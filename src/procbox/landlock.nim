@@ -1,4 +1,4 @@
-## Low-level Linux Landlock backend for confine.
+## Low-level Linux Landlock backend for procbox.
 ##
 ## Landlock is a Linux Security Module (kernel 5.13+) that lets any
 ## unprivileged process restrict its own filesystem access. Once applied to
@@ -6,7 +6,7 @@
 ## you can only ever add *more* rules, never loosen them.
 ##
 ## This module is Linux-specific. On other platforms it compiles to no-ops so
-## the rest of confine stays portable, but the interesting work is here.
+## the rest of procbox stays portable, but the interesting work is here.
 
 const landlockAvailable* = defined(linux)
 
@@ -75,7 +75,7 @@ when defined(linux):
                     LANDLOCK_CREATE_RULESET_VERSION.cuint)
     if r < 0: result = -1 else: result = int r
 
-  # Full bitmask of every right confine knows, across all ABI versions. This
+  # Full bitmask of every right procbox knows, across all ABI versions. This
   # is the upper bound; the kernel-supported subset is computed at restrict()
   # time from queryAbi().
   const allFsRights =
@@ -176,7 +176,7 @@ when defined(linux):
 
   proc addRule(rs: var Ruleset; path: string; allowed: AccessFds) =
     if rs.fd < 0:
-      raise newException(ValueError, "confine: ruleset already consumed")
+      raise newException(ValueError, "procbox: ruleset already consumed")
     let pfd = openPath(path)
     try:
       # Landlock rejects add_rule with EINVAL when directory-only rights
@@ -197,7 +197,7 @@ when defined(linux):
 
   proc apply(rs: var Ruleset) =
     if rs.fd < 0:
-      raise newException(ValueError, "confine: ruleset already consumed")
+      raise newException(ValueError, "procbox: ruleset already consumed")
     const PR_SET_NO_NEW_PRIVS = 38
     let p = syscall(clong 157, PR_SET_NO_NEW_PRIVS.clong, 1.clong,
                     0.clong, 0.clong, 0.clong)

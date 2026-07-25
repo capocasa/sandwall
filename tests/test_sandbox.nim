@@ -1,7 +1,7 @@
-## Tests for confine.
+## Tests for procbox.
 ##
 ## Two layers:
-##   1. CLI tests: invoke the `confine restrict ... -- CMD` binary, check the
+##   1. CLI tests: invoke the `procbox restrict ... -- CMD` binary, check the
 ##      command is confined.
 ##   2. Library tests: each scenario forks a child (since a Landlock domain
 ##      is permanent for the thread that applies it), so isolation is built in.
@@ -13,15 +13,15 @@ import std/[os, osproc, unittest, strutils]
 # --------------------------------------------------------------------------
 # helpers
 
-proc confineExe(): string =
-  ## The freshly built confine binary at the project root. The `nimble test`
+proc procboxExe(): string =
+  ## The freshly built procbox binary at the project root. The `nimble test`
   ## task builds it there before running the tests.
   let testDir = parentDir(currentSourcePath())
-  result = parentDir(testDir) / "confine"
+  result = parentDir(testDir) / "procbox"
   when defined(windows): result.add(".exe")
 
 proc tempDir(name: string): string =
-  result = getTempDir() / ("confine-test-" & name)
+  result = getTempDir() / ("procbox-test-" & name)
   removeDir(result)
   createDir(result)
 
@@ -47,15 +47,15 @@ proc redirectCmd(path: string): string =
 # --------------------------------------------------------------------------
 # CLI tests (shell out to the binary)
 
-suite "confine CLI (sandboxed exec)":
+suite "procbox CLI (sandboxed exec)":
   test "write allowed, write denied":
     let a = tempDir("cli-a")
     let d = tempDir("cli-d")
     # the allowed write runs in one invocation, the denied in another,
     # because a failing redirect makes the shell exit nonzero.
-    discard execCmd(confineExe().quoteShell & " restrict " & a.quoteShell &
+    discard execCmd(procboxExe().quoteShell & " restrict " & a.quoteShell &
                     " -- " & redirectCmd(a / "x.txt"))
-    let rcDenied = execCmd(confineExe().quoteShell & " restrict " &
+    let rcDenied = execCmd(procboxExe().quoteShell & " restrict " &
                            a.quoteShell &
                            " -- " & redirectCmd(d / "y.txt"))
     check: expectFile(a / "x.txt")
@@ -66,8 +66,8 @@ suite "confine CLI (sandboxed exec)":
   when not defined(windows):
     test "cannot modify system dir":
       let a = tempDir("sys-a")
-      let target = "/usr/bin/confine_should_not_exist_" & $getCurrentProcessId()
-      let rc = execCmd(confineExe().quoteShell & " restrict " & a.quoteShell &
+      let target = "/usr/bin/procbox_should_not_exist_" & $getCurrentProcessId()
+      let rc = execCmd(procboxExe().quoteShell & " restrict " & a.quoteShell &
                        " -- touch " & target)
       check: rc != 0
       check: not fileExists(target)
@@ -77,12 +77,12 @@ suite "confine CLI (sandboxed exec)":
     let ro = tempDir("ro-ro")
     writeFile(ro / "secret.txt", "topsecret")
     # read from the read-only path succeeds
-    let rcRead = execCmd(confineExe().quoteShell & " restrict " & rw.quoteShell &
+    let rcRead = execCmd(procboxExe().quoteShell & " restrict " & rw.quoteShell &
                          " --ro " & ro.quoteShell & " -- cat " &
                          (ro / "secret.txt").quoteShell)
     check: rcRead == 0
     # write to the read-only path fails
-    let rcWrite = execCmd(confineExe().quoteShell & " restrict " & rw.quoteShell &
+    let rcWrite = execCmd(procboxExe().quoteShell & " restrict " & rw.quoteShell &
                           " --ro " & ro.quoteShell & " -- " &
                           redirectCmd(ro / "new.txt"))
     check: rcWrite != 0
@@ -90,19 +90,19 @@ suite "confine CLI (sandboxed exec)":
 
   test "--ro without writable paths errors":
     let ro = tempDir("ro-only")
-    let rc = execCmd(confineExe().quoteShell & " restrict --ro " & ro.quoteShell &
+    let rc = execCmd(procboxExe().quoteShell & " restrict --ro " & ro.quoteShell &
                      " -- true")
     check: rc == 2
 
   test "no command given errors":
-    let rc = execCmd(confineExe().quoteShell & " restrict /tmp")
+    let rc = execCmd(procboxExe().quoteShell & " restrict /tmp")
     check: rc == 2
 
 # --------------------------------------------------------------------------
 # library tests (fork a child per scenario)
 
 when defined(linux) or defined(macosx):
-  import confine
+  import procbox
   import std/posix
 
   proc runScenario(name: string; body: proc(): bool): bool =
@@ -115,7 +115,7 @@ when defined(linux) or defined(macosx):
     ## because the child does little before `_exit`; this is a test-only
     ## convenience, not the pattern to copy for real sandboxing. For real
     ## commands use `forkNimbox` + `exec` (which replaces the image) or the
-    ## `confine restrict ... -- CMD` CLI.
+    ## `procbox restrict ... -- CMD` CLI.
     let pid = forkNimbox()
     if pid == 0:
       var ok = false
@@ -124,7 +124,7 @@ when defined(linux) or defined(macosx):
       exitnow(if ok: 0 else: 1)
     result = int(wait(pid)) == 0
 
-  suite "confine library (fork + restrict + exec)":
+  suite "procbox library (fork + restrict + exec)":
     test "restrict blocks writes outside allowed path":
       let a = tempDir("lib-a")
       let d = tempDir("lib-d")

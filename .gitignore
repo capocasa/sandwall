@@ -1,4 +1,4 @@
-/confine
+/procbox
 /tests/demo
 /tests/test_sandbox
 *.o

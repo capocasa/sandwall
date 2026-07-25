@@ -41,4 +41,4 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = []) =
   elif defined(windows):
     acl.restrictImpl(writable, read)
   else:
-    {.error: "confine restrict has no backend for this platform".}
+    {.error: "procbox restrict has no backend for this platform".}

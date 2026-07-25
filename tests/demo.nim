@@ -7,10 +7,10 @@
 ##      but not writable, a writable path is both.
 
 import std/[os, osproc, posix, syncio, strutils]
-import confine
+import procbox
 
 const
-  sandboxDir = "/tmp/confine-demo"
+  sandboxDir = "/tmp/procbox-demo"
 
 proc cleanup() =
   try: removeDir(sandboxDir) except CatchableError: discard
@@ -45,9 +45,9 @@ proc main() =
   let roDir = sandboxDir & "-ro"
   createDir(roDir)
   writeFile(roDir / "secret.txt", "topsecret\n")
-  # invoke the confine CLI built at the project root. --ro marks a path
+  # invoke the procbox CLI built at the project root. --ro marks a path
   # read+execute only; reads succeed, writes fail.
-  let exe = parentDir(parentDir(currentSourcePath())) / "confine"
+  let exe = parentDir(parentDir(currentSourcePath())) / "procbox"
   echo "child reads the read-only path (succeeds):"
   discard execCmd(exe.quoteShell & " restrict " & sandboxDir.quoteShell &
                   " --ro " & roDir.quoteShell &
