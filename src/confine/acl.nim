@@ -1,4 +1,4 @@
-## Windows restricted-token + ACL backend for nimbox.
+## Windows restricted-token + ACL backend for confine.
 ##
 ## Windows has no single syscall-interception hook. The Codex-validated
 ## approach is a restricted token plus filesystem ACLs: we build a token via
@@ -215,7 +215,7 @@ when defined(windows):
   proc fail*(what: string) {.noinline.} =
     ## Raise OSError carrying the Win32 error code for the last failed call.
     raise newException(OSError,
-      "nimbox windows-acl: " & what & " failed (error " & $getLastError() & ")")
+      "confine windows-acl: " & what & " failed (error " & $getLastError() & ")")
 
   proc buildRestrictedToken*(): Handle =
     ## Open the current process token and produce a restricted copy carrying a
@@ -281,7 +281,7 @@ when defined(windows):
       DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
     if rc != 0:
       raise newException(OSError,
-        "nimbox windows-acl: SetNamedSecurityInfo failed on " & path &
+        "confine windows-acl: SetNamedSecurityInfo failed on " & path &
         " (error " & $rc & ")")
 
   proc stampAce*(path: string; sid: PSID; mode: ACCESS_MODE;
@@ -295,7 +295,7 @@ when defined(windows):
     let rc = setEntriesInAcl(1, addr ea, nil, addr newAcl)
     if rc != 0:
       raise newException(OSError,
-        "nimbox windows-acl: SetEntriesInAcl failed on " & path &
+        "confine windows-acl: SetEntriesInAcl failed on " & path &
         " (error " & $rc & ")")
     # SetEntriesInAcl allocates with LocalAlloc; LocalFree releases it.
     defer: discard localFree(newAcl)
@@ -316,7 +316,7 @@ when defined(windows):
       DACL_SECURITY_INFORMATION, nil, nil, addr dacl, nil, addr sd)
     if rc != 0:
       raise newException(OSError,
-        "nimbox windows-acl: GetNamedSecurityInfo failed on " & path &
+        "confine windows-acl: GetNamedSecurityInfo failed on " & path &
         " (error " & $rc & ")")
     defer: discard localFree(sd)
 
@@ -325,7 +325,7 @@ when defined(windows):
     let rc2 = setEntriesInAcl(1, addr ea, dacl, addr newAcl)
     if rc2 != 0:
       raise newException(OSError,
-        "nimbox windows-acl: SetEntriesInAcl(REVOKE) failed on " & path &
+        "confine windows-acl: SetEntriesInAcl(REVOKE) failed on " & path &
         " (error " & $rc2 & ")")
     defer: discard localFree(newAcl)
     writeDacl(path, newAcl)
@@ -392,7 +392,7 @@ when defined(windows):
       try:
         removeSidAces(path, sid)
       except CatchableError as e:
-        stderr.writeLine("nimbox windows-acl: rollback failed on " & path &
+        stderr.writeLine("confine windows-acl: rollback failed on " & path &
           ": " & e.msg)
 
   proc restrictImpl*(writable, read: openArray[string]) =

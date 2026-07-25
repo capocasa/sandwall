@@ -1,4 +1,4 @@
-/nimbox
+/confine
 /tests/demo
 /tests/test_sandbox
 *.o

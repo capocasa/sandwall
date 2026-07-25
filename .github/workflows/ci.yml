@@ -14,13 +14,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            artifact: nimbox-linux-amd64
+            artifact: confine-linux-amd64
             ext: tar.gz
           - os: macos-latest
-            artifact: nimbox-macos-universal
+            artifact: confine-macos-universal
             ext: tar.gz
           - os: windows-latest
-            artifact: nimbox-windows-amd64
+            artifact: confine-windows-amd64
             ext: zip
 
     runs-on: ${{ matrix.os }}
@@ -37,16 +37,16 @@ jobs:
         run: nimble install -y --depsOnly
 
       - name: Build
-        run: nim c --path:src -d:release -o:nimbox src/nimbox.nim
+        run: nim c --path:src -d:release -o:confine src/confine.nim
 
       - name: Build x86_64 and create universal binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          mv nimbox nimbox-arm64
-          rm -rf ~/.cache/nim/nimbox_r
-          nim c --path:src -d:release --passC:"-arch x86_64" --passL:"-arch x86_64" --cpu:amd64 -o:nimbox-x86_64 src/nimbox.nim
-          lipo -create nimbox-arm64 nimbox-x86_64 -output nimbox
-          file nimbox
+          mv confine confine-arm64
+          rm -rf ~/.cache/nim/confine_r
+          nim c --path:src -d:release --passC:"-arch x86_64" --passL:"-arch x86_64" --cpu:amd64 -o:confine-x86_64 src/confine.nim
+          lipo -create confine-arm64 confine-x86_64 -output confine
+          file confine
 
       - name: Run tests
         run: nimble test
@@ -56,7 +56,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p ${{ matrix.artifact }}
-          cp nimbox ${{ matrix.artifact }}/
+          cp confine ${{ matrix.artifact }}/
           cp README.md LICENSE ${{ matrix.artifact }}/
           tar czf ${{ matrix.artifact }}.${{ matrix.ext }} ${{ matrix.artifact }}
 
@@ -65,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path ${{ matrix.artifact }} | Out-Null
-          Copy-Item nimbox.exe ${{ matrix.artifact }}/
+          Copy-Item confine.exe ${{ matrix.artifact }}/
           Copy-Item README.md, LICENSE ${{ matrix.artifact }}/
           Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ${{ matrix.artifact }}.${{ matrix.ext }}
 
@@ -94,6 +94,6 @@ jobs:
             --repo ${{ github.repository }} \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            nimbox-linux-amd64.tar.gz \
-            nimbox-macos-universal.tar.gz \
-            nimbox-windows-amd64.zip
+            confine-linux-amd64.tar.gz \
+            confine-macos-universal.tar.gz \
+            confine-windows-amd64.zip

@@ -1,15 +1,15 @@
-## nimbox - a filesystem sandbox backed by OS-native primitives.
+## confine - a filesystem sandbox backed by OS-native primitives.
 ##
 ## Linux uses Landlock; macOS uses Seatbelt (sandbox_init_with_parameters).
 ## The user-facing API is identical on both.
 ##
 ## As a library:
-##   import nimbox
+##   import confine
 ##   restrict("/tmp", "/home/me/work")
 ##   # this thread and all children can now only touch those paths
 ##
 ## As a binary:
-##   nimbox restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+##   confine restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
 ##   # confines itself to RWPATHs (writable) + ROPATHs (read-only), then exec()s CMD
 ##
 ## Two primitives, exposed both ways:
@@ -19,10 +19,10 @@
 ## See the `restrict` and `process` modules. Low-level Landlock access in
 ## `landlock`.
 
-import ./nimbox/restrict
+import ./confine/restrict
 export restrict
 
-import ./nimbox/process
+import ./confine/process
 export process
 
 # ----------------------------------------------------------------------- CLI
@@ -33,10 +33,10 @@ when isMainModule:
     import std/posix except Time
 
   const usage = """
-nimbox - filesystem sandbox backed by OS-native primitives
+confine - filesystem sandbox backed by OS-native primitives
 
 Usage:
-  nimbox restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+  confine restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
 
   Applies a sandbox allowing full access (read, write, create, delete,
   rename, execute) to the RWPATHs, read+execute access to the ROPATHs, and
@@ -48,9 +48,9 @@ Usage:
   not replace it.
 
 Examples:
-  nimbox restrict /tmp /home/me/work -- ls -la
-  nimbox restrict /build --ro /secrets -- make test
-  nimbox restrict . -- make test
+  confine restrict /tmp /home/me/work -- ls -la
+  confine restrict /build --ro /secrets -- make test
+  confine restrict . -- make test
 
 Landlock is monotonic: the restriction is permanent for this process and all
 descendants. There is no "unrestrict".
@@ -115,7 +115,7 @@ descendants. There is no "unrestrict".
       try:
         return int(runSandboxed(writable, cmd, read = readOnly))
       except CatchableError as e:
-        stderr.writeLine("nimbox: " & e.msg)
+        stderr.writeLine("confine: " & e.msg)
         return 127
     else:
       # posix: confine this process, then exec into CMD. Children inherit
@@ -130,7 +130,7 @@ descendants. There is no "unrestrict".
       try:
         exec(cmd)
       except CatchableError as e:
-        stderr.writeLine("nimbox: " & e.msg)
+        stderr.writeLine("confine: " & e.msg)
         return 127
 
   quit(cliMain())

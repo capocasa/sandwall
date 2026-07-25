@@ -1,4 +1,4 @@
-# nimbox
+# confine
 
 A filesystem sandbox for Nim, backed by OS-native primitives: Linux
 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) and macOS
@@ -46,7 +46,7 @@ prior-art survey.
 ## As a binary
 
 ```
-nimbox restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+confine restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
 ```
 
 Confines itself to the RWPATHs (read-write) plus any ROPATHs (read-only),
@@ -55,9 +55,9 @@ made read-only automatically so the command's binaries stay runnable;
 `--ro` adds to that set, it does not replace it.
 
 ```sh
-$ nimbox restrict /tmp /home/me/work -- ls -la
-$ nimbox restrict /build --ro /secrets -- make test
-$ nimbox restrict . -- make test
+$ confine restrict /tmp /home/me/work -- ls -la
+$ confine restrict /build --ro /secrets -- make test
+$ confine restrict . -- make test
 ```
 
 The same binary is also the library, so a parent program can self-invoke via
@@ -70,7 +70,7 @@ execCmd("/proc/self/exe restrict /tmp -- ls -la")
 ## As a library
 
 ```nim
-import nimbox
+import confine
 
 # fork a child, restrict it, exec the untrusted command, wait
 let pid = forkNimbox()
@@ -143,8 +143,8 @@ CLI tests shell out to the binary; library tests fork a child per scenario
 
 ```
 src/
-  nimbox.nim           # library + CLI (when isMainModule)
-  nimbox/
+  confine.nim           # library + CLI (when isMainModule)
+  confine/
     restrict.nim       # the restrict() proc - dispatches to the OS backend
     process.nim        # forkNimbox / exec / wait (posix fork-exec)
     paths.nim          # path normalisation, shared across backends

@@ -30,7 +30,7 @@ when defined(windows):
     ## runs whether CreateProcess succeeds or the child errors. Raises if no
     ## token was prepared (`restrict` not called) or CreateProcess fails.
     if currentRestrictedToken == 0:
-      raise newException(OSError, "nimbox: restrict() must be called first")
+      raise newException(OSError, "confine: restrict() must be called first")
 
     # Rollback runs unconditionally, including on the raise paths below. This
     # is the one mutation-bearing operation in the Windows backend and must
@@ -44,7 +44,7 @@ when defined(windows):
       if i > 0: cmdLine.add(' ')
       cmdLine.add(quoteShellWindows(a))
     if cmdLine.len == 0:
-      raise newException(ValueError, "nimbox.spawnSandboxed: empty command")
+      raise newException(ValueError, "confine.spawnSandboxed: empty command")
     let cmdLineW = newWideCString(cmdLine)
 
     var si = default(STARTUPINFO)
@@ -54,7 +54,7 @@ when defined(windows):
     if createProcessAsUserW(currentRestrictedToken, nil,
         cmdLineW, nil, nil, 0, 0, nil, nil, addr si, addr pi) == 0:
       raise newException(OSError,
-        "nimbox: CreateProcessAsUserW failed: " & $getLastError())
+        "confine: CreateProcessAsUserW failed: " & $getLastError())
     defer:
       discard closeHandle(pi.hProcess)
       discard closeHandle(pi.hThread)
@@ -63,11 +63,11 @@ when defined(windows):
     let w = waitForSingleObject(pi.hProcess, INFINITE)
     if w == WAIT_FAILED:
       raise newException(OSError,
-        "nimbox: WaitForSingleObject failed: " & $getLastError())
+        "confine: WaitForSingleObject failed: " & $getLastError())
     var code: int32 = 0
     if getExitCodeProcess(pi.hProcess, code) == 0:
       raise newException(OSError,
-        "nimbox: GetExitCodeProcess failed: " & $getLastError())
+        "confine: GetExitCodeProcess failed: " & $getLastError())
     result = ExitCode(int(code))
 else:
   import std/[posix, strutils]
@@ -78,13 +78,13 @@ else:
     ## wait on. Raises on failure.
     result = posix.fork()
     if result < 0:
-      raise newException(OSError, "nimbox: fork() failed: " & osLastError().`$`)
+      raise newException(OSError, "confine: fork() failed: " & osLastError().`$`)
 
   proc exec*(cmd: openArray[string]) =
     ## Replace the current process image with `cmd` (first element is the
     ## program, the rest its args). Uses PATH lookup. Only returns on failure.
     if cmd.len == 0:
-      raise newException(ValueError, "nimbox.exec: empty command")
+      raise newException(ValueError, "confine.exec: empty command")
     let prog0 = cmd[0]
     var argv = allocCStringArray(cmd)
     # execvp does not return on success
@@ -92,7 +92,7 @@ else:
     deallocCStringArray(argv)
     # reached only on error
     raise newException(OSError,
-      "nimbox: exec(" & cmd.join(" ") & ") failed: " & osLastError().`$`)
+      "confine: exec(" & cmd.join(" ") & ") failed: " & osLastError().`$`)
 
   proc wait*(pid: Pid): ExitCode =
     ## Block until `pid` exits. Returns the process exit code (0-255 for normal
@@ -100,7 +100,7 @@ else:
     var status: cint = 0
     if posix.waitpid(pid, status, 0) < 0:
       raise newException(OSError,
-        "nimbox: waitpid failed: " & osLastError().`$`)
+        "confine: waitpid failed: " & osLastError().`$`)
     if WIFEXITED(status):
       result = ExitCode(WEXITSTATUS(status))
     elif WIFSIGNALED(status):
@@ -131,6 +131,6 @@ template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
           restrict(writable, read)
           exec(cmd)
         except CatchableError as e:
-          stderr.writeLine("nimbox child: " & e.msg)
+          stderr.writeLine("confine child: " & e.msg)
         exitnow(127)   # only reached on setup failure
       wait(pid)

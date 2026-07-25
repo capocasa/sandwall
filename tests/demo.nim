@@ -7,10 +7,10 @@
 ##      but not writable, a writable path is both.
 
 import std/[os, osproc, posix, syncio, strutils]
-import nimbox
+import confine
 
 const
-  sandboxDir = "/tmp/nimbox-demo"
+  sandboxDir = "/tmp/confine-demo"
 
 proc cleanup() =
   try: removeDir(sandboxDir) except CatchableError: discard
@@ -45,9 +45,9 @@ proc main() =
   let roDir = sandboxDir & "-ro"
   createDir(roDir)
   writeFile(roDir / "secret.txt", "topsecret\n")
-  # invoke the nimbox CLI built at the project root. --ro marks a path
+  # invoke the confine CLI built at the project root. --ro marks a path
   # read+execute only; reads succeed, writes fail.
-  let exe = parentDir(parentDir(currentSourcePath())) / "nimbox"
+  let exe = parentDir(parentDir(currentSourcePath())) / "confine"
   echo "child reads the read-only path (succeeds):"
   discard execCmd(exe.quoteShell & " restrict " & sandboxDir.quoteShell &
                   " --ro " & roDir.quoteShell &

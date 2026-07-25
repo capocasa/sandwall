@@ -1,4 +1,4 @@
-## macOS Seatbelt backend for nimbox.
+## macOS Seatbelt backend for confine.
 ##
 ## Seatbelt is Apple's TrustedBSD MAC framework - the same kernel-enforced
 ## sandbox that backs the App Sandbox used by every Mac App Store application,
@@ -122,7 +122,7 @@ proc restrictImpl*(writable, read: openArray[string]) =
   let init = loadSandboxInit()
   if init.isNil:
     raise newException(OSError,
-      "nimbox: seatbelt unavailable (sandbox_init_with_parameters not found)")
+      "confine: seatbelt unavailable (sandbox_init_with_parameters not found)")
   let profile = buildProfile(writable, read)
   var errbuf: cstring = nil
   let r = init(profile.cstring, 0'u64, nil, addr errbuf)
@@ -133,4 +133,4 @@ proc restrictImpl*(writable, read: openArray[string]) =
       except CatchableError: discard
       let freeFn = loadSandboxFree()
       if not freeFn.isNil: freeFn(errbuf)
-    raise newException(OSError, "nimbox: " & msg)
+    raise newException(OSError, "confine: " & msg)

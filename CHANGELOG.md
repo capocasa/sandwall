@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to nimbox. Dates are commit dates, not release dates.
+All notable changes to confine. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.1.0] - 2026-07-25
@@ -26,7 +26,7 @@ Nim API across three platforms.
 - **The two primitives**: `restrict(writable, read)` and `forkNimbox` / `exec`
   / `wait`. Same names, same semantics on every platform. `restrict.nim`
   dispatches to the active backend at compile time. (`cddce2c`)
-- **CLI**: `nimbox restrict RWPATH... [--ro ROPATH...] -- CMD ARGS...`.
+- **CLI**: `confine restrict RWPATH... [--ro ROPATH...] -- CMD ARGS...`.
   Confines itself then `exec`s the command. System dirs are auto read-only so
   the command's binaries and libs stay runnable. `setsid` before exec gives the
   command its own process group for clean signal delivery. (`2af0796`,
