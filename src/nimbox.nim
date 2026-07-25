@@ -43,9 +43,9 @@ Usage:
   nothing else, then exec()s CMD. CMD and its children are confined: writes
   outside the writable paths fail with EACCES.
 
-  System dirs (/usr, /bin, /lib, /etc) are always read-only so the command's
-  binaries and libs stay runnable; --ro adds to that set, it does not replace
-  it.
+  System dirs (/usr, /bin, /lib, /dev/*, etc.) are always read-only so the
+  command's binaries and libs stay runnable; --ro adds to that set, it does
+  not replace it.
 
 Examples:
   nimbox restrict /tmp /home/me/work -- ls -la
@@ -100,8 +100,9 @@ descendants. There is no "unrestrict".
       stderr.writeLine("\nError: no command given (use -- before the command)")
       return 2
 
-    # System dirs are read-only so the command's binaries and libs are
-    # executable but not modifiable. Writable paths come from the user.
+    # System dirs (/usr, /bin, /lib, /dev/*, etc.) are auto-added as
+    # read-only inside each backend's restrictImpl, so the command's
+    # binaries and libs stay runnable without the caller listing them.
     when defined(windows):
       # Windows cannot confine the current process; restrict() only prepares
       # the token and stamps ACLs. runSandboxed spawns the child with that
@@ -124,13 +125,6 @@ descendants. There is no "unrestrict".
       # and process group. Callers (like 3code) that wrap long-running
       # commands signal the whole group on cancel/timeout; without setsid
       # those signals would miss CMD's children.
-      when defined(macosx):
-        # macOS has no /lib or /lib64; the seatbelt backend already adds the
-        # baseline (/usr/lib, /System, /Library, /dev/*) so the dynamic linker
-        # works. Just expose the user-facing binary dirs as read-only.
-        readOnly.add(["/usr", "/bin", "/sbin", "/etc"])
-      else:
-        readOnly.add(["/usr", "/bin", "/lib", "/lib64", "/etc"])
       discard setsid()
       restrict(writable, read = readOnly)
       try:

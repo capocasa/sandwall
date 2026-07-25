@@ -28,13 +28,13 @@ proc tempDir(name: string): string =
 proc expectFile(path: string): bool = fileExists(path)
 
 proc systemReadDirs(): seq[string] =
-  ## Per-OS read-only system dirs for tests. macOS has no /lib or /lib64;
-  ## the seatbelt baseline covers /usr/lib and /System already, but listing
-  ## them here keeps the test self-contained on both platforms. Windows has
-  ## no equivalent (the ACL backend stamps volume-wide write-denies).
+  ## Read-only system dirs used by library tests that call restrict()
+  ## directly. The CLI path and the backends auto-add OS-specific baselines,
+  ## but library callers pass their own lists. Kept minimal here since the
+  ## backends also auto-add /usr, /bin, /dev/*, etc.
   when defined(windows): @[]
-  elif defined(macosx): @["/usr", "/bin", "/sbin", "/etc"]
-  else: @["/usr", "/bin", "/lib", "/etc"]
+  elif defined(macosx): @[]
+  else: @[]
 
 proc redirectCmd(path: string): string =
   ## A shell command that writes "ok" to `path`, using the OS's native shell.

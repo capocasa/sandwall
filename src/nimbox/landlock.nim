@@ -12,7 +12,9 @@ const landlockAvailable* = defined(linux)
 
 when defined(linux):
   import std/[oserrors, sets]
+  import std/posix except Time
   import ./paths
+  import ./baseline
   type AccessFds = distinct uint64
 
   # Syscall numbers are stable on every Linux/Arch combination (UAPI).
@@ -103,6 +105,33 @@ when defined(linux):
     if abi < 3: result = result and not LANDLOCK_ACCESS_FS_TRUNCATE
     if abi < 4: result = result and not LANDLOCK_ACCESS_FS_IOCTL_DEV
 
+  # Rights valid only for directories. Landlock rejects add_rule with
+  # EINVAL when directory-only bits are set on a file path (device node,
+  # regular file, symlink). addRule uses fileRights (the complement) for
+  # non-directory paths.
+  const dirOnlyRights =
+    LANDLOCK_ACCESS_FS_READ_DIR or
+    LANDLOCK_ACCESS_FS_REMOVE_DIR or
+    LANDLOCK_ACCESS_FS_REMOVE_FILE or
+    LANDLOCK_ACCESS_FS_MAKE_CHAR or
+    LANDLOCK_ACCESS_FS_MAKE_DIR or
+    LANDLOCK_ACCESS_FS_MAKE_REG or
+    LANDLOCK_ACCESS_FS_MAKE_SOCK or
+    LANDLOCK_ACCESS_FS_MAKE_FIFO or
+    LANDLOCK_ACCESS_FS_MAKE_BLOCK or
+    LANDLOCK_ACCESS_FS_MAKE_SYM or
+    LANDLOCK_ACCESS_FS_REFER
+
+  # Rights valid for a regular file or device node: execute, read, write,
+  # truncate, ioctl. REFER is about cross-directory rename and is rejected
+  # for files; TRUNCATE and IOCTL_DEV are file-level ops.
+  const fileOnlyRights =
+    LANDLOCK_ACCESS_FS_EXECUTE or
+    LANDLOCK_ACCESS_FS_WRITE_FILE or
+    LANDLOCK_ACCESS_FS_READ_FILE or
+    LANDLOCK_ACCESS_FS_TRUNCATE or
+    LANDLOCK_ACCESS_FS_IOCTL_DEV
+
   proc readRights(mask: uint64): AccessFds =
     ## The "read" rights bundle: execute + read file + read dir, masked to
     ## what the kernel supports.
@@ -150,7 +179,14 @@ when defined(linux):
       raise newException(ValueError, "nimbox: ruleset already consumed")
     let pfd = openPath(path)
     try:
-      let pb = PathBeneathAttr(allowedAccess: uint64(allowed), parentFd: pfd)
+      # Landlock rejects add_rule with EINVAL when directory-only rights
+      # (READ_DIR, MAKE_*, REMOVE_*, REFER) are set on a non-directory path.
+      # O_PATH gives an fd we can fstat to check the type.
+      var st: Stat
+      var effective = uint64(allowed)
+      if fstat(pfd, st) == 0'i32 and not S_ISDIR(st.st_mode):
+        effective = effective and fileOnlyRights
+      let pb = PathBeneathAttr(allowedAccess: effective, parentFd: pfd)
       const LANDLOCK_RULE_PATH_BENEATH = 1
       let r = syscall(clong sysLandlockAddRule, rs.fd.clong,
                       LANDLOCK_RULE_PATH_BENEATH.clong,
@@ -189,15 +225,33 @@ when defined(linux):
       let mask = maskForAbi(rs.abi)
       let w = writeRights(mask)
       let r = readRights(mask)
-      var seen = initHashSet[string]()
+      # Track paths added with write rights so we don't add a redundant
+      # read-only rule for the same path (write already includes read). A
+      # read-only path added first is still upgraded by a later write rule,
+      # since Landlock unions multiple rules for the same path.
+      var writeSeen = initHashSet[string]()
+      var readSeen = initHashSet[string]()
+      # Auto-add OS-specific baseline paths so sandboxed commands can exec,
+      # load shared libraries, read /dev/urandom, and redirect to /dev/null
+      # without callers listing them explicitly.
+      for p in baselineRead:
+        let n = normalize(p)
+        if n.len == 0 or readSeen.containsOrIncl(n): continue
+        try: rs.addRule(n, r)
+        except OSError: discard
+      for p in baselineWrite:
+        let n = normalize(p)
+        if n.len == 0 or writeSeen.containsOrIncl(n): continue
+        try: rs.addRule(n, w)
+        except OSError: discard
       for p in writable:
         let n = normalize(p)
-        if n.len == 0 or seen.containsOrIncl(n): continue
+        if n.len == 0 or writeSeen.containsOrIncl(n): continue
         try: rs.addRule(n, w)
         except OSError: discard
       for p in read:
         let n = normalize(p)
-        if n.len == 0 or seen.containsOrIncl(n): continue
+        if n.len == 0 or readSeen.containsOrIncl(n): continue
         try: rs.addRule(n, r)
         except OSError: discard
       rs.apply()

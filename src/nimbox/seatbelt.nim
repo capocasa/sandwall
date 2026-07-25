@@ -18,6 +18,7 @@
 
 import std/[strutils, sets]
 import ./paths
+import ./baseline
 
 # Seatbelt's sandbox_init family is private API: the symbols live in
 # libSystem.dylib but are not in the public SDK, and `sandbox_free_errorbuf`
@@ -43,15 +44,7 @@ proc loadSandboxFree(): SandboxFreeErrorbuf =
   result = cast[SandboxFreeErrorbuf](dlsym(RTLD_DEFAULT,
                                            "sandbox_free_errorbuf"))
 
-# The baseline read-only system paths every macOS process needs to start.
-# From MXC's profile: the dynamic linker and standard libraries must stay
-# readable or the child cannot exec. SIP independently makes /System and /usr
-# read-only at the kernel level, so this only ever grants read access.
-const baselineRead = [
-  "/usr/lib", "/usr/libexec", "/usr/share", "/System", "/Library",
-  "/private/var/db/timezone", "/private/var/db/dyld", "/private/etc",
-  "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"
-]
+# Baseline paths now live in baseline.nim (shared across OS backends).
 
 proc quote(s: string): string =
   ## TinyScheme string literal: wrap in double quotes, escape backslash and
@@ -71,7 +64,9 @@ proc buildProfile(writable, read: openArray[string]): string =
   result = newStringOfCap(4096)
   result.add("(version 1)\n(deny default)\n")
 
-  # Baseline: system dirs and devices the dynamic linker needs.
+  # Baseline: system dirs and devices the dynamic linker needs. The
+  # baseline paths are OS-specific (defined in baseline.nim) and cover
+  # /usr, /bin, /System, /Library, /dev/*, etc.
   result.add("(allow file-read*")
   for p in baselineRead:
     result.add("\n  (subpath " & quote(p) & ")")
@@ -83,6 +78,12 @@ proc buildProfile(writable, read: openArray[string]): string =
   result.add("  (subpath " & quote("/usr/bin") & ")\n")
   result.add("  (subpath " & quote("/usr/sbin") & ")\n")
   result.add(")\n")
+  # Writable baseline devices (/dev/null).
+  if baselineWrite.len > 0:
+    result.add("(allow file-write* file-read*")
+    for p in baselineWrite:
+      result.add("\n  (subpath " & quote(p) & ")")
+    result.add(")\n")
 
   # Caller paths. Dedup after normalising so the same dir passed in both
   # writable and read only emits one rule.
