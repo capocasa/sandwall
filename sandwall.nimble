@@ -23,3 +23,4 @@ task test, "Run sandwall tests":
   withDir "tests":
     exec "nim c --path:../src -r test_sandbox.nim"
     exec "nim c --path:../src -r test_rules.nim"
+    exec "nim c --path:../src -r test_hosts.nim"

@@ -122,8 +122,13 @@ proc isValidHost*(h: string): bool =
       except ValueError:
         return false
     return true
-  # Hostname: labels of [a-z0-9-], not starting/ending with '-'.
-  for label in h.split('.'):
+  # Hostname: labels of [a-z0-9-], not starting/ending with '-'. A
+  # leading `*.` label arms the suffix-wildcard form and validates the
+  # rest as an ordinary hostname.
+  var v = h
+  if v.startsWith("*."): v = v[2 .. ^1]
+  if v.len == 0: return false
+  for label in v.split('.'):
     if label.len == 0 or label.len > 63: return false
     if label[0] == '-' or label[^1] == '-': return false
     if not label.allCharsInSet({'a'..'z', 'A'..'Z', '0'..'9', '-'}):
@@ -277,8 +282,9 @@ proc resolve*(p: Policy): Resolved =
   ## canonical path: a later rule for a path supersedes every earlier one
   ## for that same path. Deny is the default for anything unmentioned, so
   ## deny rules only matter as overrides of earlier allows; they drop the
-  ## path from both lists. Host rules pass through as-is (last-wins per
-  ## host:port pair, denies dropped the same way).
+  ## path from both lists. Host rules pass through with their access
+  ## intact (last-wins per host:port key only collapses repeats of the
+  ## exact same key); the wall matcher applies ordering across keys.
   var latest: Table[string, AccessKind]
   var order: seq[string]
   for r in p.rules:
@@ -293,9 +299,13 @@ proc resolve*(p: Policy): Resolved =
   for k in order:
     if k.startsWith("\x00"):
       let key = k[1 .. ^1]
-      if latest[key] == akWritable:
+      # Denies are carried too: last-wins happens per host:port KEY, so
+      # `+host:80` then `-host:443` must keep BOTH rules (the matcher
+      # sees them in policy order). The wall's HostList does the real
+      # last-wins at match time.
+      if latest[key] != akReadOnly:
         let c = key.rfind(':')
-        result.hosts.add Rule(access: akWritable, kind: rkHost,
+        result.hosts.add Rule(access: latest[key], kind: rkHost,
                               host: key[0 .. c - 1],
                               port: uint16(parseUInt(key[c + 1 .. ^1])))
     else:

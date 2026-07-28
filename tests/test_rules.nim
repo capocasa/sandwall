@@ -101,12 +101,20 @@ suite "resolve":
     when not defined(windows):
       check r.writable == @["/a"]
       check r.readonly.len == 0
-  test "host rules pass through, last-wins per host:port":
+  test "host rules pass through, last-wins per host:port key":
     let pol = parsePolicy("+ a.com\n- a.com\n+ b.com:443\n+ a.com:80\n", proj)
     let r = pol.resolve()
+    check r.hosts.len == 3
+    check r.hosts[0].host == "a.com" and r.hosts[0].port == 0
+    check r.hosts[0].access == akDeny
+    check r.hosts[1].host == "b.com" and r.hosts[1].port == 443
+    check r.hosts[2].host == "a.com" and r.hosts[2].port == 80
+  test "deny host rules survive resolve":
+    let pol = parsePolicy("+ a.com\n- b.com\n", proj)
+    let r = pol.resolve()
     check r.hosts.len == 2
-    check r.hosts[0].host == "b.com" and r.hosts[0].port == 443
-    check r.hosts[1].host == "a.com" and r.hosts[1].port == 80
+    check r.hosts[0].access == akWritable
+    check r.hosts[1].host == "b.com" and r.hosts[1].access == akDeny
 
 suite "cascade":
   test "repo supersedes system":

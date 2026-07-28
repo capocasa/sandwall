@@ -28,6 +28,9 @@ export process
 import ./sandwall/rules
 export rules
 
+import ./sandwall/wall/hosts
+export hosts
+
 # ----------------------------------------------------------------------- CLI
 
 when isMainModule:
