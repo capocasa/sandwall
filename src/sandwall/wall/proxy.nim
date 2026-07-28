@@ -40,7 +40,7 @@ type
     policyPath: string
     projectDir: string
     verbose: bool
-    listener: SocketHandle
+    listeners: seq[SocketHandle]  ## tcp listener, then optional unix socket
     running: bool
 
   ProxyCtx = ref object
@@ -87,15 +87,29 @@ proc allowed(sh: var ProxyShared; host: string; port: uint16): bool =
 # from poll.
 
 proc recvFd(fd: SocketHandle; buf: pointer; len: int; timeoutMs = -1): int =
-  ## Blocking recv with an optional millisecond timeout via poll.
-  if timeoutMs >= 0:
-    var pfd = TPollfd(fd: fd.cint, events: POLLIN)
-    let r = poll(addr pfd, 1, timeoutMs.cint)
-    if r <= 0: return r   # 0 timeout, -1 error
-    if (pfd.revents and (POLLERR or POLLNVAL)) != 0: return -1
-    if (pfd.revents and POLLIN) == 0: return 0  # HUP without data
-  result = posix.recv(fd, buf, len.cint, 0'i32).int
-  if result < 0: result = -1
+  ## Blocking read of exactly `len` bytes with an optional overall
+  ## millisecond timeout via poll. SOCKS5 greeting/request fields are
+  ## fixed-size and the peer may split them across packets (the unix
+  ## bridge splices whatever chunks the TCP side delivered), so a
+  ## single short recv must not truncate the message. Returns -1 on
+  ## error/EOF-before-complete, `len` on success.
+  var off = 0
+  let deadline = if timeoutMs >= 0: epochTime() + timeoutMs / 1000
+                 else: 0.0
+  while off < len:
+    if timeoutMs >= 0:
+      let remain = int((deadline - epochTime()) * 1000)
+      if remain <= 0: return -1
+      var pfd = TPollfd(fd: fd.cint, events: POLLIN)
+      let r = poll(addr pfd, 1, remain.cint)
+      if r <= 0: return -1
+      if (pfd.revents and (POLLERR or POLLNVAL)) != 0: return -1
+      if (pfd.revents and POLLIN) == 0: return -1  # HUP without data
+    let n = posix.recv(fd, cast[pointer](cast[int](buf) + off),
+                       (len - off).cint, 0'i32).int
+    if n <= 0: return -1
+    off.inc n
+  len
 
 proc sendFd(fd: SocketHandle; data: string): bool =
   ## Write all of `data`, ignoring SIGPIPE.
@@ -264,10 +278,12 @@ proc ip6String(a: array[16, char]): string =
 proc socksReply(fd: SocketHandle; code: char) =
   discard sendFd(fd, "\x05" & code & "\x00\x01\x00\x00\x00\x00\x00\x00")
 
-proc serveSocks5(sh: var ProxyShared; fd: SocketHandle) =
+proc serveSocks5(sh: var ProxyShared; fd: SocketHandle; first: char) =
   ## Handle one SOCKS5 session. No authentication (loopback only).
+  ## `first` is the version byte already consumed by the protocol peek.
   var head: array[2, char]
-  if recvFd(fd, addr head[0], 2, handshakeTimeout) != 2:
+  head[0] = first
+  if recvFd(fd, addr head[1], 1, handshakeTimeout) != 1:
     raise newException(ValueError, "socks greeting truncated")
   let nmethods = int(head[1])
   var methods = newString(nmethods)
@@ -332,7 +348,7 @@ proc serveClient(sh: var ProxyShared; fd: SocketHandle) =
     var b: array[1, char]
     if recvFd(fd, addr b[0], 1, handshakeTimeout) != 1: return
     if b[0] == '\x05':
-      serveSocks5(sh, fd)
+      serveSocks5(sh, fd, b[0])
     else:
       serveConnect(sh, fd, b[0])
   except CatchableError:
@@ -342,37 +358,64 @@ proc serveClient(sh: var ProxyShared; fd: SocketHandle) =
 
 proc acceptThread(sh: ptr ProxyShared) {.thread.} =
   while sh.running:
-    var pfd = TPollfd(fd: sh.listener.cint, events: POLLIN)
-    if poll(addr pfd, 1, 200) <= 0:
+    var pfds = newSeq[TPollfd](sh.listeners.len)
+    for i, l in sh.listeners:
+      pfds[i] = TPollfd(fd: l.cint, events: POLLIN)
+    if poll(addr pfds[0], pfds.len.Tnfds, 200) <= 0:
       continue   # timeout or error: re-check sh.running
-    var addrStore: Sockaddr_storage
-    var addrLen = SockLen(sizeof(addrStore))
-    let fd = posix.accept(sh.listener, cast[ptr SockAddr](addr addrStore),
-                          addr addrLen)
+    var listener = osInvalidSocket
+    for pfd in pfds:
+      if (pfd.revents and POLLIN) != 0:
+        listener = SocketHandle(pfd.fd)
+        break
+    if listener == osInvalidSocket: continue
+    # Ready without O_NONBLOCK: accept must not return EAGAIN because
+    # the forked bridge (or the fenced consumer) drained the pending
+    # connection first. That is fine - one of the proxy processes got
+    # it.
+    let fd = posix.accept(listener, nil, nil)
     if fd == osInvalidSocket:
       if osLastError().cint == EINTR: continue
       if not sh.running: break
       sleep(10)
       continue
     sh[].maybeReload()
-    # Detached client thread. The Thread slot must outlive the loop
-    # iteration: createThread hands the new thread a pointer to the
-    # Thread var's data block, so a stack slot would be freed/reused
-    # while the child still reads the arg.
-    type Ctx = tuple[sh: ptr ProxyShared, fd: SocketHandle]
-    let slot = cast[ptr Thread[Ctx]](allocShared0(sizeof(Thread[Ctx])))
-    createThread(slot[], proc(a: Ctx) {.thread.} =
-      serveClient(a.sh[], a.fd), (sh, fd))
-    # never joined or freed: client sockets close on process exit
+    sh[].serveClient(fd)
+    # Sequential: one client at a time. This keeps the accept loop
+    # single-threaded, which keeps it correct when a consumer forks
+    # after startWallProxy: the proxy then serves the loopback AND the
+    # unix listener from both processes. (Thread-per-connection here
+    # left the freshly accepted fd served only by the parent's thread,
+    # which fenced children bridged to the unix listener never reach.)
 
 # ------------------------------------------------------------- public
 
-proc startWallProxy*(policyPath: string; projectDir: string;
-                     port: uint16 = 0; verbose = false): WallProxy =
-  ## Bind 127.0.0.1:port (0 = ephemeral), load the policy, spawn the
-  ## accept loop on a background thread. Port 0 lets the caller read
-  ## back `proxy.port`; consumers that need a fixed port range (the
-  ## Windows fence story) pass explicit ports instead.
+proc listenUnix(path: string): SocketHandle =
+  ## Bind and listen on the AF_UNIX socket at `path`, replacing a stale
+  ## file. Filesystem permissions on the socket are the access control:
+  ## a unix listener exists only as the fenced side's bridge target.
+  result = posix.socket(AF_UNIX, SOCK_STREAM, 0)
+  if result == osInvalidSocket: raiseOSError(osLastError())
+  var sa: Sockaddr_un
+  sa.sun_family = TSa_Family(AF_UNIX)
+  if path.len >= sa.sun_path.len:
+    raise newException(ValueError, "sandwall proxy: unix socket path too long: " & path)
+  copyMem(addr sa.sun_path[0], cstring(path), path.len + 1)
+  removeFile(path)
+  if bindSocket(result, cast[ptr SockAddr](addr sa), SockLen(sizeof(sa))) != 0:
+    raiseOSError(osLastError())
+  if nativesockets.listen(result) != 0:
+    raiseOSError(osLastError())
+  # World-writable: a fenced child may run as another uid (Windows fence
+  # story aside, uid mapping makes this moot on Linux) and the socket is
+  # the sanctioned egress; the policy, not the file mode, is the ACL.
+  discard chmod(path, 0o777)
+
+proc startProxyListeners(policyPath, projectDir: string; port: uint16;
+                         unixSockPath: string; verbose: bool): WallProxy =
+  ## Shared body of the public startWallProxy variants: bind the TCP
+  ## loopback listener (plus a unix listener when unixSockPath is set),
+  ## load the policy, spawn the accept loop.
   let sock = newSocket(buffered = false)
   sock.setSockOpt(OptReuseAddr, true)
   sock.bindAddr(Port(port), "127.0.0.1")
@@ -381,8 +424,10 @@ proc startWallProxy*(policyPath: string; projectDir: string;
   p[] = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
                                  projectDir: projectDir,
                                  verbose: verbose,
-                                 listener: sock.getFd(),
                                  running: true))
+  p.sh.listeners.add(sock.getFd())
+  if unixSockPath.len > 0:
+    p.sh.listeners.add(listenUnix(unixSockPath))
   initLock(p.sh.lock)
   p.sh.loadList()
   createThread(p.acceptThread, acceptThread, addr p.sh)
@@ -392,6 +437,24 @@ proc startWallProxy*(policyPath: string; projectDir: string;
   result.policyPath = policyPath
   result.projectDir = projectDir
   result.verbose = verbose
+
+proc startWallProxy*(policyPath: string; projectDir: string;
+                     port: uint16 = 0; verbose = false): WallProxy =
+  ## Bind 127.0.0.1:port (0 = ephemeral), load the policy, spawn the
+  ## accept loop on a background thread. Port 0 lets the caller read
+  ## back `proxy.port`; consumers that need a fixed port range (the
+  ## Windows fence story) pass explicit ports instead.
+  startProxyListeners(policyPath, projectDir, port, "", verbose)
+
+proc startWallProxy*(policyPath: string; projectDir: string;
+                     unixSockPath: string; port: uint16 = 0;
+                     verbose = false): WallProxy =
+  ## As startWallProxy, plus a second listener on the AF_UNIX socket at
+  ## `unixSockPath`. A filesystem unix socket crosses netns boundaries,
+  ## so this is how the unfenced parent offers the proxy to a fenced
+  ## child (see wall/netns.nim). Same accept loop, family AF_UNIX; peer
+  ## address checks are skipped (filesystem perms are the ACL).
+  startProxyListeners(policyPath, projectDir, port, unixSockPath, verbose)
 
 proc stopWallProxy*(p: var WallProxy) =
   ## Close the listener, join the accept thread. Client threads are

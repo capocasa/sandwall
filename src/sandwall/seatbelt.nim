@@ -77,8 +77,8 @@ proc splitAround(root: string; denied: openArray[string]): seq[string] =
         result.add(sub)
       anc = anc.parentDir
 
-proc buildProfile(writable, read: openArray[string];
-                  denied: openArray[string] = []): string =
+proc buildProfile*(writable, read: openArray[string];
+                  denied: openArray[string] = []; egress = true): string =
   ## Assemble the TinyScheme profile. Order is: (deny default), baseline read
   ## allows, caller write allows, caller read allows, then per-policy deny
   ## narrowing. Seatbelt evaluates last-match-wins, so the grammar's own
@@ -158,21 +158,33 @@ proc buildProfile(writable, read: openArray[string];
     result.add("(deny file-write* file-read*\n  (subpath " & quote(d) & ")")
     result.add("\n  (literal " & quote(d) & "))\n")
 
+  if not egress:
+    # Network fence: permit loopback only, so the sandbox can reach the
+    # wall proxy on the host's 127.0.0.1 and nothing else. No explicit
+    # network deny is emitted: the (deny default) baseline covers the
+    # rest by omission. DNS stays fenced - the proxy resolves (impl-plan
+    # decision 8).
+    result.add("(allow network-outbound (remote ip \"localhost:*\"))\n")
+    result.add("(allow network-inbound (local ip \"localhost:*\"))\n")
+
 proc backendSupported*(): bool = true
 
 proc backendName*(): string = "seatbelt"
 
 proc restrictImpl*(writable, read: openArray[string];
-                    denied: openArray[string] = []) =
+                    denied: openArray[string] = []; egress = true) =
   ## Confine the calling thread via a Seatbelt profile. Writable paths get
   ## full access, read paths get read + execute (via the file-read* allow on
-  ## system dirs that makes exec work), everything else is denied. The
-  ## profile is rebuilt from scratch each call - no state, matching Landlock.
+  ## system dirs that makes exec work), everything else is denied. With
+  ## `egress = false` the only permitted network is loopback - the wall
+  ## proxy listens on the host's 127.0.0.1, which the sandbox reaches
+  ## directly (no bridge needed on macOS). The profile is rebuilt from
+  ## scratch each call - no state, matching Landlock.
   let init = loadSandboxInit()
   if init.isNil:
     raise newException(OSError,
       "sandwall: seatbelt unavailable (sandbox_init_with_parameters not found)")
-  let profile = buildProfile(writable, read, denied)
+  let profile = buildProfile(writable, read, denied, egress)
   var errbuf: cstring = nil
   let r = init(profile.cstring, 0'u64, nil, addr errbuf)
   if r != 0:

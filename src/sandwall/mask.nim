@@ -28,28 +28,35 @@ when defined(linux):
   {.pop.}
 
   const
-    CLONE_NEWUSER_C = 0x10000000.cint
-    CLONE_NEWNS_C = 0x00020000.cint
+    CLONE_NEWUSER_C* = 0x10000000.cint
+    CLONE_NEWNS_C* = 0x00020000.cint
+    CLONE_NEWNET_C* = 0x40000000.cint
     MS_BIND_C = 4096.culong
     MS_REC_C = 16384.culong
     MS_PRIVATE_C = 1.culong shl 18
+
+  var inUserns = false
+    ## Set once ensureUserns succeeded; later calls (e.g. maskDenied then
+    ## enterNetns) skip the unshare entirely.
 
   proc writeIdMap(path: string; inner: cint) =
     let outer = if "uid" in path: getuid() else: getgid()
     writeFile(path, $inner & " " & $outer & " 1\n")
 
-  proc maskDenied*(denied: openArray[string]) =
-    ## Hide each denied path from this process and its children. A denied
-    ## directory is bind-masked over a fresh empty dir, a denied file over
-    ## /dev/null. Raises OSError when unprivileged user namespaces are
-    ## unavailable; callers decide whether that is fatal.
-    if denied.len == 0: return
-    if unshare(CLONE_NEWUSER_C or CLONE_NEWNS_C) != 0:
+  proc ensureUserns*(extraFlags: cint = 0) =
+    ## Enter our uid-mapped user+mount namespace (plus `extraFlags` such as
+    ## CLONE_NEWNET), exactly once per process. No-op on repeat calls: the
+    ## namespaces from the first call stay, and extra flags of later calls
+    ## are moot - so the net fence must be requested before or with the
+    ## first restriction. Raises OSError when unprivileged user namespaces
+    ## are unavailable; callers decide whether that is fatal.
+    if inUserns: return
+    if unshare(CLONE_NEWUSER_C or CLONE_NEWNS_C or extraFlags) != 0:
       raise newException(OSError,
         "sandwall: unshare(user+mount ns) failed (errno " & $errno &
         "); unprivileged user namespaces may be disabled")
     # Map our own uid/gid to 0 inside the namespace so we keep ownership
-    # of the bind mounts we make.
+    # of the bind mounts (and the netns) we make.
     writeFile("/proc/self/setgroups", "deny\n")
     writeIdMap("/proc/self/uid_map", 0)
     writeIdMap("/proc/self/gid_map", 0)
@@ -57,6 +64,14 @@ when defined(linux):
     if mount(nil, "/", nil, MS_REC_C or MS_PRIVATE_C, nil) != 0:
       raise newException(OSError,
         "sandwall: making mounts private failed (errno " & $errno & ")")
+    inUserns = true
+
+  proc maskDenied*(denied: openArray[string]) =
+    ## Hide each denied path from this process and its children. A denied
+    ## directory is bind-masked over a fresh empty dir, a denied file over
+    ## /dev/null.
+    if denied.len == 0: return
+    ensureUserns()
     for raw in denied:
       let d = paths.normalize(raw)
       if d.len == 0 or not (dirExists(d) or fileExists(d)): continue

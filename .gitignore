@@ -5,3 +5,6 @@
 *.o
 *.exe
 /tests/test_hosts
+/tests/test_proxy
+/tests/test_connect
+/tests/test_wall
