@@ -24,3 +24,4 @@ task test, "Run sandwall tests":
     exec "nim c --path:../src -r test_sandbox.nim"
     exec "nim c --path:../src -r test_rules.nim"
     exec "nim c --path:../src -r test_hosts.nim"
+    exec "nim c --path:../src -r test_proxy.nim"

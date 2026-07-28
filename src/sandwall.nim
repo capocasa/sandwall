@@ -28,8 +28,8 @@ export process
 import ./sandwall/rules
 export rules
 
-import ./sandwall/wall/hosts
-export hosts
+import ./sandwall/wall
+export wall
 
 # ----------------------------------------------------------------------- CLI
 
