@@ -3,6 +3,24 @@
 All notable changes to procbox. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-07-28
+
+### Added
+
+- `rules` module: the policy file DSL (`+` allow, `-` deny, `*`
+  read-only; path and host targets), parser, cascade loading, checkPath,
+  resolve, render, append. Host rules (hostname/IP, optional port) are
+  parsed for the future network sandbox but not enforced.
+- `firewall-research.md`: cross-platform network sandboxing survey
+  (Landlock ABI v4, Seatbelt, WFP, proxy architectures) for the
+  upcoming network milestone.
+
+### Fixed
+
+- Baseline read set now covers `/etc`: ld.so config, resolv.conf,
+  nsswitch, and locale files made glibc programs unreliable under a
+  sandbox that denied /etc reads.
+
 ## [0.1.0] - 2026-07-25
 
 First release. A filesystem sandbox backed by OS-native primitives, with one

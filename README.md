@@ -67,6 +67,57 @@ The same binary is also the library, so a parent program can self-invoke via
 execCmd("/proc/self/exe restrict /tmp -- ls -la")
 ```
 
+## The policy file
+
+The `rules` module parses a tiny line-based policy DSL, shared by every
+consumer so the sandbox subprocess and the host program evaluate paths
+with the same code. One rule per line: an access code, a space, and a
+target.
+
+```
+- /                 deny everything under root
++ /tmp              writable
++                   writable project dir (bare code = project dir)
+* /var              read-only
+- ./secrets         deny, relative to the project dir
++ api.example.com   host rule (parsed, not yet enforced)
++ 10.0.0.1:8080     host with port (bare host = all ports)
++*                  no network restrictions
+```
+
+The target's first character classifies it: `/` or `C:` absolute path,
+`~` home path, `.` project-relative path, alnum host (hostname, IPv4,
+IPv6, optional `:port`). Later rules supersede earlier ones for the
+targets they name; anything unmentioned is denied. `#` comments and
+blank lines are ignored.
+
+Host rules are the seam for the network sandbox (a separate milestone):
+they parse into the policy today and `resolve` collects them, but no
+backend restricts networking yet.
+
+```nim
+let pol = loadCascaded(projectDir)      # system + repo files, defaults when absent
+case pol.checkPath(somePath)            # akWritable / akReadOnly / akDeny
+let r = pol.resolve()                   # (writable, readonly, hosts)
+restrict(r.writable, read = r.readonly)
+```
+
+Two backend caveats to know before writing tricky policies:
+
+- **Sub-path narrowing is not kernel-enforced.** The backends consume
+  the resolved (writable, readonly) root lists, which are not
+  subtractive: a deny or read-only rule for a path *under* a writable
+  root has no effect on the sandboxed process (Landlock unions rules
+  within a layer; the Seatbelt profile emits allows only). Deny
+  overrides work for disjoint roots. `checkPath` (used by host programs
+  for in-process gating) does honor nested last-wins exactly, so
+  in-process checks are stricter than the kernel boundary.
+- **Policy files under a writable root stay writable on Linux.**
+  Landlock unions rules within a layer, so force-adding the policy file
+  read-only does not subtract write (Seatbelt and Windows ACLs do
+  subtract). Put hard boundaries in a policy file outside every
+  writable root.
+
 ## As a library
 
 ```nim
