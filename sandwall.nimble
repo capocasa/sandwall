@@ -27,3 +27,12 @@ task test, "Run sandwall tests":
     exec "nim c --path:../src -r test_proxy.nim"
     exec "nim c --path:../src -r test_connect.nim"
     exec "nim c --path:../src -r test_wall.nim"
+    exec "nim c --path:../src -r test_winwall.nim"
+
+# Windows wall cross-compile check (run manually; needs mingw):
+#   nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src src/sandwall/wall/wfp.nim
+#   nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src src/sandwall/wall/winuser.nim
+# (wall.nim as a whole does not cross-compile: proxy/connect/netns are
+# POSIX-only modules not yet gated behind `when defined(windows)`.)
+# Not wired into the test task because CI/dev hosts may lack the
+# x86_64-w64-mingw32 toolchain.

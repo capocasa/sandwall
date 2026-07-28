@@ -1,13 +1,22 @@
-## wall: the network half of sandwall. Public API; the Windows fence
-## lands in chunk 4.
+## wall: the network half of sandwall. Public API.
 ##
 ##   hosts   - compiled hostname allowlist (matching semantics)
 ##   proxy   - threaded CONNECT+SOCKS5 proxy enforcing a HostList
 ##   connect - minimal SOCKS5 client (git ProxyCommand helper)
 ##   netns   - Linux kernel fence: netns + unix-socket bridge
+##   wfp     - Windows kernel fence: WFP filters on the sandwall user
+##   winuser - Windows sandwall user: setup, DPAPI creds, spawn
 
 import ./wall/hosts
 export hosts
+
+# Proxy port range is a cross-platform constant: consumers reference it
+# even when compiling for POSIX (the Windows WFP permit uses it).
+import ./wall/wfp
+export wfp.FirstProxyPort, wfp.LastProxyPort, wfp.validPortRange,
+  wfp.sddlForUserSid, wfp.GUID, wfp.parseGuid, wfp.guidBytes,
+  wfp.providerGuidText, wfp.sublayerGuidText, wfp.permitV4GuidText,
+  wfp.blockV4GuidText, wfp.permitV6GuidText, wfp.blockV6GuidText
 
 import ./wall/proxy
 export proxy
@@ -18,3 +27,9 @@ export connect
 when defined(linux):
   import ./wall/netns
   export netns
+
+when defined(windows):
+  export wfp.installFence, wfp.uninstallFence, wfp.fenceStatus,
+    wfp.wfpProbeMain
+  import ./wall/winuser
+  export winuser

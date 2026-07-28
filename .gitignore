@@ -8,3 +8,4 @@
 /tests/test_proxy
 /tests/test_connect
 /tests/test_wall
+tests/test_winwall
