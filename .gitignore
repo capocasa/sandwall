@@ -1,5 +1,6 @@
 /procbox
 /tests/demo
 /tests/test_sandbox
+/tests/test_rules
 *.o
-*.exetests/test_rules
+*.exe
