@@ -109,7 +109,8 @@ else:
       result = ExitCode(1)
 
 template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
-                        read: openArray[string] = []): ExitCode =
+                        read: openArray[string] = [];
+                        denied: openArray[string] = []): ExitCode =
   ## One-shot helper. Restricts to `writable` (full access) plus `read`
   ## (read+execute only) and runs `cmd`, returning its exit code.
   ##
@@ -122,13 +123,13 @@ template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
   ## sandbox takes effect at spawn time in the child.
   block:
     when defined(windows):
-      restrict(writable, read)
+      restrict(writable, read, denied)
       spawnSandboxed(cmd)
     else:
       let pid = forkNimbox()
       if pid == 0:
         try:
-          restrict(writable, read)
+          restrict(writable, read, denied)
           exec(cmd)
         except CatchableError as e:
           stderr.writeLine("procbox child: " & e.msg)

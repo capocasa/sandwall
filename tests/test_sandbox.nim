@@ -98,6 +98,30 @@ suite "procbox CLI (sandboxed exec)":
     let rc = execCmd(procboxExe().quoteShell & " restrict /tmp")
     check: rc == 2
 
+  test "--deny narrows a writable root (sub-path deny)":
+    # The grammar's last-wins narrowing, compiled to the backend: a
+    # denied subpath under a writable root is unreachable while the
+    # rest of the root stays writable. On Linux this exercises the
+    # userns+bind-mask path; on Seatbelt the ordered profile.
+    let rw = tempDir("deny-rw")
+    let sub = rw / "locked"
+    createDir(sub)
+    writeFile(sub / "secret.txt", "x")
+    let probe = "cat " & (sub / "secret.txt").quoteShell & " 2>/dev/null || echo DENIED"
+    let (outp, rc) = execCmdEx(procboxExe().quoteShell & " restrict " &
+      rw.quoteShell & " --deny " & sub.quoteShell & " -- sh -c " &
+      probe.quoteShell)
+    check: rc == 0
+    check: "DENIED" in outp
+    # Sibling writes still work.
+    let wrc = execCmd(procboxExe().quoteShell & " restrict " & rw.quoteShell &
+      " --deny " & sub.quoteShell & " -- " & redirectCmd(rw / "fine.txt"))
+    check: wrc == 0
+    check: fileExists(rw / "fine.txt")
+    # The host's view is untouched (no rollback needed on POSIX; the
+    # mask lives in the child's mount namespace).
+    check: readFile(sub / "secret.txt") == "x"
+
 # --------------------------------------------------------------------------
 # library tests (fork a child per scenario)
 

@@ -16,9 +16,10 @@
 ## widens the policy for that path/op. Network is blocked by omission: we emit
 ## no `network-*` allow, so the default deny covers sockets.
 
-import std/[strutils, sets]
+import std/[os, sequtils, strutils, sets]
 import ./paths
 import ./baseline
+import ./rules
 
 # Seatbelt's sandbox_init family is private API: the symbols live in
 # libSystem.dylib but are not in the public SDK, and `sandbox_free_errorbuf`
@@ -57,10 +58,34 @@ proc quote(s: string): string =
     result.add(c)
   result.add('"')
 
-proc buildProfile(writable, read: openArray[string]): string =
+proc directSubdirs(root: string): seq[string] =
+  ## Immediate child directories of `root`, skipping unreadable entries.
+  for kind, p in walkDir(root, relative = false):
+    if kind == pcDir: result.add p
+
+proc splitAround(root, denied: openArray[string]): seq[string] =
+  ## The parts of `root` that remain allowed after removing the denied
+  ## subpaths: `root` itself (file* ops, so no recursion) plus the sibling
+  ## subdirectories at every level down to each denied path. The denied
+  ## paths themselves are emitted as explicit denies afterwards.
+  result.add(root)
+  for d in denied:
+    var anc = d.parentDir
+    while isPathUnder(anc, root) and anc != root.parentDir and anc.len > root.len:
+      for sub in directSubdirs(anc):
+        if sub == d or isPathUnder(sub, d) or isPathUnder(d, sub): continue
+        result.add(sub)
+      anc = anc.parentDir
+
+proc buildProfile(writable, read: openArray[string];
+                  denied: openArray[string] = []): string =
   ## Assemble the TinyScheme profile. Order is: (deny default), baseline read
-  ## allows, caller write allows, caller read allows. Last-match-wins means
-  ## each allow overrides the default deny for its path/op pair.
+  ## allows, caller write allows, caller read allows, then per-policy deny
+  ## narrowing. Seatbelt evaluates last-match-wins, so the grammar's own
+  ## ordering is compiled directly: a denied subpath under a writable root
+  ## first splits its root (file* on the root itself, subpath allows for
+  ## the surviving siblings), then takes an explicit deny, then any
+  ## narrower later allows reinstate on top.
   result = newStringOfCap(4096)
   result.add("(version 1)\n(deny default)\n")
 
@@ -99,22 +124,46 @@ proc buildProfile(writable, read: openArray[string]): string =
     if n.len == 0 or seen.containsOrIncl(n): continue
     rpaths.add(n)
 
-  if wpaths.len > 0:
-    result.add("(allow file-write* file-read*")
-    for p in wpaths:
-      result.add("\n  (subpath " & quote(p) & ")")
-    result.add(")\n")
-  if rpaths.len > 0:
-    result.add("(allow file-read*")
-    for p in rpaths:
-      result.add("\n  (subpath " & quote(p) & ")")
-    result.add(")\n")
+  # Denies are matched against the raw caller paths (pre-dedup), then
+  # normalised with the same helper.
+  var deniedN: seq[string] = @[]
+  for p in denied:
+    let n = paths.normalize(p)
+    if n.len > 0 and not deniedN.contains(n): deniedN.add(n)
+
+  for w in wpaths:
+    let under = deniedN.filterIt(isPathUnder(it, w))
+    if under.len == 0:
+      result.add("(allow file-write* file-read*\n  (subpath " & quote(w) & "))\n")
+    else:
+      # Root narrowed by denies: the root itself as a literal-level rule
+      # plus the surviving sibling subtrees; denied subtrees are denied
+      # below.
+      result.add("(allow file-write* file-read*\n  (literal " & quote(w) & ")")
+      for s in splitAround(w, under):
+        if s != w:
+          result.add("\n  (subpath " & quote(s) & ")")
+      result.add(")\n")
+  for p in rpaths:
+    let under = deniedN.filterIt(isPathUnder(it, p))
+    if under.len == 0:
+      result.add("(allow file-read*\n  (subpath " & quote(p) & "))\n")
+    else:
+      result.add("(allow file-read*\n  (literal " & quote(p) & ")")
+      for s in splitAround(p, under):
+        if s != p:
+          result.add("\n  (subpath " & quote(s) & ")")
+      result.add(")\n")
+  for d in deniedN:
+    result.add("(deny file-write* file-read*\n  (subpath " & quote(d) & ")")
+    result.add("\n  (literal " & quote(d) & "))\n")
 
 proc backendSupported*(): bool = true
 
 proc backendName*(): string = "seatbelt"
 
-proc restrictImpl*(writable, read: openArray[string]) =
+proc restrictImpl*(writable, read: openArray[string];
+                    denied: openArray[string] = []) =
   ## Confine the calling thread via a Seatbelt profile. Writable paths get
   ## full access, read paths get read + execute (via the file-read* allow on
   ## system dirs that makes exec work), everything else is denied. The
@@ -123,7 +172,7 @@ proc restrictImpl*(writable, read: openArray[string]) =
   if init.isNil:
     raise newException(OSError,
       "procbox: seatbelt unavailable (sandbox_init_with_parameters not found)")
-  let profile = buildProfile(writable, read)
+  let profile = buildProfile(writable, read, denied)
   var errbuf: cstring = nil
   let r = init(profile.cstring, 0'u64, nil, addr errbuf)
   if r != 0:

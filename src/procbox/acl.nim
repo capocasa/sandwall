@@ -395,7 +395,8 @@ when defined(windows):
         stderr.writeLine("procbox windows-acl: rollback failed on " & path &
           ": " & e.msg)
 
-  proc restrictImpl*(writable, read: openArray[string]) =
+  proc restrictImpl*(writable, read: openArray[string];
+                     denied: openArray[string] = []) =
     ## Build the restricted token and stamp the filesystem ACLs in one pass.
     ## Stores the token for the spawn path (process.nim) and records every
     ## mutated path so the spawn can roll back via rollbackAcls.

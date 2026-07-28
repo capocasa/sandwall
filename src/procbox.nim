@@ -9,7 +9,7 @@
 ##   # this thread and all children can now only touch those paths
 ##
 ## As a binary:
-##   procbox restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+##   procbox restrict RWPATH [RWPATH ...] [--ro ROPATH ...] [--deny PATH ...] -- CMD [ARGS ...]
 ##   # confines itself to RWPATHs (writable) + ROPATHs (read-only), then exec()s CMD
 ##
 ## Two primitives, exposed both ways:
@@ -73,9 +73,11 @@ descendants. There is no "unrestrict".
     var
       writable: seq[string] = @[]
       readOnly: seq[string] = @[]
+      denied: seq[string] = @[]
       cmd: seq[string] = @[]
       seenSep = false
       seenRo = false
+      seenDeny = false
 
     var i = 1
     while i < args.len:
@@ -85,9 +87,13 @@ descendants. There is no "unrestrict".
       elif a == "--":
         seenSep = true
       elif a == "--ro":
-        seenRo = true
+        seenRo = true; seenDeny = false
+      elif a == "--deny":
+        seenDeny = true; seenRo = false
       elif a == "-h" or a == "--help":
         stdout.writeLine(usage); return 0
+      elif seenDeny:
+        denied.add(a)
       elif seenRo:
         readOnly.add(a)
       else:
@@ -116,7 +122,8 @@ descendants. There is no "unrestrict".
       # and runnable without an ALLOW ACE. User --ro paths get an explicit
       # ALLOW for read+execute so a denied volume can still be read from.
       try:
-        return int(runSandboxed(writable, cmd, read = readOnly))
+        return int(runSandboxed(writable, cmd, read = readOnly,
+                                denied = denied))
       except CatchableError as e:
         stderr.writeLine("procbox: " & e.msg)
         return 127
@@ -129,7 +136,7 @@ descendants. There is no "unrestrict".
       # commands signal the whole group on cancel/timeout; without setsid
       # those signals would miss CMD's children.
       discard setsid()
-      restrict(writable, read = readOnly)
+      restrict(writable, read = readOnly, denied = denied)
       try:
         exec(cmd)
       except CatchableError as e:

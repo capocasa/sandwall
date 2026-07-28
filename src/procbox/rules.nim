@@ -70,6 +70,12 @@ type
     ## backends, plus the parsed host rules for the (future) network half.
     writable*: seq[string]
     readonly*: seq[string]
+    denied*: seq[string]
+      ## Paths a later rule re-denied after an earlier allow. Under
+      ## last-wins these are shadowed in the writable/readonly lists, so
+      ## backends that only see those lists would wrongly allow them;
+      ## the backends enforce them on top (Seatbelt/Windows subtract
+      ## natively, Linux bind-masks them in a mount namespace).
     hosts*: seq[Rule]
 
 const
@@ -296,7 +302,14 @@ proc resolve*(p: Policy): Resolved =
       case latest[k]
       of akWritable: result.writable.add k
       of akReadOnly: result.readonly.add k
-      of akDeny: discard
+      of akDeny:
+        # A deny only needs compensating enforcement when it narrows an
+        # allow that survives in the output lists.
+        for w in result.writable:
+          if isPathUnder(k, w): result.denied.add k; break
+        if k notin result.denied:
+          for ro in result.readonly:
+            if isPathUnder(k, ro): result.denied.add k; break
 
 proc renderPolicy*(p: Policy): string =
   ## Human-readable dump of the effective rules, newest last (matching
