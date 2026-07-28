@@ -1,7 +1,7 @@
 # nimble file for procbox
 # Package
 
-version       = "0.2.0"
+version       = "0.2.1"
 author        = "Carlo Capocasa"
 description   = "A process-level filesystem sandbox backed by OS-native primitives (Landlock, Seatbelt, Windows ACLs)"
 license       = "MIT"

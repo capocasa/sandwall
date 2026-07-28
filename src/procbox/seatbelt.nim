@@ -63,7 +63,7 @@ proc directSubdirs(root: string): seq[string] =
   for kind, p in walkDir(root, relative = false):
     if kind == pcDir: result.add p
 
-proc splitAround(root, denied: openArray[string]): seq[string] =
+proc splitAround(root: string; denied: openArray[string]): seq[string] =
   ## The parts of `root` that remain allowed after removing the denied
   ## subpaths: `root` itself (file* ops, so no recursion) plus the sibling
   ## subdirectories at every level down to each denied path. The denied
