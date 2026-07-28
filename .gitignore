@@ -2,4 +2,4 @@
 /tests/demo
 /tests/test_sandbox
 *.o
-*.exe
+*.exetests/test_rules
