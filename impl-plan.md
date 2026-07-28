@@ -1,50 +1,61 @@
-# Windows backend implementation plan
+# Sandwall network firewall ("wall") - master plan
 
-## Overview
+Repo already renamed to sandwall (f8145ec). This plan adds the network
+half: `wall` modules in this repo, then 3code integration (chunks in the
+3code repo).
 
-Implement the Windows backend for nimbox: restricted-token + per-path ACL
-sandboxing, per `CROSSPLATFORM.md` Phase 3 and the MS Restricted Tokens docs.
-The user-facing API (`restrict`, `runSandboxed`) stays the same as Linux/macOS;
-Windows gets its own spawn path because there is no `fork`.
+## Locked decisions (user)
 
-This is the weakest platform. ACL stamping mutates the filesystem and must be
-rolled back. Verification on a real Windows VM is a hard gate before merge.
+- Full monty: kernel fence to loopback + CONNECT/SOCKS5 proxy enforcing
+  per-request hostname allowlists. No TLS termination.
+- Default policy has no host rules and no network fencing. First host
+  rule (or explicit fence) switches fencing on.
+- `+host` bare = all ports. `+host:port` allowed. `+localhost` meaningful.
+- Linux < kernel 6.7 (Landlock ABI < 4) with host rules: run unfenced,
+  skip net rules, warn. Never hard-fail.
+- Linux primary fence: netns + unix-socket bridge to the proxy (Landlock
+  port-only fencing is advisory at best: port-only, TCP Fast Open bypass,
+  no UDP before ABI v10).
+- Windows: dedicated local user `sandwall`, DPAPI-stored credentials,
+  persistent WFP filters keyed on the user SID, loopback permit to a
+  FIXED proxy port range, block all other egress. Filesystem isolation
+  stays as-is (restricted token + ACLs), so no-admin users keep the fs
+  sandbox without network fencing. One-time elevated idempotent setup;
+  consumers print a config-disableable warning when setup never ran.
+- Proxy is library code in sandwall; consumers expose it as a subcommand
+  of their own binary (3code gets `3code wall proxy|connect`). The
+  sandwall repo ships no standalone binaries; the box/proxy/connect
+  binaries are trivial mains inside the consumer.
+- UDP fully denied inside the fence, TCP-only proxy, DNS only via the
+  proxy. Revisit flag noted for later.
+- 3code itself never sandboxed; its web tools ignore host rules.
 
-## Backend shape (from MS docs + Codex)
+## Chunks (this repo)
 
-On Windows a token is applied at `CreateProcess` time, so `restrictImpl`
-**prepares** a token instead of confining the current thread. The token is
-applied when a child is spawned. This differs from Landlock/Seatbelt but the
-public API is unchanged: callers do `restrict()` then `runSandboxed(cmd)`.
+1. **impl-1.md - Host allowlist model.** Pure module: resolve host rules
+   into an ordered match list with last-wins semantics, wildcard
+   (`*.example.com` suffix only), IP literals, port matching. Unit tests.
+2. **impl-2.md - Proxy.** `wall/proxy.nim`: threaded HTTP CONNECT +
+   SOCKS5 server on 127.0.0.1, allowlist check per target, policy mtime
+   reload, upstream DNS resolution, deny-logging to stderr. Tests:
+   live loopback CONNECT allow/deny, SOCKS5 handshake, reload.
+3. **impl-3.md - POSIX fences.** `wall.nim` public API; Linux netns
+   (CLONE_NEWNET in the mask.nim userns) + unix-socket bridge forwarder
+   + `wall/connect.nim` minimal SOCKS5 client for git ProxyCommand;
+   macOS Seatbelt `(allow network-outbound (remote ip "localhost:*"))`
+   extension. `restrictWall` extended with an `egress` parameter
+   (backwards-compatible default = untouched).
+4. **impl-4.md - Windows fence.** `wall/wfp.nim` (BFE FFI: provider,
+   sublayer, ALE_USER_ID block + loopback permit filters, idempotent
+   install/uninstall/status), `wall/winuser.nim` (create `sandwall`
+   user, random password, DPAPI store, LogonUser), setup entry points.
+   Unverified without a Windows machine; mirrors srt's wfp.rs shape.
 
-Per `CROSSPLATFORM.md`, recommendation (b): `runSandboxed` is the portable
-high-level entry; `forkNimbox`/`exec`/`wait` stay posix primitives. On Windows
-`runSandboxed` calls `spawnSandboxed` directly (one call, no fake fork).
+## Chunks (3code repo, written when chunk 4 starts)
 
-## Chunks
-
-1. **Win32 FFI foundation + restricted token.** Declare the Win32 security/
-   token FFI. Implement `buildRestrictedToken()` that opens the current token
-   and produces a restricted copy with a fresh random SID. `restrictImpl`
-   stores it in a module global. No ACLs yet. Cross-compile check only.
-
-2. **ACL stamping + rollback.** Implement DENY/ALLOW ACE stamping on volume
-   roots and the caller paths, with `allVolumeRoots()` enumeration. Every
-   mutation recorded so it can be removed. `restrictImpl` builds the token AND
-   stamps ACLs. Cross-compile check only.
-
-3. **Process spawn + portable runSandboxed.** Windows `process.nim`:
-   `spawnSandboxed(cmd)` calls `CreateProcessAsUser` with the prepared token,
-   waits, then rolls back ACLs in a `defer`. Make `runSandboxed` dispatch to
-   posix fork-exec or windows spawn. Cross-compile check only.
-
-4. **Windows CI job + README + integrate.** Add a windows-latest job to
-   `.github/workflows/ci.yml` that builds + runs a smoke test. Update README
-   platform table. Verify Linux + macOS still green.
-
-## Hard gate
-
-The plan doc says Windows is "not mergeable without a Windows test run".
-The CI job on `windows-latest` is that test run. Do not claim Windows works
-until the CI job passes there. ACL rollback correctness (no leftover DENY
-ACEs) is the single most dangerous part.
+5. Rename dependency procbox -> sandwall in box.nim/nimble; add
+   `3code wall` subcommands (proxy, connect, setup-windows).
+6. Bash tool wiring: start proxy per box when host rules present, fence
+   the box process, inject proxy env vars + GIT_SSH_COMMAND, warning on
+   Windows-without-setup (config disableable).
+7. Integrate, full test suites both repos, docs.

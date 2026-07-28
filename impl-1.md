@@ -1,144 +1,118 @@
-# Chunk 1: Win32 FFI foundation + restricted token
+# Chunk 1: Host allowlist model
 
 ## Goal
 
-Lay the Win32 security/token FFI and implement `buildRestrictedToken()`, which
-opens the current process token and produces a restricted copy carrying a fresh
-random SID. `restrictImpl` calls it and stores the token in a module global for
-the spawn phase. No ACL stamping yet (chunk 2), no spawning (chunk 3). This
-chunk must cross-compile for Windows from Linux.
+Add a pure, file-free module that turns the policy's ordered host rules
+into a matchable allowlist with last-wins semantics. This is the brain
+the proxy (chunk 2) consults per CONNECT request. No OS code, no proxy
+yet.
 
 ## Read first
 
-- `src/nimbox/acl.nim` - the current stub you are replacing
-- `src/nimbox/restrict.nim` - the dispatcher that calls `acl.restrictImpl`
-- `src/nimbox/paths.nim` - `normalize()`, used to canonicalise caller paths
-- `CROSSPLATFORM.md` lines 215-260 (Phase 3 mechanism + the `acl.nim` sketch)
-- `impl-plan.md` - overall shape
-
-## Background: the Win32 calls (from MS Restricted Tokens docs)
-
-1. `OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &token)`
-   - get a handle to the current process's token.
-2. `AllocateAndInitializeSid(...)` to make a fresh random SID. Use
-   `SECURITY_NT_AUTHORITY` (S-1-5) with a random identifier authority. This
-   SID is the "restricting SID": Windows runs TWO access checks on every
-   `NtCreateFile` when a restricting SID is present, and BOTH must pass.
-3. `CreateRestrictedToken(token, LUA_TOKEN, 0, nil, 0, nil, 0, nil, &restricted)`
-   - Actually for a restricting SID we use `CreateRestrictedToken` with the
-   `0` flags form that takes a list of SIDs to disable, OR we use
-   `CreateRestrictedToken(baseToken, 0, disableCount, disableSids, ...)`.
-   The cleanest documented path: call `CreateRestrictedToken` with the
-   `DISABLE_MAX_PRIVILEGE` flag (strips privileges) and pass our fresh SID
-   via the `SidstoRestrict` parameter (the last-but-one array). This makes
-   it a "restricted token" in the MS sense, which triggers the two-access-
-   check semantics that the ACL stamping relies on.
-4. The returned `restricted` handle is what we store.
+- `src/sandwall/rules.nim` (Rule, RuleKind, rkHost, Resolved.hosts,
+  parseHost, isValidHost; note `port = 0` means all ports and `host =
+  "*"` means all networks)
+- `tests/test_rules.nim` (unittest style used in this repo)
+- `src/sandwall/paths.nim`
 
 ## Instructions
 
-Rewrite `src/nimbox/acl.nim` (currently a stub). Structure:
+Create `src/sandwall/wall/hosts.nim` (new directory `src/sandwall/wall/`;
+network internals live under `wall/` per the rename decision):
 
-```nim
-## Windows restricted-token + ACL backend for nimbox.
-## [doc comment explaining the two-access-check model, that restrictImpl
-##  prepares a token applied at spawn time, and that this is the weak
-##  platform - see CROSSPLATFORM.md Phase 3]
+1. Types:
 
-import std/[sets, strutils]
-import ./paths
+   ```nim
+   type
+     HostMatcher* = object
+       ## One compiled host rule, in policy order.
+       allow*: bool          ## true for +, false for -
+       isWildcard*: bool     ## host began with "*."
+       isAll*: bool          ## host == "*" (all networks)
+       host*: string         ## lowercase; literal hostname or IP, or the
+                           ## suffix after "*." for wildcards
+       port*: uint16         ## 0 = all ports
 
-when defined(windows):
-  # --- Win32 types ---
-  type
-    HANDLE = int
-    BOOL = int32
-    DWORD = uint32
-    PSID = ptr object  # opaque
-    TokenHandle {.pure.} = enum ...  # or just use DWORD consts
+     HostList* = object
+       matchers*: seq[HostMatcher]
+   ```
 
-  # SID_IDENTIFIER_AUTHORITY is a 6-byte array
-  type SidIdentifierAuthority = array[6, uint8]
+2. `proc toHostList*(hosts: seq[Rule]): HostList` - convert the resolved
+   `rkHost` rules from `rules.resolve()`. Lowercase hostnames. Detect
+   and strip a leading `*.` (sets `isWildcard`, keeps the suffix in
+   `host`). Map `akWritable` to allow=true, `akDeny` to allow=false;
+   skip `akReadOnly` host rules (read-only is meaningless for hosts;
+   the parser only produces it if a user writes `*host`, treat as
+   invalid and skip).
 
-  # --- Win32 consts ---
-  const
-    TOKEN_QUERY = 0x0008'i32
-    TOKEN_DUPLICATE = 0x0002'i32
-    DISABLE_MAX_PRIVILEGE = 0x1'i32
-    GetCurrentProcessPseudo = (-1)  # HANDLE pseudo-handle
+   Note: `rules.isValidHost` currently rejects `*.example.com`. Extend
+   `isValidHost` in rules.nim so a leading `*.` label is accepted for
+   hostnames (strip it, validate the rest as a hostname). Keep `*`
+   alone meaning all-networks. Add parser tests for this.
 
-  # --- Win32 FFI imports ---
-  proc GetCurrentProcess(): HANDLE {.stdcall, dynlib: "kernel32", importc.}
-  proc OpenProcessToken(processHandle: HANDLE; desiredAccess: DWORD;
-        tokenHandle: ptr HANDLE): BOOL {.stdcall, dynlib: "advapi32", importc.}
-  proc AllocateAndInitializeSid(pIdentifierAuthority: ptr SidIdentifierAuthority;
-        nSubAuthorityCount: uint8; ... ): BOOL {.stdcall, dynlib: "advapi32", importc.}
-  proc CreateRestrictedToken(existingToken: HANDLE; flags: DWORD;
-        sidToDisableCount: DWORD; sidToDisable: ptr PSID;
-        privilegeToDeleteCount: DWORD; privilege: ptr pointer;
-        restrictedSidCount: DWORD; sidToRestrict: ptr PSID;
-        newToken: ptr HANDLE): BOOL {.stdcall, dynlib: "advapi32", importc.}
-  proc CloseHandle(h: HANDLE): BOOL {.stdcall, dynlib: "kernel32", importc.}
-  proc GetLastError(): DWORD {.stdcall, dynlib: "kernel32", importc.}
+3. `proc allows*(l: HostList; host: string; port: uint16): bool` -
+   last-wins matching:
+   - Normalize `host`: lowercase; strip one trailing dot (FQDN root).
+   - Default (no matcher hits): **deny**. The fence only exists when
+     the policy has host rules, so the empty list denies everything;
+     callers that want unrestricted simply do not fence (see impl-plan
+     Q6).
+   - A matcher hits when port matches (matcher.port == 0 or == port)
+     AND one of:
+     - `isAll` (host `*`) matches any host.
+     - `isWildcard`: host == matcher.host (apex included:
+       `*.example.com` allows `example.com` itself, matching browser
+       and srt convention) or host ends with `"." & matcher.host`.
+     - Exact: host == matcher.host. IP literals compare as strings;
+       IPv6 may arrive bracketed from CONNECT requests, so strip
+       surrounding `[]` from the incoming host before comparing.
+   - `localhost` is an ordinary hostname here (it matches only the
+     literal `localhost`, not 127.0.0.1; users write both if they want
+     both). Document this in the module header.
 
-  var currentRestrictedToken: HANDLE = 0   # set by restrictImpl, used by spawn
+4. Module header comment in the same doc style as rules.nim: the DSL
+   meaning of host rules, last-wins order, wildcard form (`*.` suffix
+   only, leading position only), apex inclusion, port semantics, the
+   deny default, and that matching is string-based (the proxy resolves
+   AFTER the allow decision; no DNS here, so DNS-rebinding tricks by
+   the sandboxed process are impossible by construction - it cannot
+   resolve at all when fenced).
 
-  proc buildRestrictedToken(): HANDLE =
-    ## Open current token, build a restricted copy carrying a fresh SID.
-    ## Raises OSError on any step failing.
-    ...
+5. Export from `src/sandwall.nim`: `import ./sandwall/wall/hosts`,
+   `export hosts`.
 
-proc backendSupported*(): bool =
-  when defined(windows): true else: false
+6. Tests: new `tests/test_hosts.nim`, same unittest style as
+   test_rules.nim. Cover:
+   - empty list denies everything
+   - exact host allow and deny, last-wins override both directions
+   - `+*.example.com` allows `api.example.com`, `example.com`, denies
+     `notexample.com`, `example.com.evil.com`
+   - port rules: `+host:443` allows 443, denies 80; bare `+host`
+     (port 0) allows any port; `-host:22` blocks only 22
+   - `+*` allows everything; `-` then `+*` ordering, `+*` then `-host`
+     (host still denied, everything else allowed)
+   - IP literals: `+1.2.3.4`, `[::1]:8080` matching `::1` port 8080
+   - case-insensitivity: `+EXAMPLE.com` matches `example.COM`
+   - trailing-dot FQDN form
+   - `akReadOnly` host rules skipped
+   - parser: `+*.example.com` and `+*.bad_underscore.com` (latter
+     skipped silently)
 
-proc backendName*(): string = "windows-acl"
-
-when defined(windows):
-  proc restrictImpl*(writable, read: openArray[string]) =
-    ## Build the restricted token and store it. ACL stamping comes in chunk 2;
-    ## for now just record writable/read paths normalised for the stamping
-    ## pass. Canonicalise caller paths via paths.normalize now.
-    currentRestrictedToken = buildRestrictedToken()
-    # chunk 2 will stamp ACLs here
-```
-
-### Key details
-
-- **Nim stdlib has Win32 bindings** in `std/windows` and `std/winlean`. Check
-  what's already declared before redeclaring; reuse `HANDLE`, `DWORD`,
-  `GetCurrentProcess`, `CloseHandle` from there. Only declare what's missing
-  (the security/token procs are NOT in winlean). Use `import std/winlean` and
-  add the advapi32 imports yourself.
-- **AllocateAndInitializeSid** is variadic in C. Nim can't import variadic
-  stdcall cleanly. Use a fixed-arity wrapper: declare it with the max number
-  of sub-authorities you need (1 random DWORD sub-authority is enough for a
-  unique SID), or use `AllocateLocallyUniqueId` + manual SID building. Simplest
-  robust path: declare AllocateAndInitializeSid with a fixed 1 sub-authority.
-- **Pseudo-handle**: `GetCurrentProcess()` returns -1 (a pseudo-handle). It
-  does not need closing.
-- **Error handling**: every BOOL return that is 0 (false) is an error; fetch
-  `GetLastError()` and raise `OSError` with a message including the code.
-- **No ACL stamping in this chunk.** Leave a clear comment where chunk 2 adds it.
+   Wire into `sandwall.nimble` `task test` after test_rules.nim:
+   `exec "nim c --path:../src -r test_hosts.nim"`.
 
 ## Verification
 
-1. Cross-compile for Windows from Linux (we have no Windows box locally):
-   ```
-   nim c --os:windows --cpu:amd64 --noLinking --path:src src/nimbox.nim
-   ```
-   Must compile with zero errors. Fix type mismatches in the FFI.
-2. Linux build + test must STILL pass (the Linux path doesn't touch acl.nim):
-   ```
-   nimble test
-   ```
-3. `git diff` to confirm only `src/nimbox/acl.nim` changed.
-
-Use the todo tool for these verification steps.
+- `nimble test` green, including the new suite.
+- `git diff` shows only: new `src/sandwall/wall/hosts.nim`, new
+  `tests/test_hosts.nim`, small edits to rules.nim (isValidHost),
+  sandwall.nim, sandwall.nimble, tests/test_rules.nim (parser cases).
+- Commit: `host allowlist model with last-wins matching`.
 
 ## Next step
 
-When this chunk is complete and verified, call context_clear with:
-- summary: "Chunk 1 done: Win32 token FFI in acl.nim, buildRestrictedToken()
-  implemented, restrictImpl stores token in currentRestrictedToken. Cross-
-  compiles for windows/amd64, Linux tests still green. No ACL stamping yet."
-- instructions: "Read impl-2.md and execute the instructions there."
+When complete and verified, call clear with:
+- summary: "Chunk 1 done: src/sandwall/wall/hosts.nim (HostMatcher/
+  HostList/toHostList/allows, last-wins, wildcard+apex, port rules),
+  isValidHost accepts leading *., tests green, committed."
+- instructions: "Read /home/carlo/p/sandwall/impl-2.md and execute it."

@@ -1,152 +1,146 @@
-# Chunk 2: ACL stamping with rollback
+# Chunk 2: The wall proxy
 
 ## Goal
 
-Add DENY/ALLOW ACE stamping to the Windows backend. `restrictImpl` builds the
-restricted token (from chunk 1) AND stamps ACEs: a DENY ACE for the restricting
-SID on every volume root the process should not write, and ALLOW ACEs for the
-restricting SID on the writable (full) and read (read+execute) paths. Every
-mutation is recorded so chunk 3's spawn can roll it back.
+`src/sandwall/wall/proxy.nim`: a threaded HTTP CONNECT + SOCKS5 proxy
+that listens on 127.0.0.1, enforces a HostList (chunk 1) per target,
+resolves DNS itself, and hot-reloads its policy file on mtime change.
+This is the only network-allowed egress point for fenced processes.
 
 ## Read first
 
-- `src/nimbox/acl.nim` - chunk 1's state (token FFI, currentRestrictedToken)
-- `src/nimbox/paths.nim` - `normalize()`
-- `CROSSPLATFORM.md` lines 200-215 (the two-access-check model, the Codex
-  failure cases) and lines 330-360 (risks: ACL rollback, volume enumeration)
-- `impl-plan.md`
+- `src/sandwall/wall/hosts.nim` (HostList, toHostList, allows)
+- `src/sandwall/rules.nim` (loadPolicy/parsePolicy, resolve, hosts)
+- `impl-plan.md` (locked decisions; proxy shape)
+- Nim stdlib docs knowledge: `std/net` (Socket, newSocket, bindAddr,
+  listen, accept, connect, recvLine, recv, send, setSockOpt,
+  SO_REUSEADDR), `std/threadpool` or `std/threads`, `std/times`
+  (getLastModificationTime), `std/posix` for `getAddrInfo` via
+  `std/net`'s `dial`/`connect` with hostname.
 
-## Background: the stamping model
+## Design constraints
 
-The restricting SID triggers a second access check on every `NtCreateFile`.
-Strategy from Codex/MS docs:
-
-1. **Enumerate all volume roots** (`FindFirstVolumeW`/`FindNextVolumeW`). Each
-   drive letter root (`C:\`, `D:\`) gets a DENY ACE for our SID for write
-   rights. This makes everything write-denied by default across all drives.
-2. **ALLOW on writable paths**: stamp an ALLOW ACE for our SID with
-   `FILE_ALL_ACCESS` on each normalized writable path. Because two checks run,
-   the ALLOW must be present or the write fails.
-3. **ALLOW on read paths**: ALLOW ACE with `FILE_GENERIC_READ |
-   FILE_GENERIC_EXECUTE`.
-4. **The Codex lesson**: stamp EVERY ancestor of denied paths, and do NOT
-   over-deny (read ACEs on system dirs the process needs to load DLLs from).
-   For v1, the volume-root DENY covers the "deny everything" case; the ALLOWs
-   re-open the caller paths. System dirs (C:\Windows, Program Files) stay
-   write-denied by the volume DENY, which is what we want, but READ access is
-   NOT denied (we only DENY write rights on the volume root), so DLL loading
-   keeps working.
-
-### ACL rollback (the dangerous part)
-
-Stamping mutates filesystem security descriptors. If we crash or the child
-misbehaves, we leave DENY ACEs on volume roots that break other processes.
-Record every `(path, wasModified)` so the spawn (chunk 3) can remove our ACEs
-in a `defer`. For v1 store the list of stamped paths in a module global
-`stampedPaths: seq[PathRecord]`.
+- Single Nim process, one thread per accepted connection (simple,
+  matches srt's shape; connection counts are tiny). Use `std/threads`
+  with a channel-free design: each accepted client socket moves to its
+  thread. Guard the shared allowlist with a lock (see reload below).
+- Two protocols on ONE listener: peek the first byte. SOCKS5 starts
+  with 0x05; HTTP CONNECT starts with 'C' (0x43). Peeking one byte is
+  enough: any 0x05 -> SOCKS5, otherwise read an HTTP request line and
+  only accept the CONNECT method (respond 405 to anything else).
+- No TLS interception. After a successful CONNECT, reply
+  `HTTP/1.1 200 Connection Established\r\n\r\n` and splice bytes both
+  ways until EOF. After a SOCKS5 success reply, same splice.
+- DNS resolution happens in the proxy AFTER the allow decision, via
+  the OS resolver (`std/net` connect with hostname does this). The
+  allow decision is purely string-based on the requested name (see
+  hosts.nim docs).
+- Deny behavior: CONNECT gets `HTTP/1.1 403 Forbidden\r\n\r\n` and a
+  stderr log line `sandwall proxy: DENY host:port`; SOCKS5 gets reply
+  code 0x02 (connection not allowed by ruleset) and the same log.
+  Allow decisions are not logged (noise); a `-v` verbose flag logs
+  allows too.
+- Timeouts: 30s read timeout on the initial request parse, then none
+  during splice (long-lived TLS tunnels must survive idle). Use
+  blocking sockets with SO_RCVTIMEO only during the handshake phase;
+  simplest is two blocking sockets in the splice with a select loop -
+  use `std/selectors` or a simple `posix.poll` loop on both fds.
 
 ## Instructions
 
-Add to `src/nimbox/acl.nim` (extend chunk 1's file):
+1. `src/sandwall/wall/proxy.nim`:
 
-```nim
-# --- ACL types ---
-type
-  ACCESS_MODE = enum  # from accctrl.h
-    NO_INHERITANCE = 0
-    GRANT_ACCESS   # allow
-    DENY_ACCESS    # deny
-  TRUSTEE_TYPE = enum
-    TRUSTEE_IS_UNKNOWN = 0, TRUSTEE_IS_USER, TRUSTEE_IS_GROUP
-  MULTIPLE_TRUSTEE_OPERATION = enum
-    NO_MULTIPLE_TRUSTEE = 0
-  SE_OBJECT_TYPE = enum
-    SE_FILE_OBJECT = 1
+   ```nim
+   type
+     WallProxy* = object
+       sock: Socket              ## listener on 127.0.0.1
+       port*: uint16             ## actual bound port
+       policyPath*: string       ## file to reload on mtime change
+       projectDir*: string       ## for relative policy targets
+       verbose*: bool
 
-# Build a EXPLICIT_ACCESS for our SID
-proc buildExplicitAccess(sid: PSID; mode: ACCESS_MODE; rights: DWORD): ...
-```
+   proc startWallProxy*(policyPath: string; projectDir: string;
+                        port: uint16 = 0; verbose = false): WallProxy
+     ## Bind 127.0.0.1:port (0 = ephemeral), load the policy, spawn the
+     ## accept loop on a background thread. Port 0 lets the caller read
+     ## back `proxy.port` (the fixed-range Windows story picks explicit
+     ## ports instead).
 
-The single cleanest Win32 call is `SetNamedSecurityInfo` with a DACL, OR the
-older `SetEntriesInAcl` + `SetNamedSecurityInfo`. Use the `SetEntriesInAcl`
-path: build an `EXPLICIT_ACCESS` array, merge into an ACL, then call
-`SetNamedSecurityInfo(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, ...)`.
-`SetEntriesInAcl` is in advapi32.
+   proc stopWallProxy*(p: var WallProxy)
+     ## Close the listener, join the accept thread. Client threads are
+     ## detached; closing their sockets on process exit is the OS's job.
+   ```
 
-Implement:
+   Internals:
+   - `loadList(p): HostList` - `rules.loadPolicy(p.policyPath,
+     p.projectDir).resolve().hosts.toHostList()`. Store with the file's
+     mtime; before EACH accept (cheap: one stat per connection) compare
+     mtime and reload on change. Protect the current list with a
+     `std/locks` Lock since client threads read it.
+   - CONNECT parse: read request line `CONNECT host:port HTTP/1.1`,
+     consume headers until empty line (ignore content). Parse host:port
+     (IPv6 bracket form possible). Check `list.allows(host, port)`.
+     Connect upstream with a 15s timeout. On upstream failure: `502`.
+   - SOCKS5: greeting `05 nmethods methods...` -> reply `05 00` (no
+     auth; loopback only). Request `05 01 00 atyp addr port`: support
+     atyp 0x01 (IPv4), 0x03 (domain), 0x04 (IPv6). Convert IPv4/IPv6 to
+     string form for the allow check. Reply success with bound addr
+     0.0.0.0:0, then splice.
+   - Splice: poll both sockets (POLLIN|POLLHUP|POLLERR), forward
+     whatever is readable, half-close on EOF (shutdown write side), end
+     when both directions closed. 64 KiB buffers.
+   - No authentication, binds 127.0.0.1 only, never 0.0.0.0. Document
+     that loopback binding IS the access control (any local process can
+     use the proxy, by design; the fence is on the sandboxed side).
 
-```nim
-var stampedPaths: seq[string]  # paths we mutated, for rollback
+2. `src/sandwall/wall.nim` (public wall API, will grow in chunk 3):
 
-proc stampAce(path, sid, mode, rights) =
-  ## Add an ACE for sid to path's DACL. Records path in stampedPaths.
-  ...
+   ```nim
+   import ./wall/hosts
+   export hosts
+   import ./wall/proxy
+   export proxy
+   ```
 
-proc enumerateVolumeRoots(): seq[string] =
-  ## FindFirstVolumeW / FindNextVolumeW. Returns ["C:\\", "D:\\", ...]
-  ...
+   Export it from `src/sandwall.nim` alongside the existing modules
+   (`import ./sandwall/wall` / `export wall`).
 
-proc stampAcls(writable, read: seq[string]; sid: PSID) =
-  ## DENY write on all volume roots, ALLOW full on writable, ALLOW read+exec
-  ## on read paths. Record every mutated path.
-  ...
+3. Tests: `tests/test_proxy.nim`. Real loopback tests (they are
+   hermetic; bind 127.0.0.1:0):
+   - Start a throwaway upstream TCP echo server on 127.0.0.1:0 in the
+     test.
+   - Policy file in a temp dir: `+127.0.0.1` (IP literal allow).
+     Start proxy on that policy. CONNECT to `127.0.0.1:echoport` ->
+     200, bytes echo through the tunnel.
+   - CONNECT to `127.0.0.1:otherport` where policy is
+     `+127.0.0.1:echoport` only -> 403.
+   - SOCKS5 path: handshake + connect to the echo server via domain
+     atyp with `localhost` in the allowlist -> success; disallowed
+     name -> reply code 0x02.
+   - Reload: rewrite the policy file (ensure mtime advances; sleep
+     1100ms or write with explicit future mtime via
+     `std/os.setLastModificationTime`), then a previously-denied target
+     succeeds.
+   - Plain HTTP GET to the proxy -> 405.
+   Wire into sandwall.nimble `task test` after test_hosts.nim.
 
-proc rollbackAcls(sid: PSID) =
-  ## Remove our SID's ACEs from every path in stampedPaths. Best-effort,
-  ## called in a defer by the spawn in chunk 3.
-  ...
-```
-
-Then extend `restrictImpl`:
-
-```nim
-proc restrictImpl*(writable, read: openArray[string]) =
-  currentRestrictedToken = buildRestrictedToken()
-  let sid = currentRestrictingSid   # store the SID from chunk 1
-  let w = dedup(map(normalize, writable))
-  let r = dedup(map(normalize, read))
-  stampAcls(w, r, sid)
-```
-
-Keep `currentRestrictingSid` as a module global set by `buildRestrictedToken`
-(chunk 1 needs to store it alongside the token handle).
-
-### Key details
-
-- **FILE_ALL_ACCESS** = 0x1F01FF. **FILE_GENERIC_READ** = 0x120089.
-  **FILE_GENERIC_EXECUTE** = 0x1200A0. **FILE_GENERIC_WRITE** = 0x120116.
-- **DENY rights on volume root**: stamp DENY with `FILE_GENERIC_WRITE |
-  DELETE | ...` (the write/delete/create rights) NOT full deny. We must not
-  deny read or the process can't even enumerate the drive.
-- **Sub-container inheritance**: use `CONTAINER_INHERIT_ACE |
-  OBJECT_INHERIT_ACE` in the inheritance field so the ACE applies to children.
-- **SetEntriesInAcl** signature: `SetEntriesInAcl(count, entries, oldAcl,
-  newAcl)`. You pass a fresh EXPLICIT_ACCESS; it merges with the existing DACL.
-- **Path form**: Windows paths must use backslashes; `normalize` from std/os
-  produces OS-native separators, so on Windows it gives backslashes. Good.
-- **Drive root form**: `C:\` not `C:` or `C:\\`.
-- **Rollback is best-effort** in v1: enumerate `stampedPaths`, rebuild the
-  DACL without our SID's ACEs. It's fine if rollback can't handle a path that
-  was deleted; log to stderr and continue.
+   Keep tests fast (< 5s total): small timeouts, no real DNS (use
+   127.0.0.1 / localhost only).
 
 ## Verification
 
-1. Cross-compile for Windows:
-   ```
-   nim c --os:windows --cpu:amd64 --noLinking --path:src src/nimbox.nim
-   ```
-2. Linux still green:
-   ```
-   nimble test
-   ```
-3. `git diff` shows only `src/nimbox/acl.nim` changed.
-
-Use the todo tool for these.
+- `nimble test` green.
+- Manual smoke: write a temp policy `+example.com`, run a tiny main
+  that starts the proxy on a fixed port, then
+  `curl -x http://127.0.0.1:PORT https://example.com -I` works and
+  `curl -x http://127.0.0.1:PORT https://nim-lang.org -I` gets 403.
+  Delete the temp main after.
+- Commit: `wall proxy: CONNECT+SOCKS5 with hostname allowlist, mtime reload`.
 
 ## Next step
 
-When complete and verified, call context_clear with:
-- summary: "Chunk 2 done: ACL stamping (DENY on volume roots, ALLOW on
-  writable/read) with rollback recording. restrictImpl now builds token +
-  stamps. Cross-compiles windows/amd64, Linux tests green. No spawn yet."
-- instructions: "Read impl-3.md and execute the instructions there."
+When complete and verified, call clear with:
+- summary: "Chunk 2 done: wall/proxy.nim (CONNECT+SOCKS5 one-listener
+  proxy, HostList enforced, mtime reload, deny logs), wall.nim public
+  module, tests/test_proxy.nim green incl. curl smoke, committed."
+- instructions: "Read /home/carlo/p/sandwall/impl-3.md and execute it."
