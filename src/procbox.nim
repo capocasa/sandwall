@@ -25,6 +25,9 @@ export restrict
 import ./procbox/process
 export process
 
+import ./procbox/rules
+export rules
+
 # ----------------------------------------------------------------------- CLI
 
 when isMainModule:
