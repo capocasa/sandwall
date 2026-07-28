@@ -1,6 +1,6 @@
-# Network sandboxing research (procbox/sandwall "wall")
+# Network sandboxing research (sandwall/sandwall "wall")
 
-Goal: per-process network restriction to complement procbox's filesystem
+Goal: per-process network restriction to complement sandwall's filesystem
 sandbox, with the same shape: an unprivileged launcher applies OS-native
 restrictions to itself, then exec()s; the kernel enforces on every child.
 Policy is a list of allowed hosts/IPs (+ ports), deny by default, `*` for

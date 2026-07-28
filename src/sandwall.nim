@@ -1,15 +1,15 @@
-## procbox - a filesystem sandbox backed by OS-native primitives.
+## sandwall - a filesystem sandbox backed by OS-native primitives.
 ##
 ## Linux uses Landlock; macOS uses Seatbelt (sandbox_init_with_parameters).
 ## The user-facing API is identical on both.
 ##
 ## As a library:
-##   import procbox
+##   import sandwall
 ##   restrict("/tmp", "/home/me/work")
 ##   # this thread and all children can now only touch those paths
 ##
 ## As a binary:
-##   procbox restrict RWPATH [RWPATH ...] [--ro ROPATH ...] [--deny PATH ...] -- CMD [ARGS ...]
+##   sandwall restrict RWPATH [RWPATH ...] [--ro ROPATH ...] [--deny PATH ...] -- CMD [ARGS ...]
 ##   # confines itself to RWPATHs (writable) + ROPATHs (read-only), then exec()s CMD
 ##
 ## Two primitives, exposed both ways:
@@ -19,13 +19,13 @@
 ## See the `restrict` and `process` modules. Low-level Landlock access in
 ## `landlock`.
 
-import ./procbox/restrict
+import ./sandwall/restrict
 export restrict
 
-import ./procbox/process
+import ./sandwall/process
 export process
 
-import ./procbox/rules
+import ./sandwall/rules
 export rules
 
 # ----------------------------------------------------------------------- CLI
@@ -36,10 +36,10 @@ when isMainModule:
     import std/posix except Time
 
   const usage = """
-procbox - filesystem sandbox backed by OS-native primitives
+sandwall - filesystem sandbox backed by OS-native primitives
 
 Usage:
-  procbox restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+  sandwall restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
 
   Applies a sandbox allowing full access (read, write, create, delete,
   rename, execute) to the RWPATHs, read+execute access to the ROPATHs, and
@@ -51,9 +51,9 @@ Usage:
   not replace it.
 
 Examples:
-  procbox restrict /tmp /home/me/work -- ls -la
-  procbox restrict /build --ro /secrets -- make test
-  procbox restrict . -- make test
+  sandwall restrict /tmp /home/me/work -- ls -la
+  sandwall restrict /build --ro /secrets -- make test
+  sandwall restrict . -- make test
 
 Landlock is monotonic: the restriction is permanent for this process and all
 descendants. There is no "unrestrict".
@@ -125,7 +125,7 @@ descendants. There is no "unrestrict".
         return int(runSandboxed(writable, cmd, read = readOnly,
                                 denied = denied))
       except CatchableError as e:
-        stderr.writeLine("procbox: " & e.msg)
+        stderr.writeLine("sandwall: " & e.msg)
         return 127
     else:
       # posix: confine this process, then exec into CMD. Children inherit
@@ -140,7 +140,7 @@ descendants. There is no "unrestrict".
       try:
         exec(cmd)
       except CatchableError as e:
-        stderr.writeLine("procbox: " & e.msg)
+        stderr.writeLine("sandwall: " & e.msg)
         return 127
 
   quit(cliMain())

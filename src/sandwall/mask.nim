@@ -46,7 +46,7 @@ when defined(linux):
     if denied.len == 0: return
     if unshare(CLONE_NEWUSER_C or CLONE_NEWNS_C) != 0:
       raise newException(OSError,
-        "procbox: unshare(user+mount ns) failed (errno " & $errno &
+        "sandwall: unshare(user+mount ns) failed (errno " & $errno &
         "); unprivileged user namespaces may be disabled")
     # Map our own uid/gid to 0 inside the namespace so we keep ownership
     # of the bind mounts we make.
@@ -56,18 +56,18 @@ when defined(linux):
     # Don't let the masks propagate back to the host's mount table.
     if mount(nil, "/", nil, MS_REC_C or MS_PRIVATE_C, nil) != 0:
       raise newException(OSError,
-        "procbox: making mounts private failed (errno " & $errno & ")")
+        "sandwall: making mounts private failed (errno " & $errno & ")")
     for raw in denied:
       let d = paths.normalize(raw)
       if d.len == 0 or not (dirExists(d) or fileExists(d)): continue
       if dirExists(d):
-        let empty = getTempDir() / ("procbox-mask-" & $getpid() & "-" &
+        let empty = getTempDir() / ("sandwall-mask-" & $getpid() & "-" &
                                     $hash(d))
         if not dirExists(empty): createDir(empty)
         if mount(empty.cstring, d.cstring, nil, MS_BIND_C, nil) != 0:
           raise newException(OSError,
-            "procbox: bind-mask " & d & " failed (errno " & $errno & ")")
+            "sandwall: bind-mask " & d & " failed (errno " & $errno & ")")
       else:
         if mount("/dev/null".cstring, d.cstring, nil, MS_BIND_C, nil) != 0:
           raise newException(OSError,
-            "procbox: bind-mask " & d & " failed (errno " & $errno & ")")
+            "sandwall: bind-mask " & d & " failed (errno " & $errno & ")")

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to procbox. Dates are commit dates, not release dates.
+All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.2.0] - 2026-07-28
@@ -44,7 +44,7 @@ Nim API across three platforms.
 - **The two primitives**: `restrict(writable, read)` and `forkNimbox` / `exec`
   / `wait`. Same names, same semantics on every platform. `restrict.nim`
   dispatches to the active backend at compile time. (`cddce2c`)
-- **CLI**: `procbox restrict RWPATH... [--ro ROPATH...] -- CMD ARGS...`.
+- **CLI**: `sandwall restrict RWPATH... [--ro ROPATH...] -- CMD ARGS...`.
   Confines itself then `exec`s the command. System dirs are auto read-only so
   the command's binaries and libs stay runnable. `setsid` before exec gives the
   command its own process group for clean signal delivery. (`2af0796`,

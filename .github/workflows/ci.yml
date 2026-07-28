@@ -14,13 +14,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            artifact: procbox-linux-amd64
+            artifact: sandwall-linux-amd64
             ext: tar.gz
           - os: macos-latest
-            artifact: procbox-macos-universal
+            artifact: sandwall-macos-universal
             ext: tar.gz
           - os: windows-latest
-            artifact: procbox-windows-amd64
+            artifact: sandwall-windows-amd64
             ext: zip
 
     runs-on: ${{ matrix.os }}
@@ -37,16 +37,16 @@ jobs:
         run: nimble install -y --depsOnly
 
       - name: Build
-        run: nim c --path:src -d:release -o:procbox src/procbox.nim
+        run: nim c --path:src -d:release -o:sandwall src/sandwall.nim
 
       - name: Build x86_64 and create universal binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          mv procbox procbox-arm64
-          rm -rf ~/.cache/nim/procbox_r
-          nim c --path:src -d:release --passC:"-arch x86_64" --passL:"-arch x86_64" --cpu:amd64 -o:procbox-x86_64 src/procbox.nim
-          lipo -create procbox-arm64 procbox-x86_64 -output procbox
-          file procbox
+          mv sandwall sandwall-arm64
+          rm -rf ~/.cache/nim/sandwall_r
+          nim c --path:src -d:release --passC:"-arch x86_64" --passL:"-arch x86_64" --cpu:amd64 -o:sandwall-x86_64 src/sandwall.nim
+          lipo -create sandwall-arm64 sandwall-x86_64 -output sandwall
+          file sandwall
 
       - name: Run tests
         run: nimble test
@@ -56,7 +56,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p ${{ matrix.artifact }}
-          cp procbox ${{ matrix.artifact }}/
+          cp sandwall ${{ matrix.artifact }}/
           cp README.md LICENSE ${{ matrix.artifact }}/
           tar czf ${{ matrix.artifact }}.${{ matrix.ext }} ${{ matrix.artifact }}
 
@@ -65,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path ${{ matrix.artifact }} | Out-Null
-          Copy-Item procbox.exe ${{ matrix.artifact }}/
+          Copy-Item sandwall.exe ${{ matrix.artifact }}/
           Copy-Item README.md, LICENSE ${{ matrix.artifact }}/
           Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ${{ matrix.artifact }}.${{ matrix.ext }}
 
@@ -94,6 +94,6 @@ jobs:
             --repo ${{ github.repository }} \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            procbox-linux-amd64.tar.gz \
-            procbox-macos-universal.tar.gz \
-            procbox-windows-amd64.zip
+            sandwall-linux-amd64.tar.gz \
+            sandwall-macos-universal.tar.gz \
+            sandwall-windows-amd64.zip

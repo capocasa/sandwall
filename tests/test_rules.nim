@@ -2,7 +2,7 @@
 ## checkPath, resolve, render. Pure logic, no sandboxing involved.
 
 import std/[os, strutils, unittest]
-import procbox/rules
+import sandwall/rules
 
 const proj = when defined(windows): r"C:\work\proj" else: "/work/proj"
 
@@ -134,7 +134,7 @@ suite "render and append":
     check "a.com:443" in s
     check "*\n" in s
   test "appendRule writes the literal target":
-    let f = getTempDir() / "procbox-test-policy"
+    let f = getTempDir() / "sandwall-test-policy"
     removeFile(f)
     check appendRule(f, "./src", akReadOnly)
     check appendRule(f, "", akWritable)

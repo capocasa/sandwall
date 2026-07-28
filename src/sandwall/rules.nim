@@ -1,4 +1,4 @@
-## rules: the procbox policy file format, parser, and rule model.
+## rules: the sandwall policy file format, parser, and rule model.
 ##
 ## A policy is a tiny ordered DSL, one rule per line: an access code as
 ## the first character, one optional separating space, and a target.
@@ -29,7 +29,7 @@
 ## concrete path wins. Anything unmentioned is denied.
 ##
 ## Host rules are parsed and carried in the policy but not yet enforced:
-## the network half of procbox is a separate milestone. `resolve` collects
+## the network half of sandwall is a separate milestone. `resolve` collects
 ## them so callers can see (and later apply) the intended egress set.
 ##
 ## The default policy denies root, keeps the system temp dir writable

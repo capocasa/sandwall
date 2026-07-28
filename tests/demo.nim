@@ -7,10 +7,10 @@
 ##      but not writable, a writable path is both.
 
 import std/[os, osproc, posix, syncio, strutils]
-import procbox
+import sandwall
 
 const
-  sandboxDir = "/tmp/procbox-demo"
+  sandboxDir = "/tmp/sandwall-demo"
 
 proc cleanup() =
   try: removeDir(sandboxDir) except CatchableError: discard
@@ -45,9 +45,9 @@ proc main() =
   let roDir = sandboxDir & "-ro"
   createDir(roDir)
   writeFile(roDir / "secret.txt", "topsecret\n")
-  # invoke the procbox CLI built at the project root. --ro marks a path
+  # invoke the sandwall CLI built at the project root. --ro marks a path
   # read+execute only; reads succeed, writes fail.
-  let exe = parentDir(parentDir(currentSourcePath())) / "procbox"
+  let exe = parentDir(parentDir(currentSourcePath())) / "sandwall"
   echo "child reads the read-only path (succeeds):"
   discard execCmd(exe.quoteShell & " restrict " & sandboxDir.quoteShell &
                   " --ro " & roDir.quoteShell &

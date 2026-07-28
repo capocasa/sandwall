@@ -1,4 +1,4 @@
-# nimble file for procbox
+# nimble file for sandwall
 # Package
 
 version       = "0.2.1"
@@ -8,7 +8,7 @@ license       = "MIT"
 srcDir        = "src"
 installExt    = @["nim"]
 
-bin           = @["procbox"]
+bin           = @["sandwall"]
 
 
 # Dependencies
@@ -17,9 +17,9 @@ requires "nim >= 2.0.0"
 
 # Tasks / tests
 
-task test, "Run procbox tests":
+task test, "Run sandwall tests":
   # build the binary first; CLI tests invoke it from the project root
-  exec "nim c --path:src -d:release -o:procbox src/procbox.nim"
+  exec "nim c --path:src -d:release -o:sandwall src/sandwall.nim"
   withDir "tests":
     exec "nim c --path:../src -r test_sandbox.nim"
     exec "nim c --path:../src -r test_rules.nim"

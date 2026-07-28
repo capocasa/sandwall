@@ -1,4 +1,4 @@
-# procbox
+# sandwall
 
 A filesystem sandbox for Nim, backed by OS-native primitives: Linux
 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) and macOS
@@ -46,7 +46,7 @@ prior-art survey.
 ## As a binary
 
 ```
-procbox restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+sandwall restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
 ```
 
 Confines itself to the RWPATHs (read-write) plus any ROPATHs (read-only),
@@ -55,9 +55,9 @@ made read-only automatically so the command's binaries stay runnable;
 `--ro` adds to that set, it does not replace it.
 
 ```sh
-$ procbox restrict /tmp /home/me/work -- ls -la
-$ procbox restrict /build --ro /secrets -- make test
-$ procbox restrict . -- make test
+$ sandwall restrict /tmp /home/me/work -- ls -la
+$ sandwall restrict /build --ro /secrets -- make test
+$ sandwall restrict . -- make test
 ```
 
 The same binary is also the library, so a parent program can self-invoke via
@@ -121,7 +121,7 @@ Two backend caveats to know before writing tricky policies:
 ## As a library
 
 ```nim
-import procbox
+import sandwall
 
 # fork a child, restrict it, exec the untrusted command, wait
 let pid = forkNimbox()
@@ -194,8 +194,8 @@ CLI tests shell out to the binary; library tests fork a child per scenario
 
 ```
 src/
-  procbox.nim           # library + CLI (when isMainModule)
-  procbox/
+  sandwall.nim           # library + CLI (when isMainModule)
+  sandwall/
     restrict.nim       # the restrict() proc - dispatches to the OS backend
     process.nim        # forkNimbox / exec / wait (posix fork-exec)
     paths.nim          # path normalisation, shared across backends

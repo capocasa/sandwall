@@ -50,7 +50,7 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
       try:
         maskDenied(denied)
       except OSError as e:
-        stderr.writeLine("procbox: " & e.msg &
+        stderr.writeLine("sandwall: " & e.msg &
           "; continuing without sub-path deny enforcement")
     landlock.restrictImpl(writable, read)
   elif defined(macosx):
@@ -58,4 +58,4 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
   elif defined(windows):
     acl.restrictImpl(writable, read, denied)
   else:
-    {.error: "procbox restrict has no backend for this platform".}
+    {.error: "sandwall restrict has no backend for this platform".}
