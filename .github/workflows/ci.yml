@@ -49,7 +49,12 @@ jobs:
           file sandwall
 
       - name: Run tests
-        run: nimble test
+        run: |
+          set -o pipefail
+          nimble test 2>&1 | tee /tmp/sandwall-test.log
+          # A nimble task abort has failed to fail this step before;
+          # never report green with a FAILED test in the log.
+          ! grep -q '\[FAILED\]' /tmp/sandwall-test.log
 
       - name: Package (Unix)
         if: matrix.ext == 'tar.gz'

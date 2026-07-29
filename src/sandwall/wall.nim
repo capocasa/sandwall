@@ -18,11 +18,16 @@ export wfp.FirstProxyPort, wfp.LastProxyPort, wfp.validPortRange,
   wfp.providerGuidText, wfp.sublayerGuidText, wfp.permitV4GuidText,
   wfp.blockV4GuidText, wfp.permitV6GuidText, wfp.blockV6GuidText
 
-import ./wall/proxy
-export proxy
+when defined(posix):
+  # proxy/connect are POSIX-only today (AF_UNIX bridge, posix poll/
+  # splice loops). Windows gets the fence (wfp) and the user (winuser)
+  # but no in-library proxy yet; 3code runs the proxy via its own
+  # POSIX binary.
+  import ./wall/proxy
+  export proxy
 
-import ./wall/connect
-export connect
+  import ./wall/connect
+  export connect
 
 when defined(linux):
   import ./wall/netns
