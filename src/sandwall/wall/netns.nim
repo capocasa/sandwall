@@ -41,6 +41,7 @@ when defined(linux):
   proc ioctl(fd: cint; request: culong; arg: pointer): cint
       {.importc, header: "<sys/ioctl.h>".}
 
+
   type IfReq {.importc: "struct ifreq", header: "<net/if.h>".} = object
     ifr_name: array[16, char]
     ifr_flags: cshort ## start of the union; flags member sits at offset 0
@@ -140,13 +141,25 @@ when defined(linux):
     ## Bridge listener sockets live until exec/exit; keeping them in a
     ## global stops the net.Socket finalizer from closing the fd.
 
-  proc bridgeProcess(listener: SocketHandle; sockPath: string) =
+  proc bridgeProcess(listener: SocketHandle; sockPath: string;
+                     deathFd: cint) =
     ## The bridge's whole lifetime: accept and splice, one connection
     ## at a time. Single-threaded on purpose: threads do not survive a
     ## later fork() of this process, and the fenced consumer forks
     ## freely (runSandboxed nests it). Sequential accept keeps every
-    ## forked copy of the bridge a working one.
+    ## forked copy of the bridge a working one. Polls `deathFd`
+    ## alongside the listener: EOF there means the last holder of the
+    ## fenced command's pipe end is gone, so the bridge exits.
     while true:
+      var fds = [TPollfd(fd: listener.cint, events: POLLIN, revents: 0),
+                 TPollfd(fd: deathFd, events: POLLIN, revents: 0)]
+      let r = poll(addr fds[0], 2, -1)
+      if r < 0:
+        if osLastError().cint == EINTR: continue
+        return
+      if fds[1].revents != 0:
+        return  # parent pipe closed (or errored): command tree is gone
+      if (fds[0].revents and POLLIN) == 0: continue
       let cfd = posix.accept(listener, nil, nil)
       if cfd == osInvalidSocket:
         if osLastError().cint == EINTR: continue
@@ -159,18 +172,33 @@ when defined(linux):
     ## and fork a bridge process that splices every accepted connection
     ## to the AF_UNIX socket at sockPath (the host-side proxy
     ## listener). A separate process because exec() would kill an
-    ## in-process thread; the bridge dies with the netns when the last
-    ## fenced process exits. Call BEFORE exec. Returns the actual
-    ## bound port.
+    ## in-process thread. Call BEFORE exec. Returns the actual bound
+    ## port.
+    ##
+    ## Bridge lifetime: the restricting process (box) exec()s away
+    ## right after this call, and PR_SET_PDEATHSIG only fires when the
+    ## forking THREAD exits, not on exec - so instead the bridge
+    ## watches a pipe whose write end the parent holds. The write fd
+    ## is NOT close-on-exec: box's exec closes it implicitly? No -
+    ## exec only closes CLOEXEC fds, so the pipe end survives into the
+    ## exec'd command and the bridge lives exactly as long as the
+    ## fenced command tree (any fork of the command holds the fd too).
+    ## When the last holder exits the pipe hits EOF and the bridge
+    ## kills itself, releasing the netns.
     let sock = newSocket(buffered = false)
     sock.setSockOpt(OptReuseAddr, true)
     sock.bindAddr(Port(listenPort), "127.0.0.1")
     sock.listen()
     result = uint16(sock.getLocalAddr()[1])
+    var deathPipe: array[2, cint]
+    if posix.pipe(deathPipe) != 0:
+      raiseOSError(osLastError())
     let pid = posix.fork()
     if pid == 0:
-      bridgeProcess(sock.getFd(), sockPath)
+      discard posix.close(deathPipe[1])  # child only reads
+      bridgeProcess(sock.getFd(), sockPath, deathPipe[0])
       exitnow(0)
     if pid < 0:
       raiseOSError(osLastError())
+    discard posix.close(deathPipe[0])  # parent (and its exec) writes
     leaked.add(sock)
