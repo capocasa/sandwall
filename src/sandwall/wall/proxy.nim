@@ -173,8 +173,14 @@ proc splice(a, b: SocketHandle) =
   var bDead = false   # b -> a direction closed
   while not (aDead and bDead):
     var fds: array[2, TPollfd]
-    fds[0] = TPollfd(fd: a.cint, events: if aDead: 0'i16 else: POLLIN)
-    fds[1] = TPollfd(fd: b.cint, events: if bDead: 0'i16 else: POLLIN)
+    # A dead direction's fd is removed from the poll set (fd < 0
+    # makes poll ignore the entry): events=0 does NOT suffice,
+    # error conditions (POLLERR|POLLHUP) are reported
+    # unconditionally and the loop would busy-spin on the corpse.
+    fds[0] = TPollfd(fd: if aDead: -1.cint else: a.cint,
+                     events: POLLIN)
+    fds[1] = TPollfd(fd: if bDead: -1.cint else: b.cint,
+                     events: POLLIN)
     let r = poll(addr fds[0], 2, -1)
     if r < 0:
       if osLastError().cint == EINTR: continue
