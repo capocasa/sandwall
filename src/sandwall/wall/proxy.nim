@@ -182,11 +182,6 @@ proc splice(a, b: SocketHandle) =
     for i in 0 .. 1:
       let rev = fds[i].revents
       if rev == 0: continue
-      let alreadyDead = if i == 0: aDead else: bDead
-      if alreadyDead: continue
-        # A dead direction is polled with events=0 yet still reports
-        # POLLERR|POLLHUP forever; without this guard the loop
-        # busy-spins on the corpse.
       let (src, dst, buf) =
         if i == 0: (a, b, addr bufA[0])
         else: (b, a, addr bufB[0])

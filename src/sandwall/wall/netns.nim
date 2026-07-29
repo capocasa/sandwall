@@ -101,11 +101,6 @@ when defined(linux):
       for i in 0 .. 1:
         let rev = fds[i].revents
         if rev == 0: continue
-        let alreadyDead = if i == 0: aDead else: bDead
-        if alreadyDead: continue
-          # A dead direction is polled with events=0 yet still reports
-          # POLLERR|POLLHUP forever; without this guard the loop
-          # busy-spins on the corpse.
         let (src, dst) = if i == 0: (a, b) else: (b, a)
         let dead = if i == 0: addr aDead else: addr bDead
         if (rev and (POLLERR or POLLNVAL)) != 0:
