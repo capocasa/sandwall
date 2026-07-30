@@ -133,6 +133,12 @@ suite "cascade":
     when not defined(windows):
       check pol.checkPath("/tmp/x") == akWritable
       check pol.checkPath("/root/x") == akDeny
+  test "empty system level adds no rules":
+    # Regression: loadCascaded substitutes the default text only for an
+    # absent repo file; an absent system file contributes nothing.
+    # Doubling the default made every rule appear twice in renders.
+    let pol = parseCascaded("", defaultPolicyText(), proj)
+    check pol.rules.len == parsePolicy(defaultPolicyText(), proj).rules.len
 
 suite "render and append":
   test "render shows kinds and ports":

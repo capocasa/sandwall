@@ -240,13 +240,16 @@ proc parseCascaded*(sysText, repoText: string; projectDir: string): Policy =
   parsePolicy(sysText & "\n" & repoText, projectDir)
 
 proc loadCascaded*(projectDir: string): Policy =
-  ## Build the effective policy from two levels, system then repo. Each
-  ## level is the file contents when present, or the built-in default
-  ## text when absent, so the sandbox is "always on" even on a fresh
-  ## checkout. A repo-level `- /` cleanly resets everything above it,
+  ## Build the effective policy from two levels, system then repo. The
+  ## system level is the file contents when present, empty otherwise;
+  ## the repo level falls back to the built-in default text when its
+  ## file is absent, so the sandbox is "always on" even on a fresh
+  ## checkout. Only one level carries the default: substituting it at
+  ## both levels would double every default rule in the effective
+  ## policy. A repo-level `- /` cleanly resets everything above it,
   ## matching per-file last-wins semantics.
   let sysPath = systemPolicyPath()
-  let sysText = if fileExists(sysPath): readFile(sysPath) else: defaultPolicyText()
+  let sysText = if fileExists(sysPath): readFile(sysPath) else: ""
   let repoPath = repoPolicyPath(projectDir)
   let repoText = if fileExists(repoPath): readFile(repoPath) else: defaultPolicyText()
   parseCascaded(sysText, repoText, projectDir)
