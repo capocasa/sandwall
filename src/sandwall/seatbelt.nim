@@ -58,25 +58,6 @@ proc quote(s: string): string =
     result.add(c)
   result.add('"')
 
-proc directSubdirs(root: string): seq[string] =
-  ## Immediate child directories of `root`, skipping unreadable entries.
-  for kind, p in walkDir(root, relative = false):
-    if kind == pcDir: result.add p
-
-proc splitAround(root: string; denied: openArray[string]): seq[string] =
-  ## The parts of `root` that remain allowed after removing the denied
-  ## subpaths: `root` itself (file* ops, so no recursion) plus the sibling
-  ## subdirectories at every level down to each denied path. The denied
-  ## paths themselves are emitted as explicit denies afterwards.
-  result.add(root)
-  for d in denied:
-    var anc = d.parentDir
-    while isPathUnder(anc, root) and anc != root.parentDir and anc.len > root.len:
-      for sub in directSubdirs(anc):
-        if sub == d or isPathUnder(sub, d) or isPathUnder(d, sub): continue
-        result.add(sub)
-      anc = anc.parentDir
-
 proc buildProfile*(writable, read: openArray[string];
                   denied: openArray[string] = []; egress = true): string =
   ## Assemble the TinyScheme profile. Order is: (deny default), baseline read
@@ -88,6 +69,18 @@ proc buildProfile*(writable, read: openArray[string];
   ## narrower later allows reinstate on top.
   result = newStringOfCap(4096)
   result.add("(version 1)\n(deny default)\n")
+
+  # The sandboxed process (and anything it execs) stats `/` during
+  # startup path canonicalization; without this the exec'd image
+  # aborts before main (observed as SIGABRT on macOS 14+).
+  result.add("(allow file-read-data (literal \"/\"))\n")
+  # Seatbelt has no implicit traversal: stat'ing any path needs
+  # metadata access on every ancestor, and shells die when getcwd
+  # fails. Metadata (existence/type/timestamps, not content) stays
+  # open globally; content rules below do the real confinement. This
+  # is emitted BEFORE the per-policy denies so a `-` rule also
+  # hides the denied path's metadata (last match wins).
+  result.add("(allow file-read-metadata)\n")
 
   # Baseline: system dirs and devices the dynamic linker needs. The
   # baseline paths are OS-specific (defined in baseline.nim) and cover
@@ -132,30 +125,16 @@ proc buildProfile*(writable, read: openArray[string];
     if n.len > 0 and not deniedN.contains(n): deniedN.add(n)
 
   for w in wpaths:
-    let under = deniedN.filterIt(isPathUnder(it, w))
-    if under.len == 0:
-      result.add("(allow file-write* file-read*\n  (subpath " & quote(w) & "))\n")
-    else:
-      # Root narrowed by denies: the root itself as a literal-level rule
-      # plus the surviving sibling subtrees; denied subtrees are denied
-      # below.
-      result.add("(allow file-write* file-read*\n  (literal " & quote(w) & ")")
-      for s in splitAround(w, under):
-        if s != w:
-          result.add("\n  (subpath " & quote(s) & ")")
-      result.add(")\n")
+    result.add("(allow file-write* file-read*\n  (subpath " & quote(w) & "))\n")
   for p in rpaths:
-    let under = deniedN.filterIt(isPathUnder(it, p))
-    if under.len == 0:
-      result.add("(allow file-read*\n  (subpath " & quote(p) & "))\n")
-    else:
-      result.add("(allow file-read*\n  (literal " & quote(p) & ")")
-      for s in splitAround(p, under):
-        if s != p:
-          result.add("\n  (subpath " & quote(s) & ")")
-      result.add(")\n")
+    result.add("(allow file-read*\n  (subpath " & quote(p) & "))\n")
+  # Denies last: Seatbelt is last-match-wins, so a trailing deny
+  # reliably punches a hole in the broader allows above. (Putting
+  # denies first and splitting the allow around them was tried; the
+  # literal+sibling shape cannot express "dir contents minus subpath"
+  # and breaks file creation in the writable root.)
   for d in deniedN:
-    result.add("(deny file-write* file-read*\n  (subpath " & quote(d) & ")")
+    result.add("(deny file-write* file-read* file-read-metadata\n  (subpath " & quote(d) & ")")
     result.add("\n  (literal " & quote(d) & "))\n")
 
   if not egress:
