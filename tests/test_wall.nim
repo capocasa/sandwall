@@ -89,7 +89,7 @@ when defined(linux):
           discard posix.close(c)
       , (sock: echoSock))
       let policy = tmp / "policy.txt"
-      writeFile(policy, "+127.0.0.1\n")
+      writeFile(policy, "write 127.0.0.1\n")
       let sockPath = tmp / "proxy.sock"
       var p = startWallProxy(policy, tmp, unixSockPath = sockPath)
       defer: p.stopWallProxy()

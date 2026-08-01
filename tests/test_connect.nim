@@ -86,7 +86,7 @@ suite "wall connect":
 
   test "SOCKS5 handshake against the wall proxy, tunnel carries bytes":
     let policy = tmpDir / "policy.txt"
-    writeFile(policy, "+127.0.0.1:" & $echoPort & "\n")
+    writeFile(policy, "write 127.0.0.1:" & $echoPort & "\n")
     var p = startWallProxy(policy, tmpDir)
     defer: p.stopWallProxy()
     let (code, outData) = withFakeStdio("ping\n") do () -> int:
@@ -96,7 +96,7 @@ suite "wall connect":
 
   test "denied target returns 1":
     let policy = tmpDir / "policy.txt"
-    writeFile(policy, "+example.com\n")
+    writeFile(policy, "write example.com\n")
     var p = startWallProxy(policy, tmpDir)
     defer: p.stopWallProxy()
     let (code, _) = withFakeStdio("") do () -> int:

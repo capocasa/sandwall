@@ -3,6 +3,15 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- Policy DSL access codes replaced by words: `+` -> `write`, `-` ->
+  `deny`, `*` -> `read`. Arbitrary whitespace allowed between the word
+  and the target. Old-format policy files must be rewritten; the parser
+  silently drops old-style lines.
+
 ## [0.2.0] - 2026-07-28
 
 ### Added

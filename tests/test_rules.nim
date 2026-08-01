@@ -54,26 +54,36 @@ suite "host parsing":
 
 suite "path parsing":
   test "bare code means project dir":
-    let p = parsePolicy("+\n", proj)
+    let p = parsePolicy("write\n", proj)
     check p.rules.len == 1
     check p.rules[0].kind == rkPath
     check p.rules[0].access == akWritable
     check p.rules[0].path == proj.normalizedPath
+  test "arbitrary whitespace between verb and target":
+    let p = parsePolicy("deny\t\t/secret\n  write    /tmp\n", proj)
+    check p.rules.len == 2
+    check p.rules[0].access == akDeny
+    check p.rules[1].access == akWritable
+  test "host starting with a verb parses as host, not verb+rest":
+    let p = parsePolicy("deny.corp.internal\nreadout.example.com\n", proj)
+    check p.rules.len == 2
+    check p.rules[0].kind == rkHost and p.rules[0].host == "deny.corp.internal"
+    check p.rules[1].kind == rkHost and p.rules[1].host == "readout.example.com"
   test "relative resolves against project dir":
-    let p = parsePolicy("* ./src\n", proj)
+    let p = parsePolicy("read ./src\n", proj)
     check p.rules[0].access == akReadOnly
     check p.rules[0].path == (proj / "src").normalizedPath
   test "absolute kept, cleaned":
     when not defined(windows):
-      let p = parsePolicy("- /tmp/../etc\n", proj)
+      let p = parsePolicy("deny /tmp/../etc\n", proj)
       check p.rules[0].path == "/etc"
   test "comments, blanks, garbage skipped":
-    let p = parsePolicy("# note\n\n+ /tmp\n? bogus\n. oldsyntax\n", proj)
+    let p = parsePolicy("# note\n\nwrite /tmp\n? bogus\n", proj)
     check p.rules.len == 1
     check p.rules[0].path == (when defined(windows): "\\tmp" else: "/tmp")
 
 suite "checkPath":
-  const text = "- /\n+ /tmp\n+ ./\n* /var\n"
+  const text = "deny /\nwrite /tmp\nwrite ./\nread /var\n"
   let pol = parsePolicy(text, proj)
   test "last covering rule wins":
     check pol.checkPath((proj / "main.nim").normalizedPath) == akWritable
@@ -82,27 +92,27 @@ suite "checkPath":
       check pol.checkPath("/var/log") == akReadOnly
       check pol.checkPath("/etc/passwd") == akDeny
   test "deny default for the unmentioned":
-    let p2 = parsePolicy("+ ./\n", proj)
+    let p2 = parsePolicy("write ./\n", proj)
     when not defined(windows):
       check p2.checkPath("/elsewhere") == akDeny
   test "later deny overrides earlier allow":
-    let p3 = parsePolicy("+ /a\n- /a\n", proj)
+    let p3 = parsePolicy("write /a\ndeny /a\n", proj)
     when not defined(windows):
       check p3.checkPath("/a/f") == akDeny
   test "host rules never affect paths":
-    let p4 = parsePolicy("+ example.com\n", proj)
+    let p4 = parsePolicy("write example.com\n", proj)
     when not defined(windows):
       check p4.checkPath("/anything") == akDeny
 
 suite "resolve":
   test "writable/readonly split, denies dropped":
-    let pol = parsePolicy("+ /a\n* /b\n- /c\n+ /a\n- /b\n", proj)
+    let pol = parsePolicy("write /a\nread /b\ndeny /c\nwrite /a\ndeny /b\n", proj)
     let r = pol.resolve()
     when not defined(windows):
       check r.writable == @["/a"]
       check r.readonly.len == 0
   test "host rules pass through, last-wins per host:port key":
-    let pol = parsePolicy("+ a.com\n- a.com\n+ b.com:443\n+ a.com:80\n", proj)
+    let pol = parsePolicy("write a.com\ndeny a.com\nwrite b.com:443\nwrite a.com:80\n", proj)
     let r = pol.resolve()
     check r.hosts.len == 3
     check r.hosts[0].host == "a.com" and r.hosts[0].port == 0
@@ -110,7 +120,7 @@ suite "resolve":
     check r.hosts[1].host == "b.com" and r.hosts[1].port == 443
     check r.hosts[2].host == "a.com" and r.hosts[2].port == 80
   test "deny host rules survive resolve":
-    let pol = parsePolicy("+ a.com\n- b.com\n", proj)
+    let pol = parsePolicy("write a.com\ndeny b.com\n", proj)
     let r = pol.resolve()
     check r.hosts.len == 2
     check r.hosts[0].access == akWritable
@@ -118,12 +128,12 @@ suite "resolve":
 
 suite "cascade":
   test "repo supersedes system":
-    let pol = parseCascaded("+ /shared\n", "- /shared\n+ /repo\n", proj)
+    let pol = parseCascaded("write /shared\n", "deny /shared\nwrite /repo\n", proj)
     when not defined(windows):
       check pol.checkPath("/shared/x") == akDeny
       check pol.checkPath("/repo/x") == akWritable
   test "repo dash-slash resets system allows":
-    let pol = parseCascaded("+ /\n", "- /\n+ ./\n", proj)
+    let pol = parseCascaded("write /\n", "deny /\nwrite ./\n", proj)
     when not defined(windows):
       check pol.checkPath("/etc") == akDeny
       check pol.checkPath((proj / "f").normalizedPath) == akWritable
@@ -142,9 +152,9 @@ suite "cascade":
 
 suite "render and append":
   test "render shows kinds and ports":
-    let pol = parsePolicy("+ ./\n* /lib\n- /secret\n+ a.com:443\n+ *\n", proj)
+    let pol = parsePolicy("write ./\nread /lib\ndeny /secret\nwrite a.com:443\nwrite *\n", proj)
     let s = renderPolicy(pol)
-    check "write  " in s and "read   " in s and "deny   " in s
+    check "write " in s and "read  " in s and "deny  " in s
     check "a.com:443" in s
     check "*\n" in s
   test "appendRule writes the literal target":
@@ -153,5 +163,5 @@ suite "render and append":
     check appendRule(f, "./src", akReadOnly)
     check appendRule(f, "", akWritable)
     check appendRule(f, "api.x.com:8443", akWritable)
-    check readFile(f) == "* ./src\n+\n+ api.x.com:8443\n"
+    check readFile(f) == "read ./src\nwrite\nwrite api.x.com:8443\n"
     removeFile(f)

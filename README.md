@@ -71,25 +71,26 @@ execCmd("/proc/self/exe restrict /tmp -- ls -la")
 
 The `rules` module parses a tiny line-based policy DSL, shared by every
 consumer so the sandbox subprocess and the host program evaluate paths
-with the same code. One rule per line: an access code, a space, and a
-target.
+with the same code. One rule per line: an access word, arbitrary
+whitespace, and a target.
 
 ```
-- /                 deny everything under root
-+ /tmp              writable
-+                   writable project dir (bare code = project dir)
-* /var              read-only
-- ./secrets         deny, relative to the project dir
-+ api.example.com   host rule (parsed, not yet enforced)
-+ 10.0.0.1:8080     host with port (bare host = all ports)
-+*                  no network restrictions
+deny /              deny everything under root
+write /tmp          writable
+write               writable project dir (bare word = project dir)
+read /var           read-only
+deny ./secrets      deny, relative to the project dir
+write api.example.com   host rule (parsed, not yet enforced)
+write 10.0.0.1:8080 host with port (bare host = all ports)
+write *             no network restrictions
 ```
 
 The target's first character classifies it: `/` or `C:` absolute path,
 `~` home path, `.` project-relative path, alnum host (hostname, IPv4,
 IPv6, optional `:port`). Later rules supersede earlier ones for the
 targets they name; anything unmentioned is denied. `#` comments and
-blank lines are ignored.
+blank lines are ignored. A line starting with no access word is treated
+as a host rule, so hostnames like `deny.corp.internal` still parse.
 
 Host rules are the seam for the network sandbox (a separate milestone):
 they parse into the policy today and `resolve` collects them, but no

@@ -1,29 +1,33 @@
 ## rules: the sandwall policy file format, parser, and rule model.
 ##
-## A policy is a tiny ordered DSL, one rule per line: an access code as
-## the first character, one optional separating space, and a target.
-## Blank lines and `#` comments are skipped; unrecognised lines are
-## skipped silently so a half-edited file still loads its valid rules.
+## A policy is a tiny ordered DSL, one rule per line: an access word,
+## arbitrary whitespace, and a target. Blank lines and `#` comments are
+## skipped; unrecognised lines are skipped silently so a half-edited
+## file still loads its valid rules.
 ##
-## Access codes:
+## Access words:
 ##
-##   +  allow     - writable path, or connectable host
-##   -  deny      - no read, no write, no connect
-##   *  read-only - read + execute (path targets only)
+##   write  allow     - writable path, or connectable host
+##   deny   deny      - no read, no write, no connect
+##   read   read-only - read + execute (path targets only)
+##
+## A verb only matches at a word boundary (end of line or whitespace
+## after it), so hostnames that begin with the same letters
+## (`deny.corp.internal`) stay host rules.
 ##
 ## Target classification, by first character:
 ##
 ##   /            absolute path (POSIX)
 ##   X:           absolute path (Windows drive, e.g. C:\work)
 ##   ~            home-dir path
-##   .            path relative to the project dir; a bare access code
+##   .            path relative to the project dir; a bare access word
 ##                with no target means the project dir itself
 ##   [0-9A-Za-z]  host rule: hostname, IPv4, or IPv6 address, with an
 ##                optional :port suffix (host:443, [::1]:8080). No port
 ##                means all ports (stored as port 0).
 ##
-## `+*` is special: a host rule matching all networks, i.e. "no network
-## restrictions".
+## `write *` is special: a host rule matching all networks, i.e. "no
+## network restrictions".
 ##
 ## Rules run top-to-bottom; for paths, the last rule whose root covers a
 ## concrete path wins. Anything unmentioned is denied.
@@ -36,9 +40,9 @@
 ## (shells, git, and throwaway scripts need it), and opens the project
 ## dir for writing:
 ##
-##   - /
-##   + /tmp
-##   +
+##   deny /
+##   write /tmp
+##   write
 ##
 ## Cascading: an effective policy is the concatenation of a system-level
 ## file and a repo-level file, parsed once, so repo rules supersede
@@ -184,20 +188,25 @@ proc normalizePolicyPath*(p: string; projectDir: string): string =
 
 proc parsePolicy*(text: string; projectDir: string): Policy =
   ## Parse policy DSL text into ordered rules. Blank lines and `#`
-  ## comments are skipped. Unrecognised prefixes, bad hosts, and bad ports
+  ## comments are skipped. Unrecognised verbs, bad hosts, and bad ports
   ## are skipped silently so a half-edited file still loads its valid
   ## lines (the user owns this file and can see what they wrote).
   for raw in text.splitLines:
     let line = raw.strip(leading = true, trailing = false)
     if line.len == 0 or line[0] == '#': continue
-    let access =
-      case line[0]
-      of '-': akDeny
-      of '*': akReadOnly
-      of '+': akWritable
-      else: continue
-    var rest = if line.len > 1: line[1 .. ^1] else: ""
-    rest = rest.strip(leading = true, trailing = false)
+    # The access word must stand alone (end of line or whitespace
+    # after it); a line starting with anything else is treated as a
+    # host rule and dropped below when the host is invalid.
+    var access = akWritable
+    var rest = ""
+    let first = line.split(Whitespace, 1)[0]
+    case first
+    of "write": access = akWritable
+    of "deny": access = akDeny
+    of "read": access = akReadOnly
+    else: rest = line
+    if rest.len == 0:
+      rest = line[first.len .. ^1].strip(leading = true, trailing = false)
     if classifyTarget(rest) == rkPath:
       result.rules.add Rule(access: access, kind: rkPath,
                             path: normalizePolicyPath(rest, projectDir))
@@ -220,9 +229,9 @@ proc loadPolicy*(path: string; projectDir: string): Policy =
 proc defaultPolicyText*(): string =
   ## Deny root, keep the system temp dir writable, open the project dir.
   when defined(windows):
-    "- /\n+\n"
+    "deny /\nwrite\n"
   else:
-    "- /\n+ /tmp\n+\n"
+    "deny /\nwrite /tmp\nwrite\n"
 
 proc repoPolicyPath*(projectDir: string): string =
   projectDir / PolicyDir / PolicyFile
@@ -346,12 +355,12 @@ proc appendRule*(policyFile, target: string; access: AccessKind): bool =
   ## Append a single rule to `policyFile`. The literal `target` is
   ## written as-is so relative targets stay relative and the file stays
   ## portable and human-readable. Returns false on write failure.
-  let code =
+  let word =
     case access
-    of akDeny: "-"
-    of akReadOnly: "*"
-    of akWritable: "+"
-  let line = code & (if target.len > 0: " " & target else: "") & "\n"
+    of akDeny: "deny"
+    of akReadOnly: "read"
+    of akWritable: "write"
+  let line = word & (if target.len > 0: " " & target else: "") & "\n"
   try:
     var f = open(policyFile, fmAppend)
     try: f.write(line) finally: f.close()

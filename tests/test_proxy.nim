@@ -75,7 +75,7 @@ suite "wall proxy":
     removeDir(tmpDir)
 
   test "CONNECT allow tunnels bytes, port-restricted deny gets 403":
-    withPolicy "+127.0.0.1:" & $echoPort & "\n":
+    withPolicy "write 127.0.0.1:" & $echoPort & "\n":
       var p = startWallProxy(path, tmpDir)
       defer: p.stopWallProxy()
       var c = dial("127.0.0.1", Port(p.port), buffered = false)
@@ -96,7 +96,7 @@ suite "wall proxy":
       c.close()
 
   test "plain HTTP GET gets 405":
-    withPolicy "+127.0.0.1\n":
+    withPolicy "write 127.0.0.1\n":
       var p = startWallProxy(path, tmpDir)
       defer: p.stopWallProxy()
       let c = dial("127.0.0.1", Port(p.port), buffered = false)
@@ -107,7 +107,7 @@ suite "wall proxy":
       c.close()
 
   test "SOCKS5 allow and ruleset deny":
-    withPolicy "+localhost\n":
+    withPolicy "write localhost\n":
       var p = startWallProxy(path, tmpDir)
       defer: p.stopWallProxy()
       var c = dial("127.0.0.1", Port(p.port), buffered = false)
@@ -137,7 +137,7 @@ suite "wall proxy":
       c.close()
 
   test "policy reload on mtime change":
-    withPolicy "+example.com\n":
+    withPolicy "write example.com\n":
       var p = startWallProxy(path, tmpDir)
       defer: p.stopWallProxy()
       var c = dial("127.0.0.1", Port(p.port), buffered = false)
@@ -148,7 +148,7 @@ suite "wall proxy":
       c.close()
       # rewrite the policy, mtime pushed into the future so the change
       # is visible regardless of filesystem timestamp granularity
-      discard writePolicy("+127.0.0.1\n")
+      discard writePolicy("write 127.0.0.1\n")
       setLastModificationTime(path, getTime() + initDuration(seconds = 2))
       c = dial("127.0.0.1", Port(p.port), buffered = false)
       c.send("CONNECT 127.0.0.1:" & $echoPort & " HTTP/1.1\c\L\c\L")
