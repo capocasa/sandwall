@@ -83,8 +83,8 @@ type
     hosts*: seq[Rule]
 
 const
-  PolicyDir* = ".3code"
-  PolicyFile* = "sandbox"
+  PolicyFile* = ".sandboxrc"
+    ## The repo-level policy file, directly in the project dir.
 
 # ---------------------------------------------------------------- classification
 
@@ -234,7 +234,7 @@ proc defaultPolicyText*(): string =
     "deny /\nallow /tmp\nallow\n"
 
 proc repoPolicyPath*(projectDir: string): string =
-  projectDir / PolicyDir / PolicyFile
+  projectDir / PolicyFile
 
 proc systemPolicyPath*(): string =
   ## The system-level policy: next to the user config dir. Named "3code"
