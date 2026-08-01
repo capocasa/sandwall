@@ -48,7 +48,7 @@ proc redirectCmd(path: string): string =
 # CLI tests (shell out to the binary)
 
 suite "sandwall CLI (sandboxed exec)":
-  test "write allowed, write denied":
+  test "allow allowed, write denied":
     let a = tempDir("cli-a")
     let d = tempDir("cli-d")
     # the allowed write runs in one invocation, the denied in another,

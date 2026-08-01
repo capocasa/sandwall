@@ -7,9 +7,9 @@
 ##
 ## Access words:
 ##
-##   write  allow     - writable path, or connectable host
-##   deny   deny      - no read, no write, no connect
-##   read   read-only - read + execute (path targets only)
+##   allow    allow    - writable path, or connectable host
+##   deny     deny     - no read, no write, no connect
+##   readonly readonly - read + execute (path targets only)
 ##
 ## A verb only matches at a word boundary (end of line or whitespace
 ## after it), so hostnames that begin with the same letters
@@ -26,7 +26,7 @@
 ##                optional :port suffix (host:443, [::1]:8080). No port
 ##                means all ports (stored as port 0).
 ##
-## `write *` is special: a host rule matching all networks, i.e. "no
+## `allow *` is special: a host rule matching all networks, i.e. "no
 ## network restrictions".
 ##
 ## Rules run top-to-bottom; for paths, the last rule whose root covers a
@@ -41,8 +41,8 @@
 ## dir for writing:
 ##
 ##   deny /
-##   write /tmp
-##   write
+##   allow /tmp
+##   allow
 ##
 ## Cascading: an effective policy is the concatenation of a system-level
 ## file and a repo-level file, parsed once, so repo rules supersede
@@ -201,9 +201,9 @@ proc parsePolicy*(text: string; projectDir: string): Policy =
     var rest = ""
     let first = line.split(Whitespace, 1)[0]
     case first
-    of "write": access = akWritable
+    of "allow": access = akWritable
     of "deny": access = akDeny
-    of "read": access = akReadOnly
+    of "readonly": access = akReadOnly
     else: rest = line
     if rest.len == 0:
       rest = line[first.len .. ^1].strip(leading = true, trailing = false)
@@ -229,9 +229,9 @@ proc loadPolicy*(path: string; projectDir: string): Policy =
 proc defaultPolicyText*(): string =
   ## Deny root, keep the system temp dir writable, open the project dir.
   when defined(windows):
-    "deny /\nwrite\n"
+    "deny /\nallow\n"
   else:
-    "deny /\nwrite /tmp\nwrite\n"
+    "deny /\nallow /tmp\nallow\n"
 
 proc repoPolicyPath*(projectDir: string): string =
   projectDir / PolicyDir / PolicyFile
@@ -341,9 +341,9 @@ proc renderPolicy*(p: Policy): string =
   for r in p.rules:
     let label =
       case r.access
-      of akDeny: "deny   "
-      of akReadOnly: "read   "
-      of akWritable: "write  "
+      of akDeny: "deny    "
+      of akReadOnly: "readonly"
+      of akWritable: "allow   "
     case r.kind
     of rkPath:
       result.add label & "  " & r.path & "\n"
@@ -358,8 +358,8 @@ proc appendRule*(policyFile, target: string; access: AccessKind): bool =
   let word =
     case access
     of akDeny: "deny"
-    of akReadOnly: "read"
-    of akWritable: "write"
+    of akReadOnly: "readonly"
+    of akWritable: "allow"
   let line = word & (if target.len > 0: " " & target else: "") & "\n"
   try:
     var f = open(policyFile, fmAppend)

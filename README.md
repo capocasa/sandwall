@@ -76,13 +76,13 @@ whitespace, and a target.
 
 ```
 deny /              deny everything under root
-write /tmp          writable
-write               writable project dir (bare word = project dir)
-read /var           read-only
+allow /tmp          writable
+allow               writable project dir (bare word = project dir)
+readonly /var           read-only
 deny ./secrets      deny, relative to the project dir
-write api.example.com   host rule (parsed, not yet enforced)
-write 10.0.0.1:8080 host with port (bare host = all ports)
-write *             no network restrictions
+allow api.example.com   host rule (parsed, not yet enforced)
+allow 10.0.0.1:8080 host with port (bare host = all ports)
+allow *             no network restrictions
 ```
 
 The target's first character classifies it: `/` or `C:` absolute path,
