@@ -85,6 +85,9 @@ type
 const
   PolicyFile* = ".sandboxrc"
     ## The repo-level policy file, directly in the project dir.
+  UserPolicyFile* = "sandboxrc"
+    ## The user-level policy file, next to the user config dir. No dot:
+    ## it already lives inside a dot dir on most platforms.
 
 # ---------------------------------------------------------------- classification
 
@@ -237,10 +240,10 @@ proc repoPolicyPath*(projectDir: string): string =
   projectDir / PolicyFile
 
 proc systemPolicyPath*(): string =
-  ## The system-level policy: next to the user config dir. Named "3code"
+  ## The user-level policy: next to the user config dir. Named "3code"
   ## because 3code is the primary consumer; the file format itself is
   ## application-agnostic.
-  getConfigDir() / "3code" / PolicyFile
+  getConfigDir() / "3code" / UserPolicyFile
 
 proc parseCascaded*(sysText, repoText: string; projectDir: string): Policy =
   ## The pure, file-free core of `loadCascaded`: concatenate the two
