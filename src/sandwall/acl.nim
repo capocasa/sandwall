@@ -18,6 +18,7 @@ import ./paths
 
 when defined(windows):
   import std/[winlean, widestrs, sets, syncio]
+  import std/strutils except normalize
 
   # --- advapi32 security/token FFI (not in std/winlean) ---
 
@@ -46,18 +47,21 @@ when defined(windows):
       tokenHandle: ptr Handle): WINBOOL {.stdcall, dynlib: "advapi32",
       importc: "OpenProcessToken".}
 
-  # AllocateAndInitializeSid is C-variadic on the sub-authority values. Nim
-  # cannot import a variadic stdcall cleanly, so we declare the fixed 1
-  # sub-authority shape: the C signature is (auth, count, sub0..sub7, &pSid);
-  # with count=1 that is (auth, 1, sub0, &pSid). SID becomes
-  # S-<auth>-<one DWORD sub-authority>, plenty for a unique restricting SID.
-  proc allocateAndInitializeSid*(pIdentifierAuthority: ptr SidIdentifierAuthority;
-      nSubAuthorityCount: uint8; nSubAuthority0: DWORD;
-      pSid: ptr PSID): WINBOOL {.stdcall,
-      dynlib: "advapi32", importc: "AllocateAndInitializeSid".}
+  # AllocateAndInitializeSid is C-variadic on the sub-authority values,
+  # which Nim cannot import cleanly - and the fixed-arity approximation
+  # corrupts the output pointer on the Win64 ABI (observed as
+  # CreateRestrictedToken failing with error 998). Build the SID manually
+  # instead: InitializeSid + GetSidSubAuthority are both fixed-arity.
+  proc getSidLengthRequired*(nSubAuthorityCount: uint8): DWORD {.stdcall,
+      dynlib: "advapi32", importc: "GetSidLengthRequired".}
 
-  proc freeSid*(pSid: PSID): pointer {.stdcall, dynlib: "advapi32",
-      importc: "FreeSid".}
+  proc initializeSid*(pSid: PSID;
+      pIdentifierAuthority: ptr SidIdentifierAuthority;
+      nSubAuthorityCount: uint8): WINBOOL {.stdcall,
+      dynlib: "advapi32", importc: "InitializeSid".}
+
+  proc getSidSubAuthority*(pSid: PSID; nSubAuthority: DWORD): ptr DWORD
+      {.stdcall, dynlib: "advapi32", importc: "GetSidSubAuthority".}
 
   proc createRestrictedToken*(existingToken: Handle; flags: DWORD;
       sidToDisableCount: DWORD; sidToDisable: ptr PSID;
@@ -229,24 +233,30 @@ when defined(windows):
       fail("OpenProcessToken")
     defer: discard closeHandle(base)
 
-    # Fresh restricting SID. The seed mixes the PID with a stack address for
-    # per-call variance; it is NOT crypto-strength, but it is never constant
-    # (chunk 2 may swap in a proper RNG). Avoiding a fixed seed matters
-    # because a constant SID would let one sandbox's ACLs leak across runs.
+    # Fresh restricting SID S-1-5-<seed>. The seed mixes the PID with a
+    # stack address for per-call variance; it is NOT crypto-strength, but
+    # it is never constant. Avoiding a fixed seed matters because a
+    # constant SID would let one sandbox's ACLs leak across runs.
     #
-    # The SID is intentionally NOT freed here: stampAcls/rollbackAcls need it
-    # alive for the lifetime of the sandbox (until the spawn rolls back). One
-    # SID per sandbox (~8 bytes) is a bounded, acceptable cost. Freeing the
-    # previous SID on re-entry is the caller's job (restrictImpl).
+    # The SID is intentionally NOT freed here: stampAcls/rollbackAcls need
+    # it alive for the lifetime of the sandbox (until the spawn rolls
+    # back). One SID per sandbox (~12 bytes) is a bounded, acceptable
+    # cost. Freeing the previous SID on re-entry is restrictImpl's job.
+    # Built with InitializeSid + GetSidSubAuthority (fixed-arity FFI);
+    # the buffer is plain Nim memory, freed with dealloc, never FreeSid.
     var authority = securityNtAuthority
     if currentRestrictingSid != nil:
-      discard freeSid(currentRestrictingSid)
+      dealloc(currentRestrictingSid)
     currentRestrictingSid = nil
     var stackAnchor = 0
     let seed = getCurrentProcessId() xor cast[DWORD](cast[uint](addr stackAnchor))
-    if allocateAndInitializeSid(addr authority, 1'u8, seed,
-        addr currentRestrictingSid) == 0:
-      fail("AllocateAndInitializeSid")
+    let sidLen = getSidLengthRequired(1)
+    currentRestrictingSid = cast[PSID](alloc0(sidLen.int))
+    if initializeSid(currentRestrictingSid, addr authority, 1) == 0:
+      dealloc(currentRestrictingSid)
+      currentRestrictingSid = nil
+      fail("InitializeSid")
+    getSidSubAuthority(currentRestrictingSid, 0)[] = seed
 
     var restricted: Handle
     if createRestrictedToken(base, DISABLE_MAX_PRIVILEGE,
@@ -254,7 +264,7 @@ when defined(windows):
         0, nil,          # no privileges to delete
         1, addr currentRestrictingSid,  # one restricting SID
         addr restricted) == 0:
-      discard freeSid(currentRestrictingSid)
+      dealloc(currentRestrictingSid)
       currentRestrictingSid = nil
       fail("CreateRestrictedToken")
     return restricted
@@ -331,14 +341,14 @@ when defined(windows):
     writeDacl(path, newAcl)
 
   proc enumerateVolumeRoots*(): seq[string] =
-    ## Return every mounted volume root in the volume GUID path form
-    ## returned by FindFirstVolumeW. SetNamedSecurityInfo accepts these
-    ## directly, so there is no need to resolve each to a drive letter;
-    ## stamping the GUID path covers every file on that volume regardless of
-    ## which drive letter (if any) fronts it. Returns empty if enumeration
-    ## fails, in which case the sandbox degrades to denying nothing at the
-    ## volume layer (still enforces via the absence of ALLOW ACEs on
-    ## non-writable paths).
+    ## Return every mounted volume root in the volume GUID path form,
+    ## WITHOUT the trailing backslash FindFirstVolumeW appends:
+    ## SetNamedSecurityInfo rejects the backslashed form (access denied),
+    ## verified on Windows 11. Stamping the GUID path covers every file on
+    ## that volume regardless of which drive letter (if any) fronts it.
+    ## Returns empty if enumeration fails, in which case the sandbox
+    ## degrades to denying nothing at the volume layer (still enforces via
+    ## the absence of ALLOW ACEs on non-writable paths).
     var nameBuf: array[MAX_VOLUME_NAME, Utf16Char]
     let h = findFirstVolumeW(addr nameBuf[0], DWORD(nameBuf.len))
     if h == -1:
@@ -346,7 +356,8 @@ when defined(windows):
     defer: discard findVolumeClose(h)
 
     while true:
-      let guidPath = $cast[WideCString](addr nameBuf[0])
+      var guidPath = $cast[WideCString](addr nameBuf[0])
+      if guidPath.endsWith("\\"): guidPath.setLen(guidPath.len - 1)
       result.add(guidPath)
       if findNextVolumeW(h, addr nameBuf[0], DWORD(nameBuf.len)) == 0:
         break

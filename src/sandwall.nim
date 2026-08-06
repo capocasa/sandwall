@@ -118,25 +118,26 @@ filesystem policy are enforced with no setup step.
     # would miss CMD's children.
     when defined(posix):
       discard setsid()
-    try:
-      restrict(rules, projectDir, policyPath)
-    except CatchableError as e:
-      stderr.writeLine("sandwall: " & e.msg)
-      return 127
-    when defined(windows):
-      # Windows cannot confine the current process; restrict() only
-      # prepares the token and stamps ACLs, so the child is spawned
-      # with that token instead of exec'd.
-      let r = resolve(rules)
       try:
-        return int(runSandboxed(r.writable, cmd, read = r.readonly,
-                                denied = r.denied))
+        restrict(rules, projectDir, policyPath)
+        exec(cmd)
       except CatchableError as e:
         stderr.writeLine("sandwall: " & e.msg)
         return 127
     else:
+      # Windows cannot confine the current process; runSandboxed
+      # restricts (token + ACL stamps) and spawns the child with the
+      # restricted token, rolling the ACLs back after. Host rules are
+      # rejected: the network fence lives on the sandwall-user spawn
+      # path (wall/winuser.nim), not here.
+      let r = resolve(rules)
+      if r.hosts.len > 0:
+        stderr.writeLine("sandwall: host rules (network fence) are not " &
+          "supported by this command on Windows yet")
+        return 2
       try:
-        exec(cmd)
+        return int(runSandboxed(r.writable, cmd, read = r.readonly,
+                                denied = r.denied))
       except CatchableError as e:
         stderr.writeLine("sandwall: " & e.msg)
         return 127
