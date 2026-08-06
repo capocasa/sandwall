@@ -55,32 +55,32 @@ suite "host parsing":
 suite "path parsing":
   test "bare code means project dir":
     let p = parsePolicy("allow\n", proj)
-    check p.rules.len == 1
-    check p.rules[0].kind == rkPath
-    check p.rules[0].access == akWritable
-    check p.rules[0].path == proj.normalizedPath
+    check p.len == 1
+    check p[0].kind == rkPath
+    check p[0].access == akWritable
+    check p[0].path == proj.normalizedPath
   test "arbitrary whitespace between verb and target":
     let p = parsePolicy("deny\t\t/secret\n  allow    /tmp\n", proj)
-    check p.rules.len == 2
-    check p.rules[0].access == akDeny
-    check p.rules[1].access == akWritable
+    check p.len == 2
+    check p[0].access == akDeny
+    check p[1].access == akWritable
   test "host starting with a verb parses as host, not verb+rest":
     let p = parsePolicy("deny.corp.internal\nreadout.example.com\n", proj)
-    check p.rules.len == 2
-    check p.rules[0].kind == rkHost and p.rules[0].host == "deny.corp.internal"
-    check p.rules[1].kind == rkHost and p.rules[1].host == "readout.example.com"
+    check p.len == 2
+    check p[0].kind == rkHost and p[0].host == "deny.corp.internal"
+    check p[1].kind == rkHost and p[1].host == "readout.example.com"
   test "relative resolves against project dir":
     let p = parsePolicy("readonly ./src\n", proj)
-    check p.rules[0].access == akReadOnly
-    check p.rules[0].path == (proj / "src").normalizedPath
+    check p[0].access == akReadOnly
+    check p[0].path == (proj / "src").normalizedPath
   test "absolute kept, cleaned":
     when not defined(windows):
       let p = parsePolicy("deny /tmp/../etc\n", proj)
-      check p.rules[0].path == "/etc"
+      check p[0].path == "/etc"
   test "comments, blanks, garbage skipped":
     let p = parsePolicy("# note\n\nallow /tmp\n? bogus\n", proj)
-    check p.rules.len == 1
-    check p.rules[0].path == (when defined(windows): "\\tmp" else: "/tmp")
+    check p.len == 1
+    check p[0].path == (when defined(windows): "\\tmp" else: "/tmp")
 
 suite "checkPath":
   const text = "deny /\nallow /tmp\nallow ./\nreadonly /var\n"
@@ -126,29 +126,20 @@ suite "resolve":
     check r.hosts[0].access == akWritable
     check r.hosts[1].host == "b.com" and r.hosts[1].access == akDeny
 
-suite "cascade":
-  test "repo supersedes system":
-    let pol = parseCascaded("allow /shared\n", "deny /shared\nallow /repo\n", proj)
+suite "concatenated levels":
+  # Cascade semantics are the consumer's job (3code concatenates its
+  # levels and parses once); these tests pin the property that makes
+  # that work: later text supersedes earlier text in one parse.
+  test "later text supersedes earlier":
+    let pol = parsePolicy("allow /shared\n" & "\n" & "deny /shared\nallow /repo\n", proj)
     when not defined(windows):
       check pol.checkPath("/shared/x") == akDeny
       check pol.checkPath("/repo/x") == akWritable
-  test "repo dash-slash resets system allows":
-    let pol = parseCascaded("allow /\n", "deny /\nallow ./\n", proj)
+  test "later deny-slash resets earlier allows":
+    let pol = parsePolicy("allow /\n" & "\n" & "deny /\nallow ./\n", proj)
     when not defined(windows):
       check pol.checkPath("/etc") == akDeny
       check pol.checkPath((proj / "f").normalizedPath) == akWritable
-  test "default text parses to the documented policy":
-    let pol = parsePolicy(defaultPolicyText(), proj)
-    check pol.checkPath(proj.normalizedPath) == akWritable
-    when not defined(windows):
-      check pol.checkPath("/tmp/x") == akWritable
-      check pol.checkPath("/root/x") == akDeny
-  test "empty system level adds no rules":
-    # Regression: loadCascaded substitutes the default text only for an
-    # absent repo file; an absent system file contributes nothing.
-    # Doubling the default made every rule appear twice in renders.
-    let pol = parseCascaded("", defaultPolicyText(), proj)
-    check pol.rules.len == parsePolicy(defaultPolicyText(), proj).rules.len
 
 suite "render and append":
   test "render shows kinds and ports":

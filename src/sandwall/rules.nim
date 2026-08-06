@@ -32,21 +32,14 @@
 ## Rules run top-to-bottom; for paths, the last rule whose root covers a
 ## concrete path wins. Anything unmentioned is denied.
 ##
-## Host rules are parsed and carried in the policy but not yet enforced:
-## the network half of sandwall is a separate milestone. `resolve` collects
-## them so callers can see (and later apply) the intended egress set.
+## Host rules are the seam for the network wall: `resolve` collects
+## them and `restrict` enforces them (hostname-allowlist proxy behind a
+## kernel loopback fence).
 ##
-## The default policy denies root, keeps the system temp dir writable
-## (shells, git, and throwaway scripts need it), and opens the project
-## dir for writing:
-##
-##   deny /
-##   allow /tmp
-##   allow
-##
-## Cascading: an effective policy is the concatenation of a system-level
-## file and a repo-level file, parsed once, so repo rules supersede
-## system rules exactly like rules within one file.
+## A policy here is a plain `seq[Rule]`; there is no wrapper object.
+## File discovery, level cascading, and default rules are the
+## consumer's job (3code): concatenate the texts you want and call
+## `parsePolicy` once.
 
 import std/[os, strutils, tables]
 
@@ -66,9 +59,6 @@ type
       host*: string        ## hostname, IPv4/IPv6 literal, or "*" for all
       port*: uint16        ## 0 = all ports
 
-  Policy* = object
-    rules*: seq[Rule]
-
   Resolved* = object
     ## The consumed form of a policy: path roots for the filesystem
     ## backends, plus the parsed host rules for the (future) network half.
@@ -81,13 +71,6 @@ type
       ## the backends enforce them on top (Seatbelt/Windows subtract
       ## natively, Linux bind-masks them in a mount namespace).
     hosts*: seq[Rule]
-
-const
-  PolicyFile* = ".sandboxrc"
-    ## The repo-level policy file, directly in the project dir.
-  UserPolicyFile* = "sandboxrc"
-    ## The user-level policy file, next to the user config dir. No dot:
-    ## it already lives inside a dot dir on most platforms.
 
 # ---------------------------------------------------------------- classification
 
@@ -189,7 +172,7 @@ proc normalizePolicyPath*(p: string; projectDir: string): string =
 
 # ---------------------------------------------------------------- parsing
 
-proc parsePolicy*(text: string; projectDir: string): Policy =
+proc parsePolicy*(text: string; projectDir: string): seq[Rule] =
   ## Parse policy DSL text into ordered rules. Blank lines and `#`
   ## comments are skipped. Unrecognised verbs, bad hosts, and bad ports
   ## are skipped silently so a half-edited file still loads its valid
@@ -211,65 +194,21 @@ proc parsePolicy*(text: string; projectDir: string): Policy =
     if rest.len == 0:
       rest = line[first.len .. ^1].strip(leading = true, trailing = false)
     if classifyTarget(rest) == rkPath:
-      result.rules.add Rule(access: access, kind: rkPath,
-                            path: normalizePolicyPath(rest, projectDir))
+      result.add Rule(access: access, kind: rkPath,
+                      path: normalizePolicyPath(rest, projectDir))
     else:
       try:
         let (host, port) = parseHost(rest)
-        result.rules.add Rule(access: access, kind: rkHost,
-                              host: host, port: port)
+        result.add Rule(access: access, kind: rkHost,
+                        host: host, port: port)
       except ValueError:
         continue
 
-proc loadPolicy*(path: string; projectDir: string): Policy =
+proc loadPolicy*(path: string; projectDir: string): seq[Rule] =
   ## Read and parse the policy file at `path`, resolving relative targets
-  ## against `projectDir`. A missing file yields an empty policy.
-  if not fileExists(path): return Policy()
+  ## against `projectDir`. A missing file yields no rules.
+  if not fileExists(path): return @[]
   parsePolicy(readFile(path), projectDir)
-
-# ---------------------------------------------------------------- cascade
-
-proc defaultPolicyText*(): string =
-  ## Deny root, keep the system temp dir writable, open the project dir.
-  when defined(windows):
-    "deny /\nallow\n"
-  else:
-    "deny /\nallow /tmp\nallow\n"
-
-proc repoPolicyPath*(projectDir: string): string =
-  projectDir / PolicyFile
-
-proc systemPolicyPath*(): string =
-  ## The user-level policy: next to the user config dir. Named "3code"
-  ## because 3code is the primary consumer; the file format itself is
-  ## application-agnostic.
-  getConfigDir() / "3code" / UserPolicyFile
-
-proc parseCascaded*(sysText, repoText: string; projectDir: string): Policy =
-  ## The pure, file-free core of `loadCascaded`: concatenate the two
-  ## levels and parse once. Factored out so last-wins concatenation
-  ## semantics can be unit-tested without touching the real files.
-  parsePolicy(sysText & "\n" & repoText, projectDir)
-
-proc loadCascaded*(projectDir: string): Policy =
-  ## Build the effective policy from two levels, system then repo. The
-  ## system level is the file contents when present, empty otherwise;
-  ## the repo level falls back to the built-in default text when its
-  ## file is absent, so the sandbox is "always on" even on a fresh
-  ## checkout. Only one level carries the default: substituting it at
-  ## both levels would double every default rule in the effective
-  ## policy. A repo-level `- /` cleanly resets everything above it,
-  ## matching per-file last-wins semantics.
-  let sysPath = systemPolicyPath()
-  let sysText = if fileExists(sysPath): readFile(sysPath) else: ""
-  let repoPath = repoPolicyPath(projectDir)
-  let repoText = if fileExists(repoPath): readFile(repoPath) else: defaultPolicyText()
-  parseCascaded(sysText, repoText, projectDir)
-
-proc cascadedFiles*(projectDir: string): tuple[system, repo: string] =
-  ## The two files `loadCascaded` reads, for mtime watching and for
-  ## passing to subprocesses that load the policy themselves.
-  (systemPolicyPath(), repoPolicyPath(projectDir))
 
 # ---------------------------------------------------------------- queries
 
@@ -283,16 +222,16 @@ proc isPathUnder*(path, root: string): bool =
   let r = if root.endsWith(sep): root else: root & sep
   path.startsWith(r)
 
-proc checkPath*(p: Policy; path: string): AccessKind =
+proc checkPath*(rules: openArray[Rule]; path: string): AccessKind =
   ## Effective access for a concrete absolute `path`: the last path rule
   ## whose root covers it wins. Deny when nothing covers the path, which
   ## is the safe default. Host rules never affect paths.
   result = akDeny
-  for r in p.rules:
+  for r in rules:
     if r.kind == rkPath and isPathUnder(path, r.path):
       result = r.access
 
-proc resolve*(p: Policy): Resolved =
+proc resolve*(rules: openArray[Rule]): Resolved =
   ## Walk the ordered rules into the consumed form. Last-wins per
   ## canonical path: a later rule for a path supersedes every earlier one
   ## for that same path. Deny is the default for anything unmentioned, so
@@ -302,7 +241,7 @@ proc resolve*(p: Policy): Resolved =
   ## exact same key); the wall matcher applies ordering across keys.
   var latest: Table[string, AccessKind]
   var order: seq[string]
-  for r in p.rules:
+  for r in rules:
     case r.kind
     of rkPath:
       if r.path notin latest: order.add r.path
@@ -336,12 +275,12 @@ proc resolve*(p: Policy): Resolved =
           for ro in result.readonly:
             if isPathUnder(k, ro): result.denied.add k; break
 
-proc renderPolicy*(p: Policy): string =
+proc renderPolicy*(rules: openArray[Rule]): string =
   ## Human-readable dump of the effective rules, newest last (matching
-  ## file order). Used by `:sandbox show` in 3code.
-  if p.rules.len == 0:
+  ## file order).
+  if rules.len == 0:
     return "(no sandbox rules)"
-  for r in p.rules:
+  for r in rules:
     let label =
       case r.access
       of akDeny: "deny    "
