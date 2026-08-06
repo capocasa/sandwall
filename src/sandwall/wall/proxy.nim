@@ -462,6 +462,124 @@ proc startWallProxy*(policyPath: string; projectDir: string;
   ## address checks are skipped (filesystem perms are the ACL).
   startProxyListeners(policyPath, projectDir, port, unixSockPath, verbose)
 
+proc proxyChild*(dir, policyPath, projectDir: string; sockFd: SocketHandle;
+                deathFd, portFd: cint; verbose: bool) =
+  ## The forked proxy's whole lifetime: serve until the death pipe
+  ## says the sandboxed command tree is gone, then clean up the run
+  ## dir and exit. The dir exists only while this process lives, so a
+  ## crashed parent never leaves a listening proxy behind; the dir is
+  ## recreated below when the parent vanished before the child started
+  ## (the kernel keeps the bound sockets either way, this is for the
+  ## unix listener path and cleanup symmetry).
+  createDir(dir)
+  let ctx = cast[ptr ProxyCtx](allocShared0(sizeof(ProxyCtx)))
+  ctx[] = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
+                                   projectDir: projectDir,
+                                   verbose: verbose,
+                                   running: true))
+  ctx.sh.listeners.add(sockFd)
+  when defined(linux):
+    ctx.sh.listeners.add(listenUnix(dir / "proxy.sock"))
+  initLock(ctx.sh.lock)
+  ctx.sh.loadList()
+  var sa: Sockaddr_in
+  var slen = SockLen(sizeof(sa))
+  if getsockname(sockFd, cast[ptr SockAddr](addr sa), addr slen) != 0:
+    raiseOSError(osLastError())
+  let port = uint16(nativesockets.ntohs(sa.sin_port))
+  # Port back to the parent over a pipe: plain write(), not sendFd
+  # (posix.send is for sockets and fails ENOTSOCK on pipes).
+  var ps = $port
+  discard posix.write(portFd, addr ps[0], ps.len)
+  discard posix.close(portFd)
+  while true:
+    var fds = @[TPollfd(fd: deathFd, events: POLLIN, revents: 0)]
+    for l in ctx.sh.listeners:
+      fds.add TPollfd(fd: l.cint, events: POLLIN, revents: 0)
+    let r = poll(addr fds[0], fds.len.Tnfds, -1)
+    if r < 0:
+      if osLastError().cint == EINTR: continue
+      break
+    if fds[0].revents != 0: break   # command tree is gone
+    for i in 1 ..< fds.len:
+      if (fds[i].revents and POLLIN) == 0: continue
+      let fd = posix.accept(SocketHandle(fds[i].fd), nil, nil)
+      if fd == osInvalidSocket:
+        if osLastError().cint == EINTR: continue
+        sleep(10)
+        continue
+      ctx.sh.maybeReload()
+      ctx.sh.serveClient(fd)
+      break
+  for l in ctx.sh.listeners:
+    discard posix.close(l)
+  deinitLock(ctx.sh.lock)
+  deallocShared(ctx)
+  removeDir(dir)
+
+type
+  SpawnedProxy* = object
+    ## A per-invocation wall proxy, forked before any restriction is
+    ## applied so it keeps full network access. Lives exactly as long
+    ## as the sandboxed command tree (death pipe); there is one proxy
+    ## per run and never a shared instance.
+    port*: uint16          ## loopback TCP port the proxy bound
+    runDir*: string        ## holds proxy.sock (linux) and any policy copy
+    sockPath*: string      ## AF_UNIX listener, linux only ("" elsewhere)
+    pid*: Pid
+
+proc spawnWallProxy*(policyPath, projectDir: string;
+                     verbose = false): SpawnedProxy =
+  ## Fork the wall proxy as a child process and return where it
+  ## listens. Call BEFORE restrict()/exec: after exec the in-process
+  ## proxy threads would be gone, and after restrict the child would
+  ## inherit the fence and be useless. `policyPath` is watched for
+  ## mtime changes, so editing the rules file between (or during) runs
+  ## is picked up on the next connection.
+  ##
+  ## The run dir (/tmp/sandwall-PID) is removed by the child on exit.
+  ## The child exits as soon as the last holder of the death pipe is
+  ## gone, which is when the restricting process and every descendant
+  ## of the command it exec'd have died.
+  let runDir = getTempDir() / ("sandwall-" & $getCurrentProcessId())
+  createDir(runDir)
+  let sock = newSocket(buffered = false)
+  sock.setSockOpt(OptReuseAddr, true)
+  sock.bindAddr(Port(0), "127.0.0.1")
+  sock.listen()
+  var deathPipe, portPipe: array[2, cint]
+  if posix.pipe(deathPipe) != 0 or posix.pipe(portPipe) != 0:
+    raiseOSError(osLastError())
+  let pid = posix.fork()
+  if pid == 0:
+    discard posix.close(deathPipe[1])
+    discard posix.close(portPipe[0])
+    try:
+      proxyChild(runDir, policyPath, projectDir, sock.getFd(),
+                 deathPipe[0], portPipe[1], verbose)
+    except CatchableError:
+      discard
+    exitnow(0)
+  if pid < 0:
+    raiseOSError(osLastError())
+  discard posix.close(deathPipe[0])
+  discard posix.close(portPipe[1])
+  var buf = newString(8)
+  let n = posix.read(portPipe[0], addr buf[0], 8)
+  discard posix.close(portPipe[0])
+  if n <= 0:
+    raise newException(IOError, "sandwall: wall proxy failed to start")
+  buf.setLen(n)
+  result.port = uint16(parseInt(buf))
+  result.runDir = runDir
+  when defined(linux):
+    result.sockPath = runDir / "proxy.sock"
+  result.pid = pid
+  # The death pipe write end is intentionally left open and leaked:
+  # the exec'd command and its descendants hold it, and its close is
+  # what tells the proxy child to exit. Same trick as the netns
+  # bridge (wall/netns.nim).
+
 proc stopWallProxy*(p: var WallProxy) =
   ## Close the listener, join the accept thread. Client threads are
   ## detached; closing their sockets on process exit is the OS's job.
