@@ -1,33 +1,38 @@
 # sandwall
 
-A filesystem sandbox for Nim, backed by OS-native primitives: Linux
-[Landlock](https://docs.kernel.org/userspace-api/landlock.html) and macOS
+A process sandbox for Nim, backed by OS-native primitives: Linux
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html) plus a
+network-namespace egress fence, and macOS
 [Seatbelt](https://developer.apple.com/library/archive/documentation/Security/Conceptual/SecureCodingGuide/Articles/Sandboxing.html).
 Restrict a process (and every child it spawns) to a fixed set of writable
-paths. No root, no container, no helper binary, ~no runtime cost.
+paths and a fixed set of connectable hosts. No root, no container, no
+helper binary, ~no runtime cost.
 
 Both backends use the same mechanism shape: an unprivileged process applies
 a restriction to itself, and the kernel enforces it on every syscall from
 the thread and all of its descendants. `mv`, `tee`, `rm -rf`, a rogue build
 script, it doesn't matter, the kernel checks every write.
 
-## Two primitives
+## Two layers, one call
 
 ```nim
-restrict(writable, read)   # confine this thread to writable/read-only paths
+restrict(rules)            # parsed policy: fs rules first, then the net wall
 forkNimbox / exec          # fork a child, where you restrict() then exec()
 ```
 
-That's the whole API. `restrict` locks the current thread down; `forkNimbox`
-+ `exec` run a sandboxed child. Everything else is the kernel.
+`restrict` locks the current thread down: filesystem access per the
+policy's path rules, network egress per its host rules. `forkNimbox` +
+`exec` run a sandboxed child. The low-level
+`restrict(writable, read, denied)` form is still there when you want to
+skip the policy layer.
 
 ## Platform status
 
-| Platform | Status | Mechanism |
-|----------|--------|-----------|
-| Linux | **works** | Landlock (kernel-enforced, tested) |
-| macOS | **works** | Seatbelt `sandbox_init_with_parameters` (kernel-enforced) |
-| Windows | **works** | restricted token + ACLs (CreateProcessAsUser) |
+| Platform | Filesystem | Network fence |
+|----------|-----------|-------------|
+| Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy |
+| macOS | Seatbelt `sandbox_init_with_parameters` | Seatbelt loopback-only + allowlist proxy |
+| Windows | restricted token + ACLs | WFP filters on the sandwall user (`sandwall setup`) |
 
 The Linux and macOS backends confine the calling thread via kernel hooks
 (Landlock domains, Seatbelt profiles). The Windows backend has no single
@@ -46,26 +51,66 @@ prior-art survey.
 ## As a binary
 
 ```
-sandwall restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+sandwall RULES [--] CMD [ARGS ...]
 ```
 
-Confines itself to the RWPATHs (read-write) plus any ROPATHs (read-only),
+RULES is a policy file (`-` reads it from stdin). The sandbox applies the
+file's path rules to the filesystem and its host rules to the network,
 then exec()s CMD. System directories (`/usr`, `/bin`, `/lib`, `/etc`) are
-made read-only automatically so the command's binaries stay runnable;
-`--ro` adds to that set, it does not replace it.
+made read-only automatically so the command's binaries stay runnable.
 
 ```sh
-$ sandwall restrict /tmp /home/me/work -- ls -la
-$ sandwall restrict /build --ro /secrets -- make test
-$ sandwall restrict . -- make test
+$ sandwall rules.txt -- make test
+$ sandwall rules.txt curl https://api.example.com
+$ cat rules.txt | sandwall - -- ls -la
 ```
 
-The same binary is also the library, so a parent program can self-invoke via
-`/proc/self/exe` to run a sandboxed child without a separate helper:
+The same binary is also the library, so a parent program can self-invoke
+via `/proc/self/exe` to run a sandboxed child without a separate helper.
 
-```nim
-execCmd("/proc/self/exe restrict /tmp -- ls -la")
+## The network wall
+
+Host rules in the policy fence egress. The kernel restricts the process
+to loopback (a fresh network namespace on Linux, a loopback-only Seatbelt
+profile on macOS); a per-run proxy, forked before the restriction lands,
+is the only way off the machine and enforces the hostname allowlist. The
+proxy speaks HTTP CONNECT and SOCKS5, and `restrict` points the standard
+proxy env vars at it (`http_proxy`, `https_proxy`, `ALL_PROXY` with
+`socks5h` so DNS happens at the proxy), so curl, wget, and most HTTP
+libraries just work.
+
+```sh
+$ cat rules.txt
+allow /tmp
+allow api.example.com
+$ sandwall rules.txt curl https://api.example.com   # works
+$ sandwall rules.txt curl https://elsewhere.com     # 403 from the proxy
 ```
+
+Editing the rules file mid-run takes effect on the next connection: the
+proxy watches its policy file's mtime. The proxy dies with the command
+tree (death pipe), one proxy per run, never a shared instance.
+
+Two honest limitations:
+
+- **Plain `http://` through `http_proxy` does not work.** A CONNECT
+  proxy only tunnels; plain-HTTP proxying is a different protocol
+  (GET-forwarding) and gets a 405. Use https (everything should anyway)
+  or the SOCKS5 side, which tools pick up from `ALL_PROXY`.
+- **UDP is not forwarded.** No QUIC/HTTP3 (clients fall back to TCP),
+  no DNS from inside the fence (by design: resolution happens at the
+  proxy). Anything hard-requiring UDP fails closed.
+
+ssh does not read proxy env vars, so git-over-ssh needs an adapter:
+`sandwall connect HOST PORT` pumps stdio through the proxy, made for
+ssh's ProxyCommand:
+
+```sh
+export GIT_SSH_COMMAND="ssh -o ProxyCommand='sandwall connect %h %p'"
+```
+
+(Setting that variable is the consumer's job, sandwall only provides the
+adapter.)
 
 ## The policy file
 
@@ -80,7 +125,7 @@ allow /tmp          writable
 allow               writable project dir (bare word = project dir)
 readonly /var           read-only
 deny ./secrets      deny, relative to the project dir
-allow api.example.com   host rule (parsed, not yet enforced)
+allow api.example.com   host rule (fenced through the wall proxy)
 allow 10.0.0.1:8080 host with port (bare host = all ports)
 allow *             no network restrictions
 ```
@@ -92,16 +137,23 @@ targets they name; anything unmentioned is denied. `#` comments and
 blank lines are ignored. A line starting with no access word is treated
 as a host rule, so hostnames like `deny.corp.internal` still parse.
 
-Host rules are the seam for the network sandbox (a separate milestone):
-they parse into the policy today and `resolve` collects them, but no
-backend restricts networking yet.
+Host rules fence networking per the previous section: the first host
+rule turns egress loopback-only, and the wall proxy enforces the
+allowlist. `allow *` allows every host through the proxy (the fence
+still applies; direct egress stays blocked).
 
 ```nim
-let pol = loadCascaded(projectDir)      # system + repo files, defaults when absent
-case pol.checkPath(somePath)            # akWritable / akReadOnly / akDeny
-let r = pol.resolve()                   # (writable, readonly, hosts)
-restrict(r.writable, read = r.readonly)
+let rules = loadPolicy(path, projectDir)  # one file; discovery/cascade is the caller's job
+let rules2 = parsePolicy(text, projectDir)
+case rules.checkPath(somePath)            # akWritable / akReadOnly / akDeny
+let r = rules.resolve()                   # (writable, readonly, denied, hosts)
+restrict(rules, projectDir, policyPath = path)   # fs + net, one call
 ```
+
+A policy is a plain `seq[Rule]`; there is no wrapper object. File
+discovery, level cascading, and default rules belong to the consumer
+(3code concatenates its system and repo files and parses once; later
+text supersedes earlier exactly like rules within one file).
 
 Two backend caveats to know before writing tricky policies:
 
@@ -138,7 +190,8 @@ let code = wait(pid)
 Or just call `restrict` on yourself, if you don't need to stay free:
 
 ```nim
-restrict(["/tmp", "/home/me/work"])
+restrict(["/tmp", "/home/me/work"])          # paths only
+restrict(rules, projectDir, policyPath)       # full policy, fs + net
 ```
 
 ## The `restrict` proc
@@ -197,15 +250,30 @@ CLI tests shell out to the binary; library tests fork a child per scenario
 src/
   sandwall.nim           # library + CLI (when isMainModule)
   sandwall/
-    restrict.nim       # the restrict() proc - dispatches to the OS backend
+    restrict.nim       # the restrict() procs - paths form and rules form
     process.nim        # forkNimbox / exec / wait (posix fork-exec)
     paths.nim          # path normalisation, shared across backends
+    rules.nim          # policy DSL: parsePolicy / loadPolicy / resolve
     landlock.nim       # linux backend: Landlock ruleset
     seatbelt.nim       # macos backend: sandbox_init_with_parameters
     acl.nim            # windows backend: restricted token + ACLs
+    mask.nim           # linux userns+mountns for sub-path deny masks
+    wall/
+      hosts.nim        # hostname allowlist matching
+      proxy.nim        # CONNECT+SOCKS5 proxy, spawnWallProxy (forked)
+      connect.nim      # SOCKS5 stdio adapter (ssh ProxyCommand)
+      netns.nim        # linux fence: netns + unix-socket bridge
+      wfp.nim          # windows fence: WFP filters
+      winuser.nim      # windows sandwall user + spawn
 tests/
   demo.nim
-  test_sandbox.nim
+  test_sandbox.nim     # CLI + library fs tests, fenced-network CLI test
+  test_rules.nim       # policy DSL
+  test_hosts.nim       # host matching
+  test_proxy.nim       # CONNECT/SOCKS proxy against a live echo server
+  test_connect.nim     # socks client adapter
+  test_wall.nim        # netns fence + bridge (linux)
+  test_winwall.nim     # wfp pure logic (guids, sddl)
 ```
 
 See `sandbox-research.md` for the full prior-art survey (sandlock, Codex,
