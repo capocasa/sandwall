@@ -1,7 +1,7 @@
 ## Tests for sandwall.
 ##
 ## Two layers:
-##   1. CLI tests: invoke the `sandwall restrict ... -- CMD` binary, check the
+##   1. CLI tests: invoke the `sandwall RULES -- CMD` binary, check the
 ##      command is confined.
 ##   2. Library tests: each scenario forks a child (since a Landlock domain
 ##      is permanent for the thread that applies it), so isolation is built in.
@@ -44,6 +44,15 @@ proc redirectCmd(path: string): string =
   else:
     "sh -c 'echo ok > " & path & "'"
 
+proc rulesFile(name, text: string): string =
+  ## Write a policy file for the CLI tests and return its path.
+  result = tempDir("rules-" & name) / "rules.txt"
+  writeFile(result, text)
+
+proc sw(rules: string; cmd: string): string =
+  ## A full sandwall CLI invocation line.
+  sandwallExe().quoteShell & " " & rules.quoteShell & " -- " & cmd
+
 # --------------------------------------------------------------------------
 # CLI tests (shell out to the binary)
 
@@ -51,13 +60,11 @@ suite "sandwall CLI (sandboxed exec)":
   test "allow allowed, write denied":
     let a = tempDir("cli-a")
     let d = tempDir("cli-d")
+    let rules = rulesFile("a", "allow " & a & "\n")
     # the allowed write runs in one invocation, the denied in another,
     # because a failing redirect makes the shell exit nonzero.
-    discard execCmd(sandwallExe().quoteShell & " restrict " & a.quoteShell &
-                    " -- " & redirectCmd(a / "x.txt"))
-    let rcDenied = execCmd(sandwallExe().quoteShell & " restrict " &
-                           a.quoteShell &
-                           " -- " & redirectCmd(d / "y.txt"))
+    discard execCmd(sw(rules, redirectCmd(a / "x.txt")))
+    let rcDenied = execCmd(sw(rules, redirectCmd(d / "y.txt")))
     check: expectFile(a / "x.txt")
     check: rcDenied != 0
     check: not expectFile(d / "y.txt")
@@ -66,39 +73,35 @@ suite "sandwall CLI (sandboxed exec)":
   when not defined(windows):
     test "cannot modify system dir":
       let a = tempDir("sys-a")
+      let rules = rulesFile("sys", "allow " & a & "\n")
       let target = "/usr/bin/sandwall_should_not_exist_" & $getCurrentProcessId()
-      let rc = execCmd(sandwallExe().quoteShell & " restrict " & a.quoteShell &
-                       " -- touch " & target)
+      let rc = execCmd(sw(rules, "touch " & target))
       check: rc != 0
       check: not fileExists(target)
 
-  test "--ro path is readable but not writable":
+  test "readonly path is readable but not writable":
     let rw = tempDir("ro-rw")
     let ro = tempDir("ro-ro")
     writeFile(ro / "secret.txt", "topsecret")
+    let rules = rulesFile("ro", "allow " & rw & "\nreadonly " & ro & "\n")
     # read from the read-only path succeeds
-    let rcRead = execCmd(sandwallExe().quoteShell & " restrict " & rw.quoteShell &
-                         " --ro " & ro.quoteShell & " -- cat " &
-                         (ro / "secret.txt").quoteShell)
+    let rcRead = execCmd(sw(rules, "cat " & (ro / "secret.txt").quoteShell))
     check: rcRead == 0
     # write to the read-only path fails
-    let rcWrite = execCmd(sandwallExe().quoteShell & " restrict " & rw.quoteShell &
-                          " --ro " & ro.quoteShell & " -- " &
-                          redirectCmd(ro / "new.txt"))
+    let rcWrite = execCmd(sw(rules, redirectCmd(ro / "new.txt")))
     check: rcWrite != 0
     check: not fileExists(ro / "new.txt")
 
-  test "--ro without writable paths errors":
-    let ro = tempDir("ro-only")
-    let rc = execCmd(sandwallExe().quoteShell & " restrict --ro " & ro.quoteShell &
-                     " -- true")
+  test "missing rules file errors":
+    let rc = execCmd(sandwallExe().quoteShell & " /nonexistent-rules -- true")
     check: rc == 2
 
   test "no command given errors":
-    let rc = execCmd(sandwallExe().quoteShell & " restrict /tmp")
+    let rules = rulesFile("nocmd", "allow /tmp\n")
+    let rc = execCmd(sandwallExe().quoteShell & " " & rules.quoteShell)
     check: rc == 2
 
-  test "--deny narrows a writable root (sub-path deny)":
+  test "deny narrows a writable root (sub-path deny)":
     # The grammar's last-wins narrowing, compiled to the backend: a
     # denied subpath under a writable root is unreachable while the
     # rest of the root stays writable. On Linux this exercises the
@@ -107,20 +110,37 @@ suite "sandwall CLI (sandboxed exec)":
     let sub = rw / "locked"
     createDir(sub)
     writeFile(sub / "secret.txt", "x")
+    let rules = rulesFile("deny", "allow " & rw & "\ndeny " & sub & "\n")
     let probe = "cat " & (sub / "secret.txt").quoteShell & " 2>/dev/null || echo DENIED"
-    let (outp, rc) = execCmdEx(sandwallExe().quoteShell & " restrict " &
-      rw.quoteShell & " --deny " & sub.quoteShell & " -- sh -c " &
-      probe.quoteShell)
+    let (outp, rc) = execCmdEx(sw(rules, "sh -c " & probe.quoteShell))
     check: rc == 0
     check: "DENIED" in outp
     # Sibling writes still work.
-    let wrc = execCmd(sandwallExe().quoteShell & " restrict " & rw.quoteShell &
-      " --deny " & sub.quoteShell & " -- " & redirectCmd(rw / "fine.txt"))
+    let wrc = execCmd(sw(rules, redirectCmd(rw / "fine.txt")))
     check: wrc == 0
     check: fileExists(rw / "fine.txt")
     # The host's view is untouched (no rollback needed on POSIX; the
     # mask lives in the child's mount namespace).
     check: readFile(sub / "secret.txt") == "x"
+
+  when defined(linux):
+    test "host rules fence the network (allowed via proxy, direct blocked)":
+      # A loopback HTTP one-shot plus a rules file allowing it: curl
+      # through the auto-spawned proxy succeeds, bypassing the proxy
+      # hits the netns fence. Loopback-only, hermetic.
+      let a = tempDir("net-a")
+      let rules = rulesFile("net", "allow " & a & "\nallow 127.0.0.1\n")
+      let probe = "echo p=$http_proxy; " &
+        "curl -spx $http_proxy --max-time 4 http://127.0.0.1:9/ " &
+        "2>/dev/null || echo PROXY-REACHED; " &
+        "curl -s --noproxy '*' --max-time 2 http://127.0.0.1:9/ " &
+        "2>/dev/null || echo DIRECT-BLOCKED"
+      let (outp, rc) = execCmdEx(sw(rules, "sh -c " & probe.quoteShell))
+      check: rc == 0
+      # Connection refused (port 9 closed) proves the proxy answered;
+      # a fence-blocked attempt would time out instead.
+      check: "PROXY-REACHED" in outp
+      check: "DIRECT-BLOCKED" in outp
 
 # --------------------------------------------------------------------------
 # library tests (fork a child per scenario)
