@@ -193,18 +193,23 @@ when defined(linux) or defined(macosx):
         not fileExists(d / "child.txt")
       check: ok
 
-    test "successive restrict calls only tighten":
-      let a = tempDir("tight-a")
-      let b = tempDir("tight-b")
-      let ok = runScenario("tight") do () -> bool:
-        restrict([a, b], read = systemReadDirs())
-        writeFile(a / "a1.txt", "a")
-        writeFile(b / "b1.txt", "b")
-        restrict([a], read = systemReadDirs())
-        writeFile(a / "a2.txt", "a2")
-        # b is now denied by the second domain
-        var raised = false
-        try: writeFile(b / "b2.txt", "b2")
-        except CatchableError: raised = true
-        raised and fileExists(a / "a2.txt")
-      check: ok
+    when defined(linux):
+      # Landlock layers domains: each restrict() intersects with the
+      # previous, so a second call tightens. Seatbelt is one-shot per
+      # process (sandbox_init fails EPERM on re-init), so this
+      # semantics test is Linux-only.
+      test "successive restrict calls only tighten":
+        let a = tempDir("tight-a")
+        let b = tempDir("tight-b")
+        let ok = runScenario("tight") do () -> bool:
+          restrict([a, b], read = systemReadDirs())
+          writeFile(a / "a1.txt", "a")
+          writeFile(b / "b1.txt", "b")
+          restrict([a], read = systemReadDirs())
+          writeFile(a / "a2.txt", "a2")
+          # b is now denied by the second domain
+          var raised = false
+          try: writeFile(b / "b2.txt", "b2")
+          except CatchableError: raised = true
+          raised and fileExists(a / "a2.txt")
+        check: ok

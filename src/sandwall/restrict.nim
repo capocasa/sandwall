@@ -54,10 +54,12 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
   ## execute). `read` paths get read + execute only; defaults to empty.
   ## `denied` paths are unreachable even when they sit under a writable or
   ## read root (the compiled output of the policy's last-wins narrowing).
-  ## Everything else is denied. Each call layers a new restriction; the
-  ## effective access is the intersection of all applied restrictions, so
-  ## later calls only narrow. Drop a path from `writable` and re-call to
-  ## revoke it.
+  ## Everything else is denied. On Linux each call layers a new
+  ## restriction; the effective access is the intersection of all
+  ## applied restrictions, so later calls only narrow. Drop a path from
+  ## `writable` and re-call to revoke it. On macOS Seatbelt is one-shot
+  ## per process (sandbox_init fails EPERM on re-init), so restrict()
+  ## may be called only once there.
   ##
   ## On Linux `denied` is enforced by bind-masking the paths in a
   ## user+mount namespace before Landlock is applied (see mask.nim);

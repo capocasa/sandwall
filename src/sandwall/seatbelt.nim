@@ -89,6 +89,11 @@ proc buildProfile*(writable, read: openArray[string];
   for p in baselineRead:
     result.add("\n  (subpath " & quote(p) & ")")
   result.add(")\n")
+  # Fork stays usable: shells fork for pipelines, redirects, and
+  # external commands (posix_spawn covers the simple cases, but dash
+  # falls back to fork() once a redirect is involved, and fork is a
+  # separately gated operation).
+  result.add("(allow process-fork)\n")
   # Exec stays usable for system binaries.
   result.add("(allow process-exec file-read*\n")
   result.add("  (subpath " & quote("/bin") & ")\n")
