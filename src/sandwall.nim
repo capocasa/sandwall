@@ -1,23 +1,19 @@
-## sandwall - a filesystem sandbox backed by OS-native primitives.
+## sandwall - a process sandbox backed by OS-native primitives.
 ##
-## Linux uses Landlock; macOS uses Seatbelt (sandbox_init_with_parameters).
-## The user-facing API is identical on both.
+## Linux uses Landlock plus a netns egress fence; macOS uses Seatbelt
+## (sandbox_init_with_parameters) for both. The user-facing API is
+## identical on both.
 ##
 ## As a library:
 ##   import sandwall
-##   restrict("/tmp", "/home/me/work")
-##   # this thread and all children can now only touch those paths
+##   restrict(rules)          # parsed policy: fs rules, then net wall
 ##
 ## As a binary:
-##   sandwall restrict RWPATH [RWPATH ...] [--ro ROPATH ...] [--deny PATH ...] -- CMD [ARGS ...]
-##   # confines itself to RWPATHs (writable) + ROPATHs (read-only), then exec()s CMD
+##   sandwall RULES [--] CMD [ARGS ...]
+##   # confines itself per RULES (a policy file, - = stdin), then exec()s CMD
 ##
-## Two primitives, exposed both ways:
-##   1. restrict(paths)  - confine the current thread's filesystem access
-##   2. forkSandbox/exec/wait - fork a child where you restrict() then exec()
-##
-## See the `restrict` and `process` modules. Low-level Landlock access in
-## `landlock`.
+## See the `restrict` and `rules` modules. Low-level pieces: `landlock`,
+## `seatbelt`, `acl` (filesystem backends), `wall/` (the network half).
 
 import ./sandwall/restrict
 export restrict
@@ -34,116 +30,134 @@ export wall
 # ----------------------------------------------------------------------- CLI
 
 when isMainModule:
-  import std/[os, syncio]
+  import std/[os, syncio, strutils]
   when defined(posix):
     import std/posix except Time
 
   const usage = """
-sandwall - filesystem sandbox backed by OS-native primitives
+sandwall - a process sandbox backed by OS-native primitives
 
 Usage:
-  sandwall restrict RWPATH [RWPATH ...] [--ro ROPATH [ROPATH ...]] -- CMD [ARGS ...]
+  sandwall RULES [--] CMD [ARGS ...]
+  sandwall connect HOST PORT
 
-  Applies a sandbox allowing full access (read, write, create, delete,
-  rename, execute) to the RWPATHs, read+execute access to the ROPATHs, and
-  nothing else, then exec()s CMD. CMD and its children are confined: writes
-  outside the writable paths fail with EACCES.
+  RULES is a policy file; `-` reads it from stdin. The sandbox applies
+  the file's path rules to the filesystem (allow = read+write, readonly
+  = read+execute, deny = nothing; anything unmentioned is denied) and
+  its host rules to the network, then exec()s CMD. CMD and its children
+  are confined.
 
-  System dirs (/usr, /bin, /lib, /dev/*, etc.) are always read-only so the
-  command's binaries and libs stay runnable; --ro adds to that set, it does
-  not replace it.
+  With no host rules the network is left alone. With at least one host
+  rule, egress is fenced to loopback and a per-run proxy enforces the
+  hostname allowlist (edits to RULES take effect on the next
+  connection). System dirs stay read-only so CMD's binaries and libs
+  stay runnable.
+
+  sandwall connect HOST PORT
+      SOCKS5 stdio adapter for ssh ProxyCommand-style tools: pumps
+      stdio through the wall proxy at 127.0.0.1:$WALL_PROXY_PORT
+      (default 1080) to HOST:PORT. Blocks. Not needed for tools that
+      honor http_proxy/ALL_PROXY, which is most of them.
 
 Examples:
-  sandwall restrict /tmp /home/me/work -- ls -la
-  sandwall restrict /build --ro /secrets -- make test
-  sandwall restrict . -- make test
+  sandwall rules.txt -- make test
+  sandwall rules.txt curl https://api.example.com
+  cat rules.txt | sandwall - -- ls -la
 
-Landlock is monotonic: the restriction is permanent for this process and all
+The restriction is monotonic: permanent for this process and all
 descendants. There is no "unrestrict".
+
+Note: the `setup` command exists only on Windows builds (the Windows
+fence needs a one-time elevated install); on this build networking and
+filesystem policy are enforced with no setup step.
   """
+
+  proc dieUsage(msg: string): int =
+    stderr.writeLine(usage)
+    stderr.writeLine("\nError: " & msg)
+    2
+
+  proc connectMain(args: seq[string]): int =
+    when defined(posix):
+      if args.len != 2:
+        return dieUsage("connect needs HOST PORT")
+      let port = try: uint16(parseInt(args[1]))
+                 except ValueError: return dieUsage("bad port")
+      let proxyPort = try: uint16(parseInt(getEnv("WALL_PROXY_PORT", "1080")))
+                      except ValueError: 1080'u16
+      socksConnect(proxyPort, args[0], port)
+    else:
+      stderr.writeLine("sandwall: connect is POSIX-only"); 2
+
+  proc runMain(args: seq[string]): int =
+    ## sandwall RULES [--] CMD [ARGS...]
+    if args.len < 2:
+      return dieUsage("expected RULES and a command")
+    let rulesArg = args[0]
+    var cmdStart = 1
+    if args[1] == "--": cmdStart = 2
+    if cmdStart >= args.len:
+      return dieUsage("no command given")
+    let cmd = args[cmdStart .. ^1]
+
+    let projectDir = getCurrentDir()
+    var text: string
+    var policyPath = ""
+    if rulesArg == "-":
+      text = stdin.readAll()
+    else:
+      policyPath = absolutePath(rulesArg)
+      if not fileExists(policyPath):
+        return dieUsage("rules file not found: " & rulesArg)
+      text = readFile(policyPath)
+    let rules = parsePolicy(text, projectDir)
+
+    # setsid() before restrict+exec so CMD lands in its own session and
+    # process group: callers that wrap long-running commands signal the
+    # whole group on cancel/timeout, and without setsid those signals
+    # would miss CMD's children.
+    when defined(posix):
+      discard setsid()
+    try:
+      restrict(rules, projectDir, policyPath)
+    except CatchableError as e:
+      stderr.writeLine("sandwall: " & e.msg)
+      return 127
+    when defined(windows):
+      # Windows cannot confine the current process; restrict() only
+      # prepares the token and stamps ACLs, so the child is spawned
+      # with that token instead of exec'd.
+      let r = resolve(rules)
+      try:
+        return int(runSandboxed(r.writable, cmd, read = r.readonly,
+                                denied = r.denied))
+      except CatchableError as e:
+        stderr.writeLine("sandwall: " & e.msg)
+        return 127
+    else:
+      try:
+        exec(cmd)
+      except CatchableError as e:
+        stderr.writeLine("sandwall: " & e.msg)
+        return 127
 
   proc cliMain(): int =
     let args = commandLineParams()
     if args.len == 0 or args[0] == "-h" or args[0] == "--help":
       stdout.writeLine(usage)
       return 0
-
-    if args[0] != "restrict":
-      stderr.writeLine(usage)
-      stderr.writeLine("\nError: unknown subcommand (expected 'restrict')")
-      return 2
-
-    var
-      writable: seq[string] = @[]
-      readOnly: seq[string] = @[]
-      denied: seq[string] = @[]
-      cmd: seq[string] = @[]
-      seenSep = false
-      seenRo = false
-      seenDeny = false
-
-    var i = 1
-    while i < args.len:
-      let a = args[i]
-      if seenSep:
-        cmd.add(a)
-      elif a == "--":
-        seenSep = true
-      elif a == "--ro":
-        seenRo = true; seenDeny = false
-      elif a == "--deny":
-        seenDeny = true; seenRo = false
-      elif a == "-h" or a == "--help":
-        stdout.writeLine(usage); return 0
-      elif seenDeny:
-        denied.add(a)
-      elif seenRo:
-        readOnly.add(a)
+    case args[0]
+    of "connect":
+      connectMain(args[1 .. ^1])
+    of "setup":
+      when defined(windows):
+        # TODO step 9
+        stderr.writeLine("sandwall: setup not yet wired"); 2
       else:
-        writable.add(a)
-      inc i
-
-    if writable.len == 0:
-      stderr.writeLine(usage)
-      stderr.writeLine("\nError: no writable paths given")
-      return 2
-    if cmd.len == 0:
-      stderr.writeLine(usage)
-      stderr.writeLine("\nError: no command given (use -- before the command)")
-      return 2
-
-    # System dirs (/usr, /bin, /lib, /dev/*, etc.) are auto-added as
-    # read-only inside each backend's restrictImpl, so the command's
-    # binaries and libs stay runnable without the caller listing them.
-    when defined(windows):
-      # Windows cannot confine the current process; restrict() only prepares
-      # the token and stamps ACLs. runSandboxed spawns the child with that
-      # token and rolls the ACLs back in a defer.
-      #
-      # The ACL backend stamps a write/delete DENY on every volume root,
-      # leaving read+execute open, so C:\Windows and System32 stay readable
-      # and runnable without an ALLOW ACE. User --ro paths get an explicit
-      # ALLOW for read+execute so a denied volume can still be read from.
-      try:
-        return int(runSandboxed(writable, cmd, read = readOnly,
-                                denied = denied))
-      except CatchableError as e:
-        stderr.writeLine("sandwall: " & e.msg)
-        return 127
+        stderr.writeLine("sandwall: setup is only available on Windows builds " &
+          "(the Windows fence needs a one-time elevated install). On this " &
+          "build no setup is needed."); 2
     else:
-      # posix: confine this process, then exec into CMD. Children inherit
-      # the domain, so the parent restricting itself before exec is enough.
-      #
-      # setsid() runs before restrict+exec so CMD lands in its own session
-      # and process group. Callers (like 3code) that wrap long-running
-      # commands signal the whole group on cancel/timeout; without setsid
-      # those signals would miss CMD's children.
-      discard setsid()
-      restrict(writable, read = readOnly, denied = denied)
-      try:
-        exec(cmd)
-      except CatchableError as e:
-        stderr.writeLine("sandwall: " & e.msg)
-        return 127
+      runMain(args)
 
   quit(cliMain())
