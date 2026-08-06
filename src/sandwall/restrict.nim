@@ -97,7 +97,7 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
 
 # ------------------------------------------------------------------ rules
 
-import std/[os, times]
+import std/os
 import ./rules
 when defined(posix):
   import ./wall/proxy
