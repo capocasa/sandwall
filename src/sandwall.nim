@@ -151,12 +151,33 @@ filesystem policy are enforced with no setup step.
       connectMain(args[1 .. ^1])
     of "setup":
       when defined(windows):
-        # TODO step 9
-        stderr.writeLine("sandwall: setup not yet wired"); 2
+        if "--status" in args:
+          let st = fenceStatus()
+          echo "installed: ", st.installed, " filters: ", st.filters
+          if st.hint.len > 0: echo st.hint
+          else: echo "behavioral verify: ", verifyFenceBehavioral()
+          return 0
+        if "--uninstall" in args:
+          uninstallFence()
+          echo "sandwall: wall filters removed"
+          return 0
+        try:
+          let sid = setupSandwallUser()
+          installFence(sid, FirstProxyPort, LastProxyPort)
+          echo "sandwall: setup complete; sandwall user SID ", sid
+          return 0
+        except OSError as e:
+          stderr.writeLine("sandwall: " & e.msg)
+          return 1
       else:
         stderr.writeLine("sandwall: setup is only available on Windows builds " &
           "(the Windows fence needs a one-time elevated install). On this " &
           "build no setup is needed."); 2
+    of "wfp-probe":
+      when defined(windows):
+        wfpProbeMain()
+      else:
+        0  # internal: nothing to probe on POSIX
     else:
       runMain(args)
 
