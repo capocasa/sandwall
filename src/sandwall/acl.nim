@@ -1,86 +1,60 @@
-## Windows restricted-token + ACL backend for sandwall.
+## Windows AppContainer + ACL backend for sandwall.
 ##
-## Windows has no single syscall-interception hook. The Codex-validated
-## approach is a restricted token plus filesystem ACLs: we build a token via
-## CreateRestrictedToken that carries a fresh "restricting SID", then at spawn
-## time Windows runs TWO access checks on every NtCreateFile (the normal DACL
-## check and the restricting-SID check) and BOTH must pass. By stamping a DENY
-## ACE for our SID on the volume roots the sandbox must block, and ALLOW ACEs
-## for our SID on the paths it may touch, the restricted child is confined.
+## Windows has no single syscall-interception hook, and hand-rolled
+## restricted tokens (CreateRestrictedToken + CreateProcessAsUserW) cannot
+## spawn a child on Windows 11 - every variant fails with access denied
+## (verified by probes; see cybernetic-plan.md step 1). The supported
+## mechanism is an AppContainer: a process launched with
+## PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES runs under a lowbox token
+## that denies filesystem and network access by default; only DACL grants
+## for the AppContainer SID let the child touch a path.
 ##
-## A token applies at CreateProcess time, not to the calling thread, so unlike
-## Landlock/Seatbelt `restrictImpl` here PREPARES the token and stamps the
-## ACLs; the spawn path (process.nim) applies the token. This is genuinely the
-## weak platform and the ACL stamping mutates the filesystem - see
-## CROSSPLATFORM.md Phase 3.
+## So this backend: derives (or creates) the `sandwall.fs` AppContainer
+## profile once, stamps ALLOW ACEs for its SID on the writable/read-only
+## paths, and lets process.nim spawn the child with the security-capabilities
+## attribute. No volume-root DENY stamps are needed (the AppContainer denies
+## by default), which removes the dangerous system-wide mutation and its
+## rollback risk. The ALLOW stamps on user paths are still rolled back
+## after the child exits.
 
 import ./paths
 
 when defined(windows):
   import std/[winlean, widestrs, sets, syncio]
-  import std/strutils except normalize
 
-  # --- advapi32 security/token FFI (not in std/winlean) ---
+  # --- AppContainer profile FFI (userenv.dll) ---
 
   type
     PSID* = pointer
-    SidIdentifierAuthority* = array[6, uint8]
+    # winlean has no HRESULT alias.
+    HRESULT = int32
 
-  const
-    # token access rights (winnt.h)
-    TOKEN_QUERY*        = 0x0008'i32
-    TOKEN_DUPLICATE*    = 0x0002'i32
-    TOKEN_ASSIGN_PRIMARY* = 0x0001'i32
+  # The profile APIs live in userenv.dll, not kernel32/advapi32.
+  # CreateAppContainerProfile returns ERROR_ALREADY_EXISTS (0x800700b7)
+  # when the profile exists from a previous run; the SID is then obtained
+  # via DeriveAppContainerSidFromAppContainerName.
+  proc createAppContainerProfile(name, display, desc: WideCString;
+      caps: pointer; capCount: DWORD; sid: ptr PSID): HRESULT {.stdcall,
+      dynlib: "userenv", importc: "CreateAppContainerProfile".}
 
-    # CreateRestrictedToken flags
-    DISABLE_MAX_PRIVILEGE* = 0x1'i32
+  proc deriveAppContainerSidFromAppContainerName(name: WideCString;
+      sid: ptr PSID): HRESULT {.stdcall, dynlib: "userenv",
+      importc: "DeriveAppContainerSidFromAppContainerName".}
 
-    # SECURITY_NT_AUTHORITY = S-1-5, the most-used identifier authority for
-    # freshly minted SIDs. We build S-1-5-<random32> off it.
-    securityNtAuthority*: SidIdentifierAuthority =
-      [0'u8, 0, 0, 0, 0, 5]
-
-  proc getCurrentProcessId*(): DWORD {.stdcall, dynlib: "kernel32",
-      importc: "GetCurrentProcessId".}
-
-  proc openProcessToken*(processHandle: Handle; desiredAccess: DWORD;
-      tokenHandle: ptr Handle): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "OpenProcessToken".}
-
-  # AllocateAndInitializeSid is C-variadic on the sub-authority values,
-  # which Nim cannot import cleanly - and the fixed-arity approximation
-  # corrupts the output pointer on the Win64 ABI (observed as
-  # CreateRestrictedToken failing with error 998). Build the SID manually
-  # instead: InitializeSid + GetSidSubAuthority are both fixed-arity.
-  proc getSidLengthRequired*(nSubAuthorityCount: uint8): DWORD {.stdcall,
-      dynlib: "advapi32", importc: "GetSidLengthRequired".}
-
-  proc initializeSid*(pSid: PSID;
-      pIdentifierAuthority: ptr SidIdentifierAuthority;
-      nSubAuthorityCount: uint8): WINBOOL {.stdcall,
-      dynlib: "advapi32", importc: "InitializeSid".}
-
-  proc getSidSubAuthority*(pSid: PSID; nSubAuthority: DWORD): ptr DWORD
-      {.stdcall, dynlib: "advapi32", importc: "GetSidSubAuthority".}
-
-  proc createRestrictedToken*(existingToken: Handle; flags: DWORD;
-      sidToDisableCount: DWORD; sidToDisable: ptr PSID;
-      privilegeToDeleteCount: DWORD; privileges: pointer;
-      restrictedSidCount: DWORD; sidToRestrict: ptr PSID;
-      newToken: ptr Handle): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "CreateRestrictedToken".}
+  proc localFree(hMem: pointer): pointer {.stdcall, dynlib: "kernel32",
+      importc: "LocalFree".}
 
   # --- ACL stamping FFI (accctrl.h / aclapi.h / winnt.h) ---
 
   type
-    # ACCESS_MODE (accctrl.h): only GRANT_ACCESS and DENY_ACCESS are used for
-    # EXPLICIT_ACCESS entries. Sized to int32 to match the Win32 enum.
+    # ACCESS_MODE (accctrl.h): GRANT_ACCESS for stamps, REVOKE_ACCESS for
+    # rollback. Sized to int32 to match the Win32 enum.
     ACCESS_MODE {.size: sizeof(int32).} = enum
       notUsedAccess = 0
       grantAccess   ## allow
       setAccess
-      revokeAccess
-      denyAccess    ## deny
+      revokeAccess  ## strip all existing ACEs for the trustee
+      denyAccess    ## deny (unused: AppContainer denies by default)
       setAudit
       setAllAudit
 
@@ -102,7 +76,7 @@ when defined(windows):
       trusteeIsInvalid
       trusteeIsComputer
 
-    # {CONTAINER|OBJECT}_INHERIT_ACE, NO_PROPAGATE_INHERIT_ACE (winnt.h).
+    # {CONTAINER|OBJECT}_INHERIT_ACE (winnt.h).
     # SUB_CONTAINERS_AND_OBJECTS_INHERIT = both bits set.
     Inheritance = enum
       noInherit = 0x0
@@ -136,25 +110,8 @@ when defined(windows):
 
     # File access masks (winnt.h)
     FILE_GENERIC_READ*    = 0x00120089'i32
-    FILE_GENERIC_WRITE*   = 0x00120116'i32
     FILE_GENERIC_EXECUTE* = 0x001200A0'i32
     FILE_ALL_ACCESS*      = 0x001F01FF'i32
-    FILE_DELETE_ACCESS*   = 0x00010000'i32  # DELETE right
-
-  # FindFirstVolumeW / FindNextVolumeW / FindVolumeClose (kernel32).
-  const
-    MAX_VOLUME_NAME = 50  # a Volume Manager GUID path fits well within this
-
-  proc findFirstVolumeW(lpszVolumeName: ptr Utf16Char;
-      cchBufferLength: DWORD): Handle {.stdcall, dynlib: "kernel32",
-      importc: "FindFirstVolumeW".}
-
-  proc findNextVolumeW(hFindVolume: Handle; lpszVolumeName: ptr Utf16Char;
-      cchBufferLength: DWORD): WINBOOL {.stdcall, dynlib: "kernel32",
-      importc: "FindNextVolumeW".}
-
-  proc findVolumeClose(hFindVolume: Handle): WINBOOL {.stdcall,
-      dynlib: "kernel32", importc: "FindVolumeClose".}
 
   # SetEntriesInAcl merges one or more EXPLICIT_ACCESS into a new ACL. We pass
   # the old ACL as nil so it builds a fresh one from our entries.
@@ -169,49 +126,27 @@ when defined(windows):
       pDacl: PACL; pSacl: PACL): DWORD {.stdcall, dynlib: "advapi32",
       importc: "SetNamedSecurityInfoW".}
 
-  proc localFree(hMem: pointer): pointer {.stdcall, dynlib: "kernel32",
-      importc: "LocalFree".}
-
   # GetNamedSecurityInfo reads an existing security descriptor by name. Used by
   # rollbackAcls to fetch the live DACL before stripping our SID's ACEs.
-  # SECURITY_DESCRIPTOR is opaque to us; we deal in the DACL pointer it returns.
   proc getNamedSecurityInfoW*(pObjectName: pointer;
       objectType: SE_OBJECT_TYPE; securityInfo: DWORD;
       psidOwner: ptr PSID; psidGroup: ptr PSID; pDacl: ptr PACL;
       pSacl: ptr PACL; psd: ptr pointer): DWORD {.stdcall, dynlib: "advapi32",
       importc: "GetNamedSecurityInfoW"}
 
-  # CreateProcessAsUserW (advapi32). Applies a prepared token to the spawned
-  # child in one call; there is no way to narrow the current process. The
-  # STARTUPINFO / PROCESS_INFORMATION structs come from winlean. lpCommandLine
-  # is LPWSTR (mutable), which WideCString satisfies.
-  proc createProcessAsUserW*(hToken: Handle; lpApplicationName: WideCString;
-      lpCommandLine: WideCString; lpProcessAttributes: ptr SECURITY_ATTRIBUTES;
-      lpThreadAttributes: ptr SECURITY_ATTRIBUTES; bInheritHandles: WINBOOL;
-      dwCreationFlags: DWORD; lpEnvironment: pointer;
-      lpCurrentDirectory: WideCString; lpStartupInfo: ptr STARTUPINFO;
-      lpProcessInformation: ptr PROCESS_INFORMATION): WINBOOL {.stdcall,
-      dynlib: "advapi32", importc: "CreateProcessAsUserW"}
-
   # --- module state ---
 
-  # Token prepared by restrictImpl, applied at spawn time. 0 = no sandbox set.
-  var currentRestrictedToken*: Handle = 0
+  # AppContainer SID prepared by restrictImpl, applied at spawn time by
+  # process.nim. nil = no sandbox set. The SID is allocated by userenv and
+  # kept alive for the whole sandbox lifetime; the attribute-list buffer
+  # process.nim builds references it.
+  var currentAppContainerSid*: PSID = nil
 
-  # The restricting SID owned by the current sandbox. The SID is kept alive
-  # for the whole sandbox lifetime (not freed in buildRestrictedToken): the
-  # stamping and rollback passes reference it independently of the token, which
-  # holds its own internal copy. restrictImpl frees the previous SID on re-entry.
-  var currentRestrictingSid*: PSID = nil
-
-  # Caller paths normalised once.
-  var writablePaths*: seq[string] = @[]
-  var readOnlyPaths*: seq[string] = @[]
-
-  # Every filesystem path whose DACL we mutated. The spawn (chunk 3) walks
-  # this in a defer to remove our ACEs. Mutating real security descriptors is
-  # the one dangerous operation in this backend: a crash between stamp and
-  # rollback leaves deny ACEs on volume roots that break other processes.
+  # Every filesystem path whose DACL we mutated. The spawn walks this in a
+  # defer to remove our ACEs. Mutating security descriptors is the one
+  # dangerous operation in this backend: a crash between stamp and rollback
+  # leaves stray allow ACEs for the AppContainer SID on user paths (deny
+  # stamps no longer exist - the AppContainer denies by default).
   var stampedPaths*: seq[string] = @[]
 
   # --- helpers ---
@@ -221,53 +156,24 @@ when defined(windows):
     raise newException(OSError,
       "sandwall windows-acl: " & what & " failed (error " & $getLastError() & ")")
 
-  proc buildRestrictedToken*(): Handle =
-    ## Open the current process token and produce a restricted copy carrying a
-    ## fresh random SID. The returned token is what the spawn path applies;
-    ## caller owns the handle. Raises OSError on any failed step. As a side
-    ## effect sets `currentRestrictingSid` so the stamping pass can reuse the
-    ## exact SID embedded in the token.
-    var base: Handle
-    if openProcessToken(getCurrentProcess(),
-        TOKEN_QUERY or TOKEN_DUPLICATE, addr base) == 0:
-      fail("OpenProcessToken")
-    defer: discard closeHandle(base)
-
-    # Fresh restricting SID S-1-5-<seed>. The seed mixes the PID with a
-    # stack address for per-call variance; it is NOT crypto-strength, but
-    # it is never constant. Avoiding a fixed seed matters because a
-    # constant SID would let one sandbox's ACLs leak across runs.
-    #
-    # The SID is intentionally NOT freed here: stampAcls/rollbackAcls need
-    # it alive for the lifetime of the sandbox (until the spawn rolls
-    # back). One SID per sandbox (~12 bytes) is a bounded, acceptable
-    # cost. Freeing the previous SID on re-entry is restrictImpl's job.
-    # Built with InitializeSid + GetSidSubAuthority (fixed-arity FFI);
-    # the buffer is plain Nim memory, freed with dealloc, never FreeSid.
-    var authority = securityNtAuthority
-    if currentRestrictingSid != nil:
-      dealloc(currentRestrictingSid)
-    currentRestrictingSid = nil
-    var stackAnchor = 0
-    let seed = getCurrentProcessId() xor cast[DWORD](cast[uint](addr stackAnchor))
-    let sidLen = getSidLengthRequired(1)
-    currentRestrictingSid = cast[PSID](alloc0(sidLen.int))
-    if initializeSid(currentRestrictingSid, addr authority, 1) == 0:
-      dealloc(currentRestrictingSid)
-      currentRestrictingSid = nil
-      fail("InitializeSid")
-    getSidSubAuthority(currentRestrictingSid, 0)[] = seed
-
-    var restricted: Handle
-    if createRestrictedToken(base, DISABLE_MAX_PRIVILEGE,
-        0, nil,          # no SIDs to disable
-        0, nil,          # no privileges to delete
-        1, addr currentRestrictingSid,  # one restricting SID
-        addr restricted) == 0:
-      dealloc(currentRestrictingSid)
-      currentRestrictingSid = nil
-      fail("CreateRestrictedToken")
-    return restricted
+  proc buildAppContainerSid*(): PSID =
+    ## Return the SID of the `sandwall.fs` AppContainer profile, creating
+    ## the profile on first use. The profile persists across runs, so after
+    ## creation we take the derive path. Raises OSError if neither call
+    ## succeeds. The returned SID stays valid until freed by userenv; we
+    ## keep it for the process lifetime.
+    if currentAppContainerSid != nil:
+      return currentAppContainerSid
+    let name = newWideCString("sandwall.fs")
+    var sid: PSID = nil
+    if createAppContainerProfile(name, newWideCString("sandwall fs"),
+        newWideCString("sandwall filesystem sandbox"), nil, 0,
+        addr sid) != 0:
+      # Exists from a previous run (or any failure) - derive by name.
+      if deriveAppContainerSidFromAppContainerName(name, addr sid) != 0:
+        fail("CreateAppContainerProfile/DeriveAppContainerSidFromAppContainerName")
+    currentAppContainerSid = sid
+    return sid
 
   proc buildExplicitAccess(sid: PSID; mode: ACCESS_MODE; rights: DWORD;
       inheritance: DWORD): EXPLICIT_ACCESS_W =
@@ -340,50 +246,19 @@ when defined(windows):
     defer: discard localFree(newAcl)
     writeDacl(path, newAcl)
 
-  proc enumerateVolumeRoots*(): seq[string] =
-    ## Return every mounted volume root in the volume GUID path form,
-    ## WITHOUT the trailing backslash FindFirstVolumeW appends:
-    ## SetNamedSecurityInfo rejects the backslashed form (access denied),
-    ## verified on Windows 11. Stamping the GUID path covers every file on
-    ## that volume regardless of which drive letter (if any) fronts it.
-    ## Returns empty if enumeration fails, in which case the sandbox
-    ## degrades to denying nothing at the volume layer (still enforces via
-    ## the absence of ALLOW ACEs on non-writable paths).
-    var nameBuf: array[MAX_VOLUME_NAME, Utf16Char]
-    let h = findFirstVolumeW(addr nameBuf[0], DWORD(nameBuf.len))
-    if h == -1:
-      return @[]
-    defer: discard findVolumeClose(h)
-
-    while true:
-      var guidPath = $cast[WideCString](addr nameBuf[0])
-      if guidPath.endsWith("\\"): guidPath.setLen(guidPath.len - 1)
-      result.add(guidPath)
-      if findNextVolumeW(h, addr nameBuf[0], DWORD(nameBuf.len)) == 0:
-        break
-
 proc backendSupported*(): bool =
   when defined(windows): true else: false
 
-proc backendName*(): string = "windows-acl"
+proc backendName*(): string = "windows-appcontainer"
 
 when defined(windows):
-  const
-    # Rights we deny at volume roots: the write/delete/create family. We must
-    # NOT deny FILE_GENERIC_READ or the process cannot even enumerate the
-    # drive or load DLLs from C:\Windows.
-    denyRights = FILE_GENERIC_WRITE or FILE_DELETE_ACCESS
-
   proc stampAcls*(writable, read: seq[string]; sid: PSID) =
-    ## Stamp the full ACL policy for `sid`:
-    ##   1. DENY `denyRights` on every volume root, so the default across all
-    ##      drives is write-denied.
-    ##   2. ALLOW FILE_ALL_ACCESS on each writable path.
-    ##   3. ALLOW FILE_GENERIC_READ | FILE_GENERIC_EXECUTE on each read path.
-    ## Each mutated path is recorded in stampedPaths for rollback.
-    for vol in enumerateVolumeRoots():
-      stampAce(vol, sid, denyAccess, denyRights)
-
+    ## Stamp the full ACL policy for the AppContainer SID:
+    ##   1. ALLOW FILE_ALL_ACCESS on each writable path.
+    ##   2. ALLOW FILE_GENERIC_READ | FILE_GENERIC_EXECUTE on each read path.
+    ## No DENY stamps: the AppContainer denies everything it is not granted,
+    ## so volume roots need no touching. Each mutated path is recorded in
+    ## stampedPaths for rollback.
     for p in writable:
       stampAce(p, sid, grantAccess, FILE_ALL_ACCESS)
 
@@ -393,10 +268,10 @@ when defined(windows):
 
   proc rollbackAcls*(sid: PSID) =
     ## Best-effort removal of our SID's ACEs from every stamped path. Called
-    ## in a defer by the spawn (chunk 3). Errors are logged to stderr and
-    ## skipped: a missing path (deleted during the run) must not abort cleanup
-    ## of the rest. Snapshots the path list first because removeSidAces must
-    ## NOT append to it (we are undoing, not stamping).
+    ## in a defer by the spawn. Errors are logged to stderr and skipped: a
+    ## missing path (deleted during the run) must not abort cleanup of the
+    ## rest. Snapshots the path list first because removeSidAces must NOT
+    ## append to it (we are undoing, not stamping).
     let paths = stampedPaths
     stampedPaths = @[]
     for path in paths:
@@ -408,14 +283,14 @@ when defined(windows):
 
   proc restrictImpl*(writable, read: openArray[string];
                      denied: openArray[string] = []) =
-    ## Build the restricted token and stamp the filesystem ACLs in one pass.
-    ## Stores the token for the spawn path (process.nim) and records every
-    ## mutated path so the spawn can roll back via rollbackAcls.
-    currentRestrictedToken = buildRestrictedToken()
+    ## Prepare the AppContainer SID and stamp the filesystem ACLs in one
+    ## pass. Stores the SID for the spawn path (process.nim) and records
+    ## every mutated path so the spawn can roll back via rollbackAcls.
+    let sid = buildAppContainerSid()
 
     var seen = initHashSet[string]()
-    writablePaths = @[]
-    readOnlyPaths = @[]
+    var writablePaths: seq[string] = @[]
+    var readOnlyPaths: seq[string] = @[]
     for p in writable:
       let n = normalize(p)
       if n.len == 0 or seen.containsOrIncl(n): continue
@@ -425,4 +300,4 @@ when defined(windows):
       if n.len == 0 or seen.containsOrIncl(n): continue
       readOnlyPaths.add(n)
 
-    stampAcls(writablePaths, readOnlyPaths, currentRestrictingSid)
+    stampAcls(writablePaths, readOnlyPaths, sid)
