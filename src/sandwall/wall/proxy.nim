@@ -529,7 +529,7 @@ type
     pid*: Pid
 
 proc spawnWallProxy*(policyPath, projectDir: string;
-                     verbose = false): SpawnedProxy =
+                     runDir = ""; verbose = false): SpawnedProxy =
   ## Fork the wall proxy as a child process and return where it
   ## listens. Call BEFORE restrict()/exec: after exec the in-process
   ## proxy threads would be gone, and after restrict the child would
@@ -541,7 +541,8 @@ proc spawnWallProxy*(policyPath, projectDir: string;
   ## The child exits as soon as the last holder of the death pipe is
   ## gone, which is when the restricting process and every descendant
   ## of the command it exec'd have died.
-  let runDir = getTempDir() / ("sandwall-" & $getCurrentProcessId())
+  let runDir = if runDir.len > 0: runDir
+               else: getTempDir() / ("sandwall-" & $getCurrentProcessId())
   createDir(runDir)
   let sock = newSocket(buffered = false)
   sock.setSockOpt(OptReuseAddr, true)

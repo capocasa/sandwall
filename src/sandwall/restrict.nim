@@ -31,7 +31,8 @@ elif defined(windows):
 proc restrict*(writable: openArray[string]; read: openArray[string] = [];
                denied: openArray[string] = [];
                fenceNet: bool = false; proxyPort: uint16 = 0;
-               proxySockPath: string = "") =
+               proxySockPath: string = "";
+               bridgePort: ptr uint16 = nil) =
   ## Confine the calling thread (and all future children).
   ##
   ## `fenceNet` confines network egress to loopback: on Linux by
@@ -82,7 +83,8 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
     if fenceNet and proxySockPath.len > 0:
       # Landlock must still permit connecting to the unix socket: the
       # consumer must place proxySockPath under a writable path.
-      discard bridgeToUnix(proxyPort, proxySockPath)
+      let bp = bridgeToUnix(proxyPort, proxySockPath)
+      if bridgePort != nil: bridgePort[] = bp
   elif defined(macosx):
     seatbelt.restrictImpl(writable, read, denied, egress = not fenceNet)
   elif defined(windows):
@@ -92,3 +94,94 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
     acl.restrictImpl(writable, read, denied)
   else:
     {.error: "sandwall restrict has no backend for this platform".}
+
+# ------------------------------------------------------------------ rules
+
+import std/[os, times]
+import ./rules
+when defined(posix):
+  import ./wall/proxy
+
+proc restrict*(rules: openArray[Rule]; projectDir: string;
+               policyPath: string = ""; verbose = false) =
+  ## Apply a parsed policy to the calling thread (and all future
+  ## children): filesystem rules first, then the network wall.
+  ##
+  ## With no host rules this is the filesystem sandbox alone. With at
+  ## least one host rule, egress is fenced to loopback and a per-run
+  ## wall proxy is forked (spawnWallProxy: it dies with the command
+  ## tree, one proxy per run); the proxy enforces the hostname
+  ## allowlist. Proxy env vars (http_proxy et al, socks5h for remote
+  ## DNS) are set on this process so an exec'd command inherits them.
+  ##
+  ## `policyPath` is the file the proxy watches for mtime reloads, so
+  ## editing the rules file mid-run takes effect on the next
+  ## connection. Empty (stdin, ephemeral rules): the rendered rules
+  ## are written into the run dir and that copy is watched; rewriting
+  ## it is the reload path.
+  ##
+  ## Raises on backend or proxy failure.
+  let r = resolve(rules)
+  if r.hosts.len == 0:
+    restrict(r.writable, r.readonly, r.denied)
+    return
+  when defined(posix):
+    # The proxy is forked BEFORE any restriction: after restrict it
+    # would inherit the fence, after exec the forking image is gone.
+    # No policyPath (stdin, ephemeral rules): render the rules into
+    # the run dir and watch that copy.
+    let runDir = getTempDir() / ("sandwall-" & $getCurrentProcessId())
+    createDir(runDir)
+    let polPath = if policyPath.len > 0: policyPath
+                  else: runDir / "policy"
+    if policyPath.len == 0:
+      writeFile(polPath, renderPolicy(rules))
+    let proxy = spawnWallProxy(polPath, projectDir, runDir = runDir,
+                               verbose = verbose)
+    # The bridge's unix socket must sit in a writable dir or Landlock
+    # denies connect() on it (netns.nim header). Add the run dir.
+    var writable = r.writable
+    if proxy.sockPath.len > 0:
+      writable.add proxy.runDir
+    # On linux the fenced side reaches the proxy through the netns
+    # bridge, which binds its own ephemeral port INSIDE the netns;
+    # env must point at that port, not the host one. On macOS the
+    # sandbox reaches host loopback directly, so the proxy's own port.
+    var bp: uint16
+    restrict(writable, r.readonly, r.denied, fenceNet = true,
+             proxyPort = 0, proxySockPath = proxy.sockPath,
+             bridgePort = addr bp)
+    let fencePort = when defined(linux): bp else: proxy.port
+    # Env for the exec'd command: most tools honor http_proxy/
+    # ALL_PROXY; socks5h means DNS happens at the proxy (the fence
+    # has no resolver). WALL_PROXY_PORT is for tools that speak to
+    # the proxy directly (the connect adapter reads it).
+    let hp = "http://127.0.0.1:" & $fencePort
+    let sp = "socks5h://127.0.0.1:" & $fencePort
+    putEnv("http_proxy", hp)
+    putEnv("https_proxy", hp)
+    putEnv("HTTP_PROXY", hp)
+    putEnv("HTTPS_PROXY", hp)
+    putEnv("ALL_PROXY", sp)
+    putEnv("all_proxy", sp)
+    # No NO_PROXY on purpose: loopback targets must go through the
+    # proxy too - the fence permits only loopback, and the proxy is
+    # where the hostname allowlist lives. Tools bypassing the proxy
+    # for 127.0.0.1 would hit the fence (or, allowed, loopback
+    # services inside the netns see nothing useful).
+    putEnv("NO_PROXY", "")
+    putEnv("no_proxy", "")
+    putEnv("WALL_PROXY_PORT", $fencePort)
+  else:
+    # Windows: the net fence is keyed on the sandwall user and lives
+    # on the spawn path (wall/winuser.nim), not in this in-process
+    # call. Fail loudly rather than pretend.
+    raise newException(IOError,
+      "sandwall: host rules (network fence) are not supported in-process " &
+      "on Windows; spawn via the sandwall user instead")
+
+proc restrict*(rules: openArray[Rule]; verbose = false) =
+  ## As restrict(rules, projectDir, policyPath) with the current dir
+  ## as project root and no policy file (rules are fixed for the run;
+  ## a reload copy is written to the run dir when fencing).
+  restrict(rules, getCurrentDir(), "", verbose)
