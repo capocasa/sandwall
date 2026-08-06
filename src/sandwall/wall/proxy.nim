@@ -462,7 +462,7 @@ proc startWallProxy*(policyPath: string; projectDir: string;
   ## address checks are skipped (filesystem perms are the ACL).
   startProxyListeners(policyPath, projectDir, port, unixSockPath, verbose)
 
-proc proxyChild*(dir, policyPath, projectDir: string; sockFd: SocketHandle;
+proc proxyChild(dir, policyPath, projectDir: string; sockFd: SocketHandle;
                 deathFd, portFd: cint; verbose: bool) =
   ## The forked proxy's whole lifetime: serve until the death pipe
   ## says the sandboxed command tree is gone, then clean up the run
