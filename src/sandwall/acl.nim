@@ -107,11 +107,30 @@ when defined(windows):
   const
     # SECURITY_INFORMATION flags (winnt.h)
     DACL_SECURITY_INFORMATION* = 0x00000004
+    LABEL_SECURITY_INFORMATION = 0x00000010'i32
 
     # File access masks (winnt.h)
     FILE_GENERIC_READ*    = 0x00120089'i32
     FILE_GENERIC_EXECUTE* = 0x001200A0'i32
     FILE_ALL_ACCESS*      = 0x001F01FF'i32
+
+    # Token rights needed to write an integrity label into an object's SACL
+    # (SetNamedSecurityInfo with LABEL_SECURITY_INFORMATION).
+    TOKEN_QUERY_PRIV       = 0x0008'i32
+    TOKEN_ADJUST_PRIVILEGES = 0x0020'i32
+    SE_PRIVILEGE_ENABLED   = 0x00000002'i32
+
+  type
+    LUID = object
+      lowPart: DWORD
+      highPart: LONG
+    LUID_AND_ATTRIBUTES = object
+      luid: LUID
+      attributes: DWORD
+    # TOKEN_PRIVILEGES with a one-element privilege array.
+    TOKEN_PRIVILEGES_1 = object
+      privilegeCount: DWORD
+      privileges: array[1, LUID_AND_ATTRIBUTES]
 
   # SetEntriesInAcl merges one or more EXPLICIT_ACCESS into a new ACL. We pass
   # the old ACL as nil so it builds a fresh one from our entries.
@@ -134,6 +153,52 @@ when defined(windows):
       pSacl: ptr PACL; psd: ptr pointer): DWORD {.stdcall, dynlib: "advapi32",
       importc: "GetNamedSecurityInfoW"}
 
+  # --- integrity label FFI (advapi32) ---
+
+  # SDDL <-> security descriptor conversion, and SACL extraction from a
+  # descriptor. The integrity label is applied via an SDDL SACL because
+  # building a SYSTEM_MANDATORY_LABEL ACE by hand (SetEntriesInAcl rewrites
+  # the ACE type) does not survive SetNamedSecurityInfo - verified by probes.
+  proc convertStringSecurityDescriptorToSecurityDescriptorW(sddl: WideCString;
+      rev: DWORD; sd: ptr pointer; size: ptr uint): WINBOOL {.stdcall,
+      dynlib: "advapi32",
+      importc: "ConvertStringSecurityDescriptorToSecurityDescriptorW".}
+
+  proc getSecurityDescriptorSacl(sd: pointer; present: ptr WINBOOL;
+      sacl: ptr PACL; defaulted: ptr WINBOOL): WINBOOL {.stdcall,
+      dynlib: "advapi32", importc: "GetSecurityDescriptorSacl".}
+
+  proc getAce(acl: PACL; idx: DWORD; ace: ptr pointer): WINBOOL {.stdcall,
+      dynlib: "advapi32", importc: "GetAce".}
+
+  # IsEqualSid/EqualSid/RtlEqualMemory are all compiler intrinsics on Windows
+  # (none exported from any dll - "could not import"), so compare SIDs in pure
+  # Nim: equal length plus a raw byte compare via equalMem.
+  proc getLengthSid(sid: PSID): DWORD {.stdcall, dynlib: "advapi32",
+      importc: "GetLengthSid".}
+
+  proc sameSid(a, b: PSID): bool =
+    let la = getLengthSid(a)
+    if la != getLengthSid(b): return false
+    return equalMem(a, b, int(la))
+
+  proc addAce(acl: PACL; aceRevision, startingAceIndex: DWORD; aceList: pointer;
+      aceListLength: DWORD): WINBOOL {.stdcall, dynlib: "advapi32",
+      importc: "AddAce".}
+
+  proc openProcessToken(processHandle: Handle; desiredAccess: DWORD;
+      tokenHandle: ptr Handle): WINBOOL {.stdcall, dynlib: "advapi32",
+      importc: "OpenProcessToken".}
+
+  proc lookupPrivilegeValueW(systemName, name: WideCString;
+      luid: ptr LUID): WINBOOL {.stdcall, dynlib: "advapi32",
+      importc: "LookupPrivilegeValueW".}
+
+  proc adjustTokenPrivileges(tokenHandle: Handle; disableAllPrivileges: WINBOOL;
+      newState: ptr TOKEN_PRIVILEGES_1; bufferLength: DWORD;
+      previousState: pointer; returnLength: ptr DWORD): WINBOOL {.stdcall,
+      dynlib: "advapi32", importc: "AdjustTokenPrivileges".}
+
   # --- module state ---
 
   # AppContainer SID prepared by restrictImpl, applied at spawn time by
@@ -149,12 +214,34 @@ when defined(windows):
   # stamps no longer exist - the AppContainer denies by default).
   var stampedPaths*: seq[string] = @[]
 
+  # Writable paths we labelled Low integrity; rolled back in rollbackAcls.
+  var labelledPaths*: seq[string] = @[]
+
   # --- helpers ---
 
   proc fail*(what: string) {.noinline.} =
     ## Raise OSError carrying the Win32 error code for the last failed call.
     raise newException(OSError,
       "sandwall windows-acl: " & what & " failed (error " & $getLastError() & ")")
+
+  proc enablePrivilege(name: string) =
+    ## Enable `name` (e.g. SeSecurityPrivilege) on the current process token.
+    ## Needed to write integrity labels into an object's SACL. Best-effort:
+    ## a caller already holding the privilege is unaffected, and a caller that
+    ## cannot get it will simply fail the label write (handled by caller).
+    var token: Handle
+    if openProcessToken(getCurrentProcess(),
+        DWORD(TOKEN_QUERY_PRIV or TOKEN_ADJUST_PRIVILEGES), addr token) == 0:
+      return
+    defer: discard closeHandle(token)
+    var luid: LUID
+    if lookupPrivilegeValueW(nil, newWideCString(name), addr luid) == 0:
+      return
+    var tp: TOKEN_PRIVILEGES_1
+    tp.privilegeCount = 1
+    tp.privileges[0].luid = luid
+    tp.privileges[0].attributes = DWORD(SE_PRIVILEGE_ENABLED)
+    discard adjustTokenPrivileges(token, 0, addr tp, 0, nil, nil)
 
   proc buildAppContainerSid*(): PSID =
     ## Return the SID of the `sandwall.fs` AppContainer profile, creating
@@ -200,15 +287,25 @@ when defined(windows):
         "sandwall windows-acl: SetNamedSecurityInfo failed on " & path &
         " (error " & $rc & ")")
 
-  proc stampAce*(path: string; sid: PSID; mode: ACCESS_MODE;
-      rights: DWORD; inheritance = DWORD(subContainersAndObjectsInherit)) =
-    ## Add an ACE for `sid` to `path`'s DACL. Merges a single EXPLICIT_ACCESS
-    ## via SetEntriesInAcl (oldAcl=nil builds a fresh one containing just our
-    ## entry), then writes the resulting DACL back with SetNamedSecurityInfo.
-    ## Records `path` in stampedPaths. Raises OSError on any failed step.
+  proc mergeDaclEntry(path: string; sid: PSID; mode: ACCESS_MODE;
+      rights: DWORD; inheritance: DWORD) =
+    ## Merge one EXPLICIT_ACCESS into `path`'s live DACL (grant or revoke).
+    ## Reads the DACL, applies SetEntriesInAcl against it (preserving every
+    ## other ACE), writes the result back. Raises OSError on any failed step.
+    var oldDacl: PACL = nil
+    var sd: pointer = nil
+    let wpathObj = newWideCString(path)
+    let wpath: WideCString = wpathObj
+    let rc0 = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
+      DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
+    if rc0 != 0:
+      raise newException(OSError,
+        "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
+        " (error " & $rc0 & ")")
+    defer: discard localFree(sd)
     var ea = buildExplicitAccess(sid, mode, rights, inheritance)
     var newAcl: PACL = nil
-    let rc = setEntriesInAcl(1, addr ea, nil, addr newAcl)
+    let rc = setEntriesInAcl(1, addr ea, oldDacl, addr newAcl)
     if rc != 0:
       raise newException(OSError,
         "sandwall windows-acl: SetEntriesInAcl failed on " & path &
@@ -216,34 +313,125 @@ when defined(windows):
     # SetEntriesInAcl allocates with LocalAlloc; LocalFree releases it.
     defer: discard localFree(newAcl)
     writeDacl(path, newAcl)
+
+  proc stampAce*(path: string; sid: PSID; mode: ACCESS_MODE;
+      rights: DWORD; inheritance = DWORD(subContainersAndObjectsInherit)) =
+    ## Add an ACE for `sid` to `path`'s DACL, MERGING into the existing DACL
+    ## (preserving the inherited SYSTEM/Administrators grants). Records `path`
+    ## in stampedPaths for rollback. Raises OSError on any failed step.
+    mergeDaclEntry(path, sid, mode, rights, inheritance)
     stampedPaths.add(path)
+
+  # SDDL for the Low-integrity mandatory label. `ML` =
+  # SYSTEM_MANDATORY_LABEL_ACE_TYPE (a SetEntriesInAcl-built ACE gets its type
+  # rewritten and is silently dropped by SetNamedSecurityInfo, so the label
+  # must come from an SDDL-parsed descriptor - verified by probes). OICI makes
+  # the label inherit to children, NW is the No-Write-Up policy, LW = the Low
+  # integrity SID (S-1-16-4096). AI keeps the SACL auto-inherit flag, matching
+  # what `icacls /setintegritylevel (OI)(CI)L` produces.
+  const lowLabelSddl = "S:AI(ML;OICI;NW;;;LW)"
+
+  proc stampIntegrityLabel(path: string) =
+    ## Mark `path` Low integrity via a mandatory-label ACE in the SACL. An
+    ## AppContainer child runs at Low integrity, and Windows Mandatory
+    ## Integrity Control denies a Low process write access to any object not
+    ## itself labelled Low (the default No-Write-Up policy) - regardless of
+    ## the DACL. So every writable path needs this label in addition to the
+    ## DACL grant, or the child sees "Access is denied" on writes even though
+    ## the DACL ACE is present. Requires SeSecurityPrivilege (SACL write),
+    ## enabled in stampAcls.
+    var sd: pointer = nil
+    if convertStringSecurityDescriptorToSecurityDescriptorW(
+        newWideCString(lowLabelSddl), 1, addr sd, nil) == 0:
+      raise newException(OSError,
+        "sandwall windows-acl: SDDL parse of label failed (error " &
+        $getLastError() & ")")
+    defer: discard localFree(sd)
+    var present: WINBOOL = 0
+    var sacl: PACL = nil
+    var defaulted: WINBOOL = 0
+    if getSecurityDescriptorSacl(sd, addr present, addr sacl, addr defaulted) == 0 or
+        present == 0 or sacl == nil:
+      raise newException(OSError,
+        "sandwall windows-acl: no SACL in parsed label descriptor")
+    let wpathObj = newWideCString(path)
+    let wpath: WideCString = wpathObj
+    let rc = setNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
+      DWORD(LABEL_SECURITY_INFORMATION), nil, nil, nil, sacl)
+    if rc != 0:
+      raise newException(OSError,
+        "sandwall windows-acl: SetNamedSecurityInfo(label) failed on " & path &
+        " (error " & $rc & ")")
+    labelledPaths.add(path)
+
+  proc removeIntegrityLabel(path: string) =
+    ## Clear the integrity label from `path` (rollback of stampIntegrityLabel).
+    ## Writes a NULL SACL for the LABEL portion, which removes the mandatory
+    ## label ACE. Requires SeSecurityPrivilege.
+    let wpathObj = newWideCString(path)
+    let wpath: WideCString = wpathObj
+    let rc = setNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
+      DWORD(LABEL_SECURITY_INFORMATION), nil, nil, nil, nil)
+    if rc != 0:
+      raise newException(OSError,
+        "sandwall windows-acl: SetNamedSecurityInfo(label-clear) failed on " & path &
+        " (error " & $rc & ")")
 
   proc removeSidAces(path: string; sid: PSID) =
     ## Strip every ACE whose trustee SID equals `sid` from `path`'s DACL.
-    ## Reads the live DACL via GetNamedSecurityInfo, removes matching ACEs
-    ## with SetEntriesInAcl (REVOKE_ACCESS removes all existing ACEs for the
-    ## trustee before the merge), and writes the result back. This is the
-    ## only safe rollback primitive: it preserves every ACE that is not ours.
-    var dacl: PACL = nil
+    ## SetEntriesInAcl/REVOKE_ACCESS is NOT usable here: on this Windows 11
+    ## build it leaves behind a ghost ACCESS_DENIED (mask 0) ACE for the
+    ## trustee instead of deleting it (verified by probe p80). So we rebuild
+    ## the DACL manually: copy every ACE whose trustee is NOT our SID into a
+    ## fresh ACL with AddAce, preserving order (deny-before-allow semantics)
+    ## and every other trustee. Raises OSError on failure.
+    var oldDacl: PACL = nil
     var sd: pointer = nil
     let wpathObj = newWideCString(path)
     let wpath: WideCString = wpathObj
-    let rc = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
-      DACL_SECURITY_INFORMATION, nil, nil, addr dacl, nil, addr sd)
-    if rc != 0:
+    let rc0 = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
+      DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
+    if rc0 != 0:
       raise newException(OSError,
         "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
-        " (error " & $rc & ")")
+        " (error " & $rc0 & ")")
     defer: discard localFree(sd)
 
-    var ea = buildExplicitAccess(sid, revokeAccess, 0, 0)
-    var newAcl: PACL = nil
-    let rc2 = setEntriesInAcl(1, addr ea, dacl, addr newAcl)
-    if rc2 != 0:
-      raise newException(OSError,
-        "sandwall windows-acl: SetEntriesInAcl(REVOKE) failed on " & path &
-        " (error " & $rc2 & ")")
-    defer: discard localFree(newAcl)
+    # Compute the surviving size and count, skipping our SID's ACEs.
+    let aceCount = cast[ptr uint16](cast[uint](oldDacl) + 2)[]
+    var keepSize = 0
+    var keepCount = 0
+    for i in 0 ..< int(aceCount):
+      var ace: pointer = nil
+      if getAce(oldDacl, DWORD(i), addr ace) == 0: continue
+      let aceSize = int(cast[ptr uint16](cast[uint](ace) + 2)[])
+      let aceSid = cast[PSID](cast[pointer](cast[uint](ace) + 8))
+      if sameSid(aceSid, sid):
+        continue  # ours - drop it
+      keepSize += aceSize
+      keepCount += 1
+
+    # New ACL header (8 bytes) + the kept ACE bodies, built by AddAce so the
+    # header fields (revision, size, count) stay consistent.
+    let newSize = 8 + keepSize
+    let newAcl = cast[PACL](alloc0(newSize))
+    defer: dealloc(newAcl)
+    # ACL_REVISION = 2 (a plain discretionary ACL).
+    cast[ptr uint8](newAcl)[] = 2
+    cast[ptr uint16](cast[uint](newAcl) + 2)[] = uint16(newSize)
+    cast[ptr uint16](cast[uint](newAcl) + 4)[] = 0  # AddAce maintains AceCount
+    for i in 0 ..< int(aceCount):
+      var ace: pointer = nil
+      if getAce(oldDacl, DWORD(i), addr ace) == 0: continue
+      let aceSize = DWORD(cast[ptr uint16](cast[uint](ace) + 2)[])
+      let aceSid = cast[PSID](cast[pointer](cast[uint](ace) + 8))
+      if sameSid(aceSid, sid):
+        continue
+      # MAXDWORD start index = append, preserving order.
+      if addAce(newAcl, DWORD(2), DWORD(-1), ace, aceSize) == 0:
+        raise newException(OSError,
+          "sandwall windows-acl: AddAce(rebuild) failed on " & path &
+          " (error " & $getLastError() & ")")
     writeDacl(path, newAcl)
 
 proc backendSupported*(): bool =
@@ -254,24 +442,28 @@ proc backendName*(): string = "windows-appcontainer"
 when defined(windows):
   proc stampAcls*(writable, read: seq[string]; sid: PSID) =
     ## Stamp the full ACL policy for the AppContainer SID:
-    ##   1. ALLOW FILE_ALL_ACCESS on each writable path.
-    ##   2. ALLOW FILE_GENERIC_READ | FILE_GENERIC_EXECUTE on each read path.
+    ##   1. ALLOW FILE_ALL_ACCESS + a Low integrity label on each writable
+    ##      path (the label is required: the Low-integrity child is blocked
+    ##      from writing Medium/High objects by MIC even when the DACL allows).
+    ##   2. ALLOW FILE_GENERIC_READ | FILE_GENERIC_EXECUTE on each read path
+    ##      (read is allowed across integrity levels, so no label needed).
     ## No DENY stamps: the AppContainer denies everything it is not granted,
     ## so volume roots need no touching. Each mutated path is recorded in
     ## stampedPaths for rollback.
+    enablePrivilege("SeSecurityPrivilege")
     for p in writable:
       stampAce(p, sid, grantAccess, FILE_ALL_ACCESS)
+      stampIntegrityLabel(p)
 
     for p in read:
       stampAce(p, sid, grantAccess,
         FILE_GENERIC_READ or FILE_GENERIC_EXECUTE)
 
   proc rollbackAcls*(sid: PSID) =
-    ## Best-effort removal of our SID's ACEs from every stamped path. Called
-    ## in a defer by the spawn. Errors are logged to stderr and skipped: a
-    ## missing path (deleted during the run) must not abort cleanup of the
-    ## rest. Snapshots the path list first because removeSidAces must NOT
-    ## append to it (we are undoing, not stamping).
+    ## Best-effort removal of our SID's ACEs from every stamped path, and the
+    ## Low integrity label from every labelled path. Called in a defer by the
+    ## spawn. Errors are logged to stderr and skipped: a missing path (deleted
+    ## during the run) must not abort cleanup of the rest.
     let paths = stampedPaths
     stampedPaths = @[]
     for path in paths:
@@ -279,6 +471,14 @@ when defined(windows):
         removeSidAces(path, sid)
       except CatchableError as e:
         stderr.writeLine("sandwall windows-acl: rollback failed on " & path &
+          ": " & e.msg)
+    let labelled = labelledPaths
+    labelledPaths = @[]
+    for path in labelled:
+      try:
+        removeIntegrityLabel(path)
+      except CatchableError as e:
+        stderr.writeLine("sandwall windows-acl: label rollback failed on " & path &
           ": " & e.msg)
 
   proc restrictImpl*(writable, read: openArray[string];

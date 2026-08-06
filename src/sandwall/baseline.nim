@@ -31,8 +31,10 @@ elif defined(macosx):
   ]
   const baselineWrite* = ["/dev/null"]
 elif defined(windows):
-  # The ACL backend stamps volume-wide write-denies; C:\Windows and System32
-  # stay readable/runnable without ALLOW ACEs. No explicit baseline needed.
+  # The AppContainer child reads/executes system binaries via the standard
+  # ALL APPLICATION PACKAGES grant already on C:\Windows, so no baseline
+  # stamping is needed (and C:\Windows is protected against our DACL writes
+  # anyway). Writable paths get explicit grants; everything else is denied.
   const baselineRead* = @[]
   const baselineWrite* = @[]
 else:

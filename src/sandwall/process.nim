@@ -45,6 +45,9 @@ when defined(windows):
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009'u
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000'i32
 
+  proc setHandleInformation(hObject: Handle; dwMask, dwFlags: DWORD): WINBOOL
+      {.stdcall, dynlib: "kernel32", importc: "SetHandleInformation".}
+
   proc initializeProcThreadAttributeList(list: pointer; count: DWORD;
       flags: DWORD; size: ptr uint): WINBOOL {.stdcall, dynlib: "kernel32",
       importc: "InitializeProcThreadAttributeList".}
@@ -114,24 +117,62 @@ when defined(windows):
       raise newException(OSError,
         "sandwall: UpdateProcThreadAttribute failed: " & $getLastError())
 
+    # The AppContainer child cannot run a binary unless CreateProcess is
+    # given explicit, valid std handles (STARTF_USESTDHANDLES) and
+    # bInheritHandles=TRUE; with plain inherited std handles (bInheritHandles
+    # = FALSE) spawning any exe inside the container fails with access denied
+    # (verified by probe bisection). Redirect the child's stdout+stderr into
+    # an inheritable anonymous pipe we pump back to our own stdout.
+    var sa: SECURITY_ATTRIBUTES
+    sa.nLength = DWORD(sizeof(sa))
+    sa.lpSecurityDescriptor = nil
+    sa.bInheritHandle = 1
+    var pipeRead, pipeWrite: Handle
+    if createPipe(pipeRead, pipeWrite, sa, 0) == 0:
+      raise newException(OSError,
+        "sandwall: CreatePipe failed: " & $getLastError())
+    # The read end stays with the parent; do not let the child inherit it.
+    discard setHandleInformation(pipeRead, 1, 0)  # HANDLE_FLAG_INHERIT, off
+    defer:
+      discard closeHandle(pipeRead)
+      discard closeHandle(pipeWrite)
+
     var six = default(STARTUPINFOEX)
     six.si.cb = DWORD(sizeof(six))
+    six.si.dwFlags = DWORD(STARTF_USESTDHANDLES)
+    six.si.hStdInput = getStdHandle(STD_INPUT_HANDLE)
+    six.si.hStdOutput = pipeWrite
+    six.si.hStdError = pipeWrite
     six.lpAttributeList = attrList
     var pi = default(PROCESS_INFORMATION)
 
     # Explicit lpCurrentDirectory: the AppContainer virtualizes %TEMP%, and
     # inheriting a cwd the container cannot reach breaks cmd's redirects.
     let cwdW = newWideCString(getCurrentDir())
-    if createProcessExW(nil, cmdLineW, nil, nil, 0,
+    if createProcessExW(nil, cmdLineW, nil, nil, 1,
         DWORD(EXTENDED_STARTUPINFO_PRESENT), nil, cwdW,
         addr six, pi) == 0:
       raise newException(OSError,
         "sandwall: CreateProcessW failed: " & $getLastError())
+    # Parent must close its copy of the write end or reads never see EOF.
+    discard closeHandle(pipeWrite)
+    pipeWrite = 0
     defer:
       discard closeHandle(pi.hProcess)
       discard closeHandle(pi.hThread)
 
-    # INFINITE wait; the child is sandboxed and we own its lifetime.
+    # Pump the child's output to our stdout while it runs. ReadFile blocks
+    # until data arrives or the pipe closes, so this also naturally waits.
+    let outHandle = getStdHandle(STD_OUTPUT_HANDLE)
+    var buf: array[4096, char]
+    while true:
+      var nread: int32 = 0
+      let ok = readFile(pipeRead, addr buf[0], int32(buf.len), addr nread, nil)
+      if ok == 0 or nread == 0: break
+      discard writeFile(outHandle, addr buf[0], nread, nil, nil)
+
+    # Ensure the child has fully exited (the pump ends at pipe close, which
+    # is process exit, but wait to be certain before reading the exit code).
     let w = waitForSingleObject(pi.hProcess, INFINITE)
     if w == WAIT_FAILED:
       raise newException(OSError,
