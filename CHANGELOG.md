@@ -3,28 +3,48 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.2.4] - 2026-08-08
+
+### Fixed
+
+- Windows WFP fence: the fence did not install. The failure was
+  FWP_E_LAYER_NOT_FOUND (0x80320004), misdiagnosed in a prior attempt
+  as FWP_E_INVALID_WEIGHT (an error code that does not exist). Root
+  cause: 5 of 6 WFP layer/provider GUIDs were hallucinated
+  (plausible-looking but wrong byte values). Verified against the
+  Microsoft SDK header and three independent C sources (OpenVPN,
+  WireGuard, strongSwan). With the correct layer GUID,
+  FwpmFilterAdd0 returns S_OK. Additional bugs fixed during live
+  verification on Windows 11: FWP_MATCH_RANGE was 1, should be 5
+  (FWP_MATCH_GREATER); FWP_ACTION_BLOCK/PERMIT used 0x2000
+  (NON_TERMINATING) not 0x1000 (TERMINATING); FWP_V6_ADDR_MASK was
+  unhandled in addFilter (null pointer deref); enumOurFilters read
+  only 256 of 600+ filters in a single enum call; wfp_shim.c lacked a
+  _WIN32_WINNT guard (types invisible to gcc); the AC fence used
+  ALE_USER_ID with a security descriptor, which matches the token
+  user rather than the AppContainer SID, switched to ALE_PACKAGE_ID
+  with FWP_SID; runMain passed inetOk = netAllowed (airgap) instead of
+  inetOk = true (fence posture) for host rules.
 
 ### Changed
 
-- Windows: host-rules network posture changed from airgap (no-cap
-  AppContainer, fully offline) to **WFP fence + degrade**. With host
-  rules and `sandwall setup` (one-time elevated) installed, WFP filters
-  confine the AppContainer child to loopback, and the wall proxy
-  enforces the hostname allowlist (same architecture as POSIX).
+- Windows: host-rules network posture is **WFP fence + degrade**.
+  With host rules and `sandwall setup` (one-time elevated) installed,
+  WFP filters confine the AppContainer child to loopback, and the wall
+  proxy enforces the hostname allowlist (same architecture as POSIX).
   Without `sandwall setup`, host rules produce a stderr warning and the
-  child has open network access (accepted degrade). The WFP FFI had
-  six critical bugs fixed: FWP_DATA_TYPE enum values (UINT64=4 not 13,
-  etc.), FwpmFreeMemory0 takes void**, FWP_VALUE0 must be a union (not
-  sequential struct), FWPM_ACTION0.filterType is ptr GUID, FWPM_FILTER0
-  has a 16-byte rawContext/providerContextKey union, and uint64 weight
-  values are passed by reference. A C shim (csrc/wfp_shim.c) wraps
-  provider/sublayer/filter add to avoid Nim ORC GC corruption of the
-  WFP RPC stack.
+  child has open network access (accepted degrade).
 - Policy DSL access codes replaced by words: `+` -> `write`, `-` ->
   `deny`, `*` -> `read`. Arbitrary whitespace allowed between the word
   and the target. Old-format policy files must be rewritten; the parser
   silently drops old-style lines.
+
+### Added
+
+- Windows: `installAcFence`, `uninstallAcFence`, and `acFenceStatus`
+  expose the AppContainer fence (loopback confinement keyed on the
+  package SID). `setup` installs both the user fence and the AC fence;
+  `--status` reports both; `--uninstall` removes both.
 - Windows: the restricted-token + CPAU backend (which could not spawn a
   confined child on Windows 11) is replaced by an **AppContainer**
   backend. The child runs under a lowbox token that denies filesystem and
