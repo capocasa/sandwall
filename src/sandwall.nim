@@ -131,21 +131,13 @@ filesystem policy are enforced with no setup step.
       # restricts (AppContainer SID + ACL stamps) and spawns the child
       # in the container, rolling the ACLs back after.
       let r = resolve(rules)
-      # Network parity with POSIX: no host rules -> the child gets the
-      # internetClient capability (network left alone); host rules ->
-      # the child gets no capability (full egress fence) and a wall
-      # proxy enforces the allowlist (wired in the next chunk).
-      # Host rules: the no-capability AppContainer is the fence (all
-      # egress incl. loopback is denied - verified: loopback is blocked
-      # under EVERY capability, the loopback-exemption API is MSIX-only,
-      # and WFP ALE_APP_ID is unavailable without admin/BFE, so no
-      # capability combination lets the child reach a loopback proxy).
-      # The wall proxy still runs in THIS unrestricted process and its
-      # env (set on ourselves pre-spawn; the AC child rejects a custom
-      # env block, probe p119, but inherits ours) is handed to the child,
-      # so tools see the standard allowlist interface - but the child
-      # cannot actually reach the proxy, so the allowlist cannot pass
-      # traffic. Windows + host rules = airgap, and we say so.
+      # Network: no host rules -> internetClient (open, POSIX parity).
+      # Host rules -> the WFP fence (installed via `sandwall setup`)
+      # confines egress to loopback so the child can only reach the
+      # wall proxy, which enforces the hostname allowlist. If the fence
+      # is NOT installed, warn and leave the network open (accepted
+      # degrade posture). The wall proxy runs either way (interface
+      # parity; harmless when the fence is absent).
       let netAllowed = r.hosts.len == 0
       var wallProxy: WallProxy
       if not netAllowed:
@@ -155,9 +147,6 @@ filesystem policy are enforced with no setup step.
                           $getCurrentProcessId() & "-policy")
                         writeFile(p, renderPolicy(rules))
                         p
-        stderr.writeLine("sandwall: host rules on Windows: the child is " &
-          "fully offline (the AppContainer egress fence also blocks " &
-          "loopback, so the wall proxy/allowlist cannot pass traffic)")
         wallProxy = startWallProxy(polPath, projectDir)
         let hp = "http://127.0.0.1:" & $wallProxy.port
         let sp = "socks5h://127.0.0.1:" & $wallProxy.port
@@ -170,6 +159,15 @@ filesystem policy are enforced with no setup step.
         putEnv("NO_PROXY", "")
         putEnv("no_proxy", "")
         putEnv("WALL_PROXY_PORT", $wallProxy.port)
+        # Check if the WFP fence is installed. If not, warn: the child
+        # will have open network access despite host rules.
+        let fenceInstalled = try: acFenceStatus().installed
+                              except CatchableError: false
+        if not fenceInstalled:
+          stderr.writeLine("sandwall: WARNING: host rules are present but " &
+            "the WFP fence is not installed. The child will have OPEN " &
+            "network access. Run 'sandwall setup' (elevated) to install " &
+            "the fence and enforce the host allowlist.")
       try:
         return int(runSandboxed(r.writable, cmd, read = r.readonly,
                                 denied = r.denied,
