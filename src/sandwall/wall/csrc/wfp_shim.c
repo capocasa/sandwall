@@ -3,6 +3,9 @@
 // passed across the FFI boundary (SIGSEGV in FwpmProviderAdd0 etc).
 // This shim constructs the WFP structs in C, avoiding all Nim GC
 // involvement in the RPC path.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600  /* WFP types are guarded by _WIN32_WINNT >= 0x0600 */
+#endif
 #include <windows.h>
 #include <fwpmu.h>
 #include <string.h>
@@ -60,7 +63,6 @@ DWORD sw_filter_add(HANDLE engine,
     FWP_BYTE_ARRAY16 v6addr;
     FWP_BYTE_BLOB sd_blob;
     FWP_RANGE0 port_range;
-    UINT16 port_lo, port_hi;
     UINT64 weight_val = weight;
     UINT8 weight_u8 = 0x0F; /* fallback if UINT64 fails */
 
@@ -79,25 +81,30 @@ DWORD sw_filter_add(HANDLE engine,
             v4am.mask = (UINT32)(c->value >> 32);
             conditions[i].conditionValue.v4AddrMask = &v4am;
             break;
+        case FWP_V6_ADDR_MASK:
+            /* value is a pointer to FWP_V6_ADDR_AND_MASK */
+            conditions[i].conditionValue.v6AddrMask =
+                (FWP_V6_ADDR_AND_MASK*)(UINT_PTR)c->value;
+            break;
         case FWP_BYTE_ARRAY16_TYPE:
             // value is a pointer to 16-byte array
             memcpy(v6addr.byteArray16, (void*)(UINT_PTR)c->value, 16);
             conditions[i].conditionValue.byteArray16 = &v6addr;
             break;
         case FWP_SECURITY_DESCRIPTOR_TYPE:
-            // value is a pointer to FWP_BYTE_BLOB
+            /* value is a pointer to FWP_BYTE_BLOB */
             sd_blob.size = ((FWP_BYTE_BLOB*)(UINT_PTR)c->value)->size;
             sd_blob.data = ((FWP_BYTE_BLOB*)(UINT_PTR)c->value)->data;
             conditions[i].conditionValue.sd = &sd_blob;
             break;
+        case FWP_SID:
+            /* value is a pointer to a SID (PSID) */
+            conditions[i].conditionValue.sid = (SID*)(UINT_PTR)c->value;
+            break;
         case FWP_RANGE_TYPE:
-            // value is two UINT16 port values packed: lo in low 16, hi in next 16
-            port_lo = (UINT16)(c->value & 0xFFFF);
-            port_hi = (UINT16)((c->value >> 16) & 0xFFFF);
-            port_range.valueLow.type = FWP_UINT16;
-            port_range.valueLow.uint16 = port_lo;
-            port_range.valueHigh.type = FWP_UINT16;
-            port_range.valueHigh.uint16 = port_hi;
+            /* value is a pointer to FWP_RANGE0 (two FWP_VALUE0, each with
+               type + uint16) */
+            memcpy(&port_range, (void*)(UINT_PTR)c->value, sizeof(FWP_RANGE0));
             conditions[i].conditionValue.rangeValue = &port_range;
             break;
         }
