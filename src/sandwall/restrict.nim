@@ -48,7 +48,9 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
   ## is unused. When the netns is unavailable (unprivileged userns
   ## disabled, old kernel) a warning is printed and the restriction
   ## continues WITHOUT network fencing, matching the backend posture.
-  ## Windows accepts the parameter and ignores it for now (chunk 4).
+  ## Windows ignores it here: the network fence on Windows is decided at
+  ## spawn time in process.spawnSandboxed (internetClient capability when
+  ## the policy has no host rules, airgap when it has), not in-process.
   ##
   ## `writable` paths get full access (read, write, create, delete, rename,
   ## execute). `read` paths get read + execute only; defaults to empty.
