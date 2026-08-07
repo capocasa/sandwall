@@ -103,6 +103,31 @@ when defined(windows):
 
   type SIZE_T* = uint
   {.passL: "-lfwpuclnt -ladvapi32".}
+  {.compile: "csrc/wfp_shim.c".}
+
+  # C shim wrappers (see csrc/wfp_shim.c) — avoid Nim ORC GC issues
+  # with WFP RPC when passing structs containing GC-managed pointers.
+  proc swProviderAdd(engine: Handle; rawGuid: ptr byte;
+      name: ptr UncheckedArray[Utf16Char]): DWORD {.stdcall,
+      importc: "sw_provider_add".}
+  proc swSublayerAdd(engine: Handle; rawGuid: ptr byte;
+      name: ptr UncheckedArray[Utf16Char];
+      weight: uint16): DWORD {.stdcall,
+      importc: "sw_sublayer_add".}
+  type
+    SwCondDesc* {.bycopy.} = object
+      fieldKey: array[16, byte]
+      matchType: uint32
+      kind: uint32
+      pad: uint32
+      value: uint64
+
+  proc swFilterAdd(engine: Handle; providerGuid: ptr byte;
+      filterKey: ptr byte; sublayerGuid: ptr byte; layerGuid: ptr byte;
+      weight: uint64; name: ptr UncheckedArray[Utf16Char];
+      actionType: uint32; conds: ptr SwCondDesc; numConds: uint32;
+      outId: ptr uint64): DWORD {.stdcall,
+      importc: "sw_filter_add".}
 
   # --- types (fwpmu.h / fwptypes.h) ---
 
@@ -348,23 +373,13 @@ when defined(windows):
     if rc != 0: fail("FwpmEngineOpen0", rc)
 
   proc ensureProviderAndSublayer(engine: Handle) =
-    let provName = allocWide("sandwall")
-    var prov: FWPM_PROVIDER0
-    zeroMem(addr prov, sizeof(prov))
-    prov.providerKey = providerKey
-    prov.displayData.name = provName
-    prov.displayData.description = provName
-    var rc = fwpmProviderAdd0(engine, addr prov, nil)
+    let name = allocWide("sandwall")
+    var rc = swProviderAdd(engine, cast[ptr byte](unsafeAddr providerKey),
+      name)
     if rc != 0'i32 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
       fail("FwpmProviderAdd0", rc)
-    var sub: FWPM_SUBLAYER0
-    zeroMem(addr sub, sizeof(sub))
-    sub.subLayerKey = sublayerKey
-    sub.displayData.name = provName
-    sub.displayData.description = provName
-    sub.providerKey = unsafeAddr providerKey
-    sub.weight = 0xFFFF
-    rc = fwpmSubLayerAdd0(engine, addr sub, nil)
+    rc = swSublayerAdd(engine, cast[ptr byte](unsafeAddr sublayerKey),
+      name, 0xFFFF)
     if rc != 0'i32 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
       fail("FwpmSubLayerAdd0", rc)
 
