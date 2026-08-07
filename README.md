@@ -32,7 +32,7 @@ skip the policy layer.
 |----------|-----------|-------------|
 | Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy |
 | macOS | Seatbelt `sandbox_init_with_parameters` | Seatbelt loopback-only + allowlist proxy |
-| Windows | AppContainer (lowbox token) + DACL grants | WFP filters on the sandwall user (`sandwall setup`) |
+| Windows | AppContainer (lowbox token) + DACL grants | capability selection: internetClient (no host rules) / airgap (host rules) + allowlist proxy env |
 
 The Linux and macOS backends confine the calling thread via kernel hooks
 (Landlock domains, Seatbelt profiles). The Windows backend has no single
@@ -44,9 +44,17 @@ child exits. See `CROSSPLATFORM.md` for the design and
 `sandbox-research.md` for the prior-art survey.
 
 Windows notes:
-- The network fence (host rules) is not yet wired to the AppContainer
-  backend; the CLI rejects host rules on Windows for now. The filesystem
-  sandbox is fully enforced.
+- Network semantics match POSIX for the common case: a policy with **no
+  host rules** leaves the network working (the AppContainer child gets
+  the `internetClient` capability). A policy **with host rules** fences
+  egress completely: the child gets no capability and is fully offline
+  (the AppContainer blocks even loopback, so the per-run wall proxy -
+  whose env the child inherits - cannot be reached and the allowlist
+  cannot pass traffic). This airgap posture is deliberate: Windows has
+  no user-mode way to exempt a loopback proxy from the container's
+  network isolation (the exemption API is MSIX-package-only and the WFP
+  ALE_APP_ID route needs admin), so the allowlist is enforced as
+  "nothing gets out" rather than "only these hosts".
 - A `cmd` inside the sandbox can run further executables by **bare name or
   relative path** (`myexe`, `.\myexe`, `sub\myexe`) resolved against the
   current directory, but **not** by drive-letter absolute path:

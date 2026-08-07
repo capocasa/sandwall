@@ -10,8 +10,13 @@
 > plus a Low integrity label stamped for the AppContainer SID on writable
 > paths and read+execute grants on read-only paths (see `src/sandwall/acl.nim`
 > and `process.nim`, and the README "Windows notes"). Filesystem isolation is
-> verified live; the WFP network fence is not yet wired to the AppContainer
-> path. The Phase-3 text below is kept for history.
+> verified live. Network: with no host rules the child gets the
+> `internetClient` capability (network left alone, as POSIX); with host
+> rules the child gets no capability and is fully offline (the
+> AppContainer blocks even loopback, so the wall proxy/allowlist cannot
+> pass traffic - an airgap, not a loopback-fenced allowlist; the loopback
+> exemption is MSIX-only and WFP needs admin). The Phase-3 text below is
+> kept for history.
 
 Goal: make `restrict(writable, read)` and the `nimbox restrict ... -- CMD` CLI
 work on macOS and Windows, behind the same Nim API the Linux backend already

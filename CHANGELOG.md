@@ -17,9 +17,13 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
   network by default; writable paths get an ALLOW ACE + Low integrity
   label for the AppContainer SID, read-only paths a read+execute grant,
   and the stamps roll back after the child exits. Filesystem isolation is
-  verified on Windows 11. The WFP network fence (host rules) is not yet
-  wired to the AppContainer path; the CLI rejects host rules on Windows
-  for now. Inside a sandboxed `cmd`, run user executables by bare name or
+  verified on Windows 11. Network semantics now match POSIX: with no host
+  rules the child gets the `internetClient` capability (network left
+  alone); with host rules the child gets no capability and is fully
+  offline (the AppContainer blocks even loopback, so the wall proxy
+  cannot be reached - the allowlist degrades to an airgap, with a stderr
+  warning). The wall proxy compiles on Windows (WSAPoll/winsock port).
+  Inside a sandboxed `cmd`, run user executables by bare name or
   relative path (not a drive-letter absolute path, which cmd under an
   AppContainer refuses). Windows CLI tests now run natively (portable
   `type`/`cmd` probes, pwsh-safe CI step).
