@@ -17,8 +17,7 @@
 ## allow decision, via the OS resolver. Denies are logged to stderr;
 ## allows are silent unless `verbose` is set.
 
-import std/[locks, nativesockets, os, strutils, syncio, times]
-import std/net
+import std/[locks, nativesockets, net, os, strutils, syncio, times]
 when defined(posix):
   import std/posix
 else:
