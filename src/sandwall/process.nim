@@ -13,6 +13,15 @@
 ## defer.
 ##
 ## `runSandboxed` is the portable entry that dispatches to the right path.
+##
+## Running user exes inside the AppContainer (verified on Windows 11):
+## the AC child runs any exe whose directory carries an AC-SID read+execute
+## grant plus a Low integrity label. A `cmd` inside the AC can itself spawn
+## further exes given as a bare name or relative path (`myexe`, `.\myexe`,
+## `sub\myexe`) resolved against the cwd, but NOT as a drive-letter
+## absolute path - `cmd /c C:\path\some.exe` fails "Access is denied" even
+## for System32 exes. So to run a user exe from a sandboxed `cmd`, cd into
+## its (writable/readonly) directory and invoke it by name.
 
 import std/os
 import ./restrict
@@ -145,6 +154,14 @@ when defined(windows):
     six.si.hStdError = pipeWrite
     six.lpAttributeList = attrList
     var pi = default(PROCESS_INFORMATION)
+
+    # NOTE: the AppContainer child rejects a custom environment block
+    # (lpEnvironment) outright - CreateProcessW fails with
+    # ERROR_NO_ENVIRONMENT (203) no matter the content (verified by probe
+    # p119). So the child always inherits our environment; there is no way
+    # to inject a modified PATH. Nested exe execution instead relies on
+    # bare-name/relative invocation resolving against the cwd (see the
+    # step-5 note in the module header).
 
     # Explicit lpCurrentDirectory: the AppContainer virtualizes %TEMP%, and
     # inheriting a cwd the container cannot reach breaks cmd's redirects.
