@@ -46,6 +46,11 @@ const
   permitV6GuidText* = "7c3f6e94-1a5d-6b70-d8c4-9f2e0a3b6c85"
   blockV6GuidText*  = "8d4a7fa5-2b6e-7c81-e9d5-0a3f1b4c7d96"
 
+  acPermitV4GuidText* = "CDBF134B-0C89-4AF6-8114-712C909AD282"
+  acBlockV4GuidText*  = "7776A764-193C-4EAE-B513-8EA59118F909"
+  acPermitV6GuidText* = "083F2DED-64CE-444F-815D-DC04F8752F1A"
+  acBlockV6GuidText*  = "AB977372-A5E9-4DE2-9D59-A9F3A561DA07"
+
 type
   GUID* {.bycopy.} = object
     data1: uint32
@@ -96,7 +101,8 @@ proc sddlForUserSid*(sid: string): string =
 when defined(windows):
   import std/[winlean, widestrs, net]
 
-  {.passL: "-lfwpuclnt".}
+  type SIZE_T* = uint
+  {.passL: "-lfwpuclnt -ladvapi32".}
 
   # --- types (fwpmu.h / fwptypes.h) ---
 
@@ -203,6 +209,10 @@ when defined(windows):
       data2: 0x34c2'u16, data3: 0x4f05'u16,
       data4: [0xbc'u8, 0x3b, 0x02, 0x88, 0x0a, 0x31, 0x3a, 0x1c])
 
+    FWPM_CONDITION_ALE_APP_ID = GUID(data1: 0xd78e1e87'u32,
+      data2: 0x8644'u16, data3: 0x4ea5'u16,
+      data4: [0x94'u8, 0x37, 0xd8, 0x09, 0xec, 0xfc, 0x97, 0x19])
+
     FWP_MATCH_EQUAL = 0'u32
     FWP_MATCH_RANGE = 1'u32
 
@@ -214,6 +224,7 @@ when defined(windows):
     FWP_SECURITY_DESCRIPTOR = 12'u32
     FWP_UINT64 = 13'u32
     FWP_UINT16 = 17'u32
+    FWP_BYTE_BLOB_TYPE = 3'u32
 
     FWP_ACTION_BLOCK = 0x00002001'u32
     FWP_ACTION_PERMIT = 0x00002002'u32
@@ -278,6 +289,29 @@ when defined(windows):
       importc: "ConvertStringSecurityDescriptorToSecurityDescriptorW".}
   proc localFree(hMem: pointer): pointer {.stdcall, dynlib: "kernel32",
       importc: "LocalFree".}
+  type
+    PSID* = pointer
+    HRESULT* = int32
+
+  proc deriveAppContainerSidFromAppContainerName(name: WideCString;
+      sid: ptr PSID): HRESULT {.stdcall, dynlib: "userenv",
+      importc: "DeriveAppContainerSidFromAppContainerName".}
+
+  proc getLengthSid(pSid: PSID): DWORD {.stdcall, dynlib: "advapi32",
+      importc: "GetLengthSid".}
+
+  proc copySid(destSidLen: DWORD; destSid: PSID;
+      sourceSid: PSID): WINBOOL {.stdcall, dynlib: "advapi32",
+      importc: "CopySid".}
+
+  proc localAlloc(uFlags: DWORD; bytes: SIZE_T): pointer {.stdcall, dynlib: "kernel32",
+      importc: "LocalAlloc".}
+
+  proc fwpmFilterDeleteByKey0(engineHandle: Handle;
+      key: ptr GUID): DWORD {.stdcall, dynlib: "fwpuclnt",
+      importc: "FwpmFilterDeleteByKey0".}
+
+
 
   proc fail(what: string; code: DWORD) {.noinline.} =
     raise newException(OSError, "sandwall wfp: " & what &
@@ -470,3 +504,106 @@ when defined(windows):
     except OSError as e:
       # WSAEACCES = 10013: blocked by the fence
       result = (if e.errorCode.int32 == 10013'i32: 0 else: 2)
+
+  proc getAppContainerSidBlob(): FWP_BYTE_BLOB =
+    let name = newWideCString("sandwall.fs")
+    var sid: PSID = nil
+    let hr = deriveAppContainerSidFromAppContainerName(name, addr sid)
+    if hr != 0'i32:
+      fail("DeriveAppContainerSidFromAppContainerName", cast[DWORD](hr))
+    let sidLen = getLengthSid(sid)
+    let data = localAlloc(0, cast[SIZE_T](sidLen))
+    if data == nil:
+      fail("localAlloc for SID blob", DWORD(getLastError()))
+    if copySid(sidLen, data, sid) == 0:
+      fail("CopySid", DWORD(getLastError()))
+    return FWP_BYTE_BLOB(size: cast[uint32](sidLen), data: cast[ptr uint8](data))
+
+  proc installAcFence*() =
+    let engine = openEngine(newWideCString("sandwall-ac-setup"))
+    defer: discard fwpmEngineClose0(engine)
+    ensureProviderAndSublayer(engine)
+    let acSidBlob = getAppContainerSidBlob()
+    defer: discard localFree(acSidBlob.data)
+
+    var v4am = FWP_V4_ADDR_AND_MASK(addr4: 0x7F000000'u32, mask: 0xFF000000'u32)
+    var permitV4Cond: array[2, FWPM_FILTER_CONDITION0]
+    permitV4Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    permitV4Cond[0].matchType = FWP_MATCH_EQUAL
+    permitV4Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
+    permitV4Cond[0].conditionValue.sd = addr acSidBlob
+    permitV4Cond[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
+    permitV4Cond[1].matchType = FWP_MATCH_EQUAL
+    permitV4Cond[1].conditionValue.kind = fwpV4AddrAndMaskKind
+    permitV4Cond[1].conditionValue.v4AddrMask = addr v4am
+    addFilter(engine, parseGuid(acPermitV4GuidText), newWideCString("sandwall-ac-permit-v4"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV4Cond)
+
+    var blockV4Cond: array[1, FWPM_FILTER_CONDITION0]
+    blockV4Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    blockV4Cond[0].matchType = FWP_MATCH_EQUAL
+    blockV4Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
+    blockV4Cond[0].conditionValue.sd = addr acSidBlob
+    addFilter(engine, parseGuid(acBlockV4GuidText), newWideCString("sandwall-ac-block-v4"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockV4Cond)
+
+    var loopback6: FWP_BYTE_ARRAY16
+    loopback6.bytes[15] = 1
+    var permitV6Cond: array[2, FWPM_FILTER_CONDITION0]
+    permitV6Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    permitV6Cond[0].matchType = FWP_MATCH_EQUAL
+    permitV6Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
+    permitV6Cond[0].conditionValue.sd = addr acSidBlob
+    permitV6Cond[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
+    permitV6Cond[1].matchType = FWP_MATCH_EQUAL
+    permitV6Cond[1].conditionValue.kind = fwpV6AddrKind
+    permitV6Cond[1].conditionValue.v6Addr = addr loopback6
+    addFilter(engine, parseGuid(acPermitV6GuidText), newWideCString("sandwall-ac-permit-v6"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV6Cond)
+
+    var blockV6Cond: array[1, FWPM_FILTER_CONDITION0]
+    blockV6Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    blockV6Cond[0].matchType = FWP_MATCH_EQUAL
+    blockV6Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
+    blockV6Cond[0].conditionValue.sd = addr acSidBlob
+    addFilter(engine, parseGuid(acBlockV6GuidText), newWideCString("sandwall-ac-block-v6"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockV6Cond)
+
+  proc uninstallAcFence*() =
+    let engine = openEngine(newWideCString("sandwall-ac-setup"))
+    defer: discard fwpmEngineClose0(engine)
+    for keyText in [acPermitV4GuidText, acBlockV4GuidText, acPermitV6GuidText, acBlockV6GuidText]:
+      let key = parseGuid(keyText)
+      discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
+
+  proc acFenceStatus*(): tuple[installed: bool; filters: int; hint: string] =
+    var engine: Handle
+    var session: FWPM_SESSION0
+    zeroMem(addr session, sizeof(session))
+    let name = newWideCString("sandwall-ac-status")
+    session.displayData.name = name
+    session.displayData.description = name
+    let rc = fwpmEngineOpen0(nil, RPC_C_AUTHN_DEFAULT, nil, addr session, addr engine)
+    if rc == DWORD(ERROR_ACCESS_DENIED):
+      return (false, 0, "WFP status needs admin; run 'sandwall setup' elevated")
+    if rc != 0: fail("FwpmEngineOpen0", rc)
+    defer: discard fwpmEngineClose0(engine)
+
+    var found = 0
+    for keyText in [acPermitV4GuidText, acBlockV4GuidText, acPermitV6GuidText, acBlockV6GuidText]:
+      var eh: Handle
+      let rc2 = fwpmFilterCreateEnumHandle0(engine, nil, addr eh)
+      if rc2 != 0:
+        fail("fwpmFilterCreateEnumHandle0", rc2)
+      var entries: ptr UncheckedArray[ptr FWPM_FILTER0]
+      var n: uint32
+      let erc = fwpmFilterEnum0(engine, eh, 256, addr entries, addr n)
+      discard fwpmFilterDestroyEnumHandle0(engine, eh)
+      if erc != 0:
+        fail("fwpmFilterEnum0", erc)
+      for i in 0 ..< n.int:
+        if entries[i][].filterKey == parseGuid(keyText):
+          inc found
+      fwpmFreeMemory0(entries)
+
+    (found == 4, found, "")
