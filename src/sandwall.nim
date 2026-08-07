@@ -126,18 +126,18 @@ filesystem policy are enforced with no setup step.
         return 127
     else:
       # Windows cannot confine the current process; runSandboxed
-      # restricts (token + ACL stamps) and spawns the child with the
-      # restricted token, rolling the ACLs back after. Host rules are
-      # rejected: the network fence lives on the sandwall-user spawn
-      # path (wall/winuser.nim), not here.
+      # restricts (AppContainer SID + ACL stamps) and spawns the child
+      # in the container, rolling the ACLs back after.
       let r = resolve(rules)
-      if r.hosts.len > 0:
-        stderr.writeLine("sandwall: host rules (network fence) are not " &
-          "supported by this command on Windows yet")
-        return 2
+      # Network parity with POSIX: no host rules -> the child gets the
+      # internetClient capability (network left alone); host rules ->
+      # the child gets no capability (full egress fence) and a wall
+      # proxy enforces the allowlist (wired in the next chunk).
+      let netAllowed = r.hosts.len == 0
       try:
         return int(runSandboxed(r.writable, cmd, read = r.readonly,
-                                denied = r.denied))
+                                denied = r.denied,
+                                inetOk = netAllowed))
       except CatchableError as e:
         stderr.writeLine("sandwall: " & e.msg)
         return 127

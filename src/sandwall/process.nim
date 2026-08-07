@@ -50,6 +50,10 @@ when defined(windows):
       capabilityCount: DWORD
       reserved: DWORD
 
+    SID_AND_ATTRIBUTES = object
+      sid: winlean.PSID
+      attributes: DWORD
+
   const
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009'u
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000'i32
@@ -81,7 +85,11 @@ when defined(windows):
       lpProcessInformation: var PROCESS_INFORMATION): WINBOOL {.stdcall,
       dynlib: "kernel32", importc: "CreateProcessW", sideEffect.}
 
-  proc spawnSandboxed*(cmd: openArray[string]): ExitCode =
+  proc convertStringSidToSidW(str: WideCString; sid: ptr winlean.PSID): WINBOOL
+      {.stdcall, dynlib: "advapi32", importc: "ConvertStringSidToSidW".}
+
+  proc spawnSandboxed*(cmd: openArray[string];
+                       internetAccess = false): ExitCode =
     ## Spawn `cmd` in the prepared AppContainer (see `acl.restrictImpl`),
     ## wait for it, and roll back the stamped ACLs in a `defer` so cleanup
     ## runs whether CreateProcess succeeds or the child errors. Raises if no
@@ -106,11 +114,33 @@ when defined(windows):
 
     # Attribute list carrying SECURITY_CAPABILITIES: the two-call sizing
     # pattern (first call fails but returns the size), then the update.
+    #
+    # `internetAccess` (set when the policy has no host rules) grants the
+    # internetClient capability: without it the AppContainer is fully
+    # airgapped, which would over-block fs-only policies relative to POSIX
+    # (no host rules = network left alone). The capability only counts
+    # with attributes = SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT
+    # (0x14; enabled alone is inert - probe p124). With host rules the
+    # caller leaves this false and the no-capability container IS the
+    # fence: all egress incl. loopback is denied, so the only way out is
+    # the wall proxy via the proxy env the parent sets before spawning.
+    var capSids: array[1, SID_AND_ATTRIBUTES]
     var sc: SECURITY_CAPABILITIES
     sc.appContainerSid = currentAppContainerSid
-    sc.capabilities = nil
-    sc.capabilityCount = 0
     sc.reserved = 0
+    if internetAccess:
+      var icSid: winlean.PSID
+      if convertStringSidToSidW(newWideCString("S-1-15-3-1"), addr icSid) == 0:
+        raise newException(OSError,
+          "sandwall: ConvertStringSidToSidW(internetClient) failed: " &
+          $getLastError())
+      capSids[0].sid = icSid
+      capSids[0].attributes = 0x14'i32
+      sc.capabilities = addr capSids[0]
+      sc.capabilityCount = 1
+    else:
+      sc.capabilities = nil
+      sc.capabilityCount = 0
 
     var listSize: uint = 0
     discard initializeProcThreadAttributeList(nil, 1, 0, addr listSize)
@@ -240,7 +270,8 @@ else:
 
 template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
                         read: openArray[string] = [];
-                        denied: openArray[string] = []): ExitCode =
+                        denied: openArray[string] = [];
+                        inetOk: bool = false): ExitCode =
   ## One-shot helper. Restricts to `writable` (full access) plus `read`
   ## (read+execute only) and runs `cmd`, returning its exit code.
   ##
@@ -255,7 +286,7 @@ template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
   block:
     when defined(windows):
       restrict(writable, read, denied)
-      spawnSandboxed(cmd)
+      spawnSandboxed(cmd, internetAccess = inetOk)
     else:
       let pid = forkNimbox()
       if pid == 0:
