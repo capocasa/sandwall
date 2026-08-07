@@ -48,13 +48,21 @@ jobs:
           lipo -create sandwall-arm64 sandwall-x86_64 -output sandwall
           file sandwall
 
-      - name: Run tests
+      - name: Run tests (Unix)
+        if: runner.os != 'Windows'
         run: |
           set -o pipefail
           nimble test 2>&1 | tee /tmp/sandwall-test.log
           # A nimble task abort has failed to fail this step before;
           # never report green with a FAILED test in the log.
           ! grep -q '\[FAILED\]' /tmp/sandwall-test.log
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          nimble test 2>&1 | Tee-Object -FilePath sandwall-test.log
+          if (Select-String -Path sandwall-test.log -Pattern '\[FAILED\]' -Quiet) { exit 1 }
 
       - name: Package (Unix)
         if: matrix.ext == 'tar.gz'

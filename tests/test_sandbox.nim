@@ -15,8 +15,12 @@ import std/[os, osproc, unittest, strutils]
 
 proc sandwallExe(): string =
   ## The freshly built sandwall binary at the project root. The `nimble test`
-  ## task builds it there before running the tests.
-  let testDir = parentDir(currentSourcePath())
+  ## task builds it there before running the tests. Derived from this test
+  ## executable's own location (getAppFilename) rather than
+  ## currentSourcePath, which is a COMPILE-TIME path - wrong for a
+  ## cross-compiled binary run on another host (the Windows tests are
+  ## cross-built on Linux and run on a Windows machine).
+  let testDir = parentDir(getAppFilename())
   result = parentDir(testDir) / "sandwall"
   when defined(windows): result.add(".exe")
 
@@ -43,6 +47,13 @@ proc redirectCmd(path: string): string =
     "cmd /c \"echo ok > " & path & "\""
   else:
     "sh -c 'echo ok > " & path & "'"
+
+proc catCmd(path: string): string =
+  ## A command that reads `path` to stdout: `type` on Windows, `cat` on posix.
+  when defined(windows):
+    "cmd /c type " & path.quoteShell
+  else:
+    "cat " & path.quoteShell
 
 proc rulesFile(name, text: string): string =
   ## Write a policy file for the CLI tests and return its path.
@@ -85,7 +96,7 @@ suite "sandwall CLI (sandboxed exec)":
     writeFile(ro / "secret.txt", "topsecret")
     let rules = rulesFile("ro", "allow " & rw & "\nreadonly " & ro & "\n")
     # read from the read-only path succeeds
-    let rcRead = execCmd(sw(rules, "cat " & (ro / "secret.txt").quoteShell))
+    let rcRead = execCmd(sw(rules, catCmd(ro / "secret.txt")))
     check: rcRead == 0
     # write to the read-only path fails
     let rcWrite = execCmd(sw(rules, redirectCmd(ro / "new.txt")))
@@ -111,16 +122,24 @@ suite "sandwall CLI (sandboxed exec)":
     createDir(sub)
     writeFile(sub / "secret.txt", "x")
     let rules = rulesFile("deny", "allow " & rw & "\ndeny " & sub & "\n")
-    let probe = "cat " & (sub / "secret.txt").quoteShell & " 2>/dev/null || echo DENIED"
-    let (outp, rc) = execCmdEx(sw(rules, "sh -c " & probe.quoteShell))
+    # The probe reads the denied secret and reports DENIED on failure.
+    # sh/cmd both exit nonzero on a failed read; wrap so the CLI rc is 0
+    # and we assert on the marker instead.
+    when defined(windows):
+      let probe = "cmd /c \"type " & (sub / "secret.txt") &
+        " 2>NUL || echo DENIED\""
+    else:
+      let probe = "sh -c " & ("cat " & (sub / "secret.txt").quoteShell &
+        " 2>/dev/null || echo DENIED").quoteShell
+    let (outp, rc) = execCmdEx(sw(rules, probe))
     check: rc == 0
     check: "DENIED" in outp
     # Sibling writes still work.
     let wrc = execCmd(sw(rules, redirectCmd(rw / "fine.txt")))
     check: wrc == 0
     check: fileExists(rw / "fine.txt")
-    # The host's view is untouched (no rollback needed on POSIX; the
-    # mask lives in the child's mount namespace).
+    # The host's view is untouched (POSIX: the mask lives in the child's
+    # mount namespace; Windows: the deny ACE is rolled back after the run).
     check: readFile(sub / "secret.txt") == "x"
 
   when defined(linux):
