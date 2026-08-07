@@ -400,27 +400,42 @@ when defined(windows):
       if f[].subLayerKey == sublayerKey:
         result.add f[].filterId
 
+  proc guidToBytes(g: GUID): array[16, byte] = guidBytes(g)
+
   proc addFilter(engine: Handle; key: GUID; name: ptr UncheckedArray[Utf16Char];
       layer: GUID; weight: uint64; actionType: uint32;
       conditions: openArray[FWPM_FILTER_CONDITION0]) =
-    var f: FWPM_FILTER0
-    zeroMem(addr f, sizeof(f))
-    f.filterKey = key
-    f.displayData.name = name
-    f.displayData.description = name
-    f.providerKey = unsafeAddr providerKey
-    f.layerKey = layer
-    f.subLayerKey = sublayerKey
-    var weightVal = weight
-    f.weight.kind = FWP_UINT64
-    f.weight.data.uint64Value = addr weightVal
-    f.action.actionType = actionType
-    f.numFilterConditions = conditions.len.uint32
-    if conditions.len > 0:
-      f.filterCondition = cast[ptr UncheckedArray[FWPM_FILTER_CONDITION0]](
-        unsafeAddr conditions[0])
+    # Build SwCondDesc array from the Nim-built conditions, then delegate
+    # to the C shim which constructs FWPM_FILTER0 in C (avoiding Nim GC
+    # issues with the WFP RPC stack).
+    var descs: array[4, SwCondDesc]
+    let n = min(conditions.len, 4)
+    for i in 0 ..< n:
+      let c = conditions[i]
+      descs[i].fieldKey = guidToBytes(c.fieldKey)
+      descs[i].matchType = c.matchType
+      descs[i].kind = c.conditionValue.kind
+      descs[i].pad = 0
+      # Extract the value based on kind
+      case c.conditionValue.kind
+      of FWP_V4_ADDR_MASK:
+        let v4 = c.conditionValue.data.v4AddrMask
+        if v4 != nil:
+          descs[i].value = uint64(v4[].addr4) or (uint64(v4[].mask) shl 32)
+      of FWP_BYTE_ARRAY16_TYPE:
+        descs[i].value = cast[uint64](c.conditionValue.data.v6Addr)
+      of FWP_SECURITY_DESCRIPTOR:
+        descs[i].value = cast[uint64](c.conditionValue.data.sd)
+      of FWP_RANGE:
+        descs[i].value = cast[uint64](c.conditionValue.data.rangeValue)
+      else:
+        descs[i].value = 0
     var id: uint64
-    let rc = fwpmFilterAdd0(engine, addr f, nil, addr id)
+    var keyBytes = guidToBytes(key)
+    let rc = swFilterAdd(engine, cast[ptr byte](unsafeAddr providerKey),
+      addr keyBytes[0], cast[ptr byte](unsafeAddr sublayerKey),
+      cast[ptr byte](unsafeAddr layer), weight, name, actionType,
+      addr descs[0], n.uint32, addr id)
     if rc != 0: fail("FwpmFilterAdd0", rc)
 
   proc installFence*(userSid: string; firstPort, lastPort: uint16) =

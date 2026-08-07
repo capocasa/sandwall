@@ -62,6 +62,7 @@ DWORD sw_filter_add(HANDLE engine,
     FWP_RANGE0 port_range;
     UINT16 port_lo, port_hi;
     UINT64 weight_val = weight;
+    UINT8 weight_u8 = 0x0F; /* fallback if UINT64 fails */
 
     ZeroMemory(conditions, sizeof(conditions));
     if (num_conds > 4) num_conds = 4;
@@ -110,8 +111,7 @@ DWORD sw_filter_add(HANDLE engine,
     memcpy(&filt.subLayerKey, sublayer_guid, sizeof(GUID));
     filt.displayData.name = (PWSTR)name;
     filt.displayData.description = (PWSTR)name;
-    filt.weight.type = FWP_UINT64;
-    filt.weight.uint64 = &weight_val;
+    filt.weight.type = FWP_EMPTY; /* let BFE auto-assign */
     filt.numFilterConditions = num_conds;
     filt.filterCondition = (num_conds > 0) ? conditions : NULL;
     filt.action.type = action_type;
