@@ -7,6 +7,20 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- Windows: host-rules network posture changed from airgap (no-cap
+  AppContainer, fully offline) to **WFP fence + degrade**. With host
+  rules and `sandwall setup` (one-time elevated) installed, WFP filters
+  confine the AppContainer child to loopback, and the wall proxy
+  enforces the hostname allowlist (same architecture as POSIX).
+  Without `sandwall setup`, host rules produce a stderr warning and the
+  child has open network access (accepted degrade). The WFP FFI had
+  six critical bugs fixed: FWP_DATA_TYPE enum values (UINT64=4 not 13,
+  etc.), FwpmFreeMemory0 takes void**, FWP_VALUE0 must be a union (not
+  sequential struct), FWPM_ACTION0.filterType is ptr GUID, FWPM_FILTER0
+  has a 16-byte rawContext/providerContextKey union, and uint64 weight
+  values are passed by reference. A C shim (csrc/wfp_shim.c) wraps
+  provider/sublayer/filter add to avoid Nim ORC GC corruption of the
+  WFP RPC stack.
 - Policy DSL access codes replaced by words: `+` -> `write`, `-` ->
   `deny`, `*` -> `read`. Arbitrary whitespace allowed between the word
   and the target. Old-format policy files must be rewritten; the parser
