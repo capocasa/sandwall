@@ -119,22 +119,26 @@ when defined(windows):
       bytes: array[16, uint8]
 
     FWPM_DISPLAY_DATA0* {.bycopy.} = object
-      name: WideCString
-      description: WideCString
+      name: ptr UncheckedArray[Utf16Char]
+      description: ptr UncheckedArray[Utf16Char]
 
-    # FWP_VALUE0: a kind tag plus an 8-byte payload. Payloads are
-    # pointers (structs passed by reference) or integer values, so the
-    # layout is { uint32 kind; 4 pad; 8 bytes } on 32- and 64-bit.
-    FWP_VALUE0* {.bycopy.} = object
-      kind: uint32
+    # FWP_VALUE0: a kind tag (uint32) plus 4 bytes of padding plus an
+    # 8-byte union payload (matches the Win32 FWP_VALUE0 on amd64).
+    # Using a union avoids the struct-size bug where sequential fields
+    # bloated FWP_VALUE0 to 56 bytes and corrupted FWPM_FILTER0 offsets
+    # after `weight`, which hung FwpmFilterEnum0.
+    FWP_VALUE_DATA* {.union.} = object
       uint8Value: uint8
       uint16Value: uint16
       uint32Value: uint32
-      uint64Value: uint64
+      uint64Value: ptr uint64  # FWP_VALUE0 stores UINT64 by reference
       v4AddrMask: ptr FWP_V4_ADDR_AND_MASK
       v6Addr: ptr FWP_BYTE_ARRAY16
       rangeValue: pointer  # ptr FWP_RANGE0
       sd: ptr FWP_BYTE_BLOB
+    FWP_VALUE0* {.bycopy.} = object
+      kind: uint32
+      data: FWP_VALUE_DATA
 
     FWP_RANGE0* {.bycopy.} = object
       valueLow, valueHigh: FWP_VALUE0
@@ -158,6 +162,10 @@ when defined(windows):
       providerData: FWP_BYTE_BLOB
       weight: uint16
 
+    # rawContext (UINT64) / providerContextKey (GUID) union: 16 bytes.
+    FWP_RAW_CONTEXT_UNION* {.union.} = object
+      rawContext: uint64
+      providerContextKey: GUID
     FWPM_FILTER0* {.bycopy.} = object
       filterKey: GUID
       displayData: FWPM_DISPLAY_DATA0
@@ -170,14 +178,14 @@ when defined(windows):
       numFilterConditions: uint32
       filterCondition: ptr UncheckedArray[FWPM_FILTER_CONDITION0]
       action: FWPM_ACTION0
-      rawContextOrProviderContext: uint64
+      rawContextOrProviderContext: FWP_RAW_CONTEXT_UNION
       reserved: ptr GUID
       filterId: uint64
       effectiveWeight: FWP_VALUE0
 
     FWPM_ACTION0* {.bycopy.} = object
       actionType: uint32
-      filterType: GUID
+      filterType: ptr GUID
 
     FWPM_SESSION0* {.bycopy.} = object
       sessionKey: GUID
@@ -186,7 +194,7 @@ when defined(windows):
       txnWaitTimeoutInMSec: uint32
       processId: DWORD
       sid: pointer
-      username: WideCString
+      username: ptr UncheckedArray[Utf16Char]
       kernelMode: WINBOOL
 
   const
@@ -218,13 +226,16 @@ when defined(windows):
 
     # FWP_DATA_TYPE (fwptypes.h)
     FWP_EMPTY = 0'u32
-    fwpV4AddrAndMaskKind = 5'u32
-    fwpV6AddrKind = 6'u32
-    FWP_RANGE = 10'u32
-    FWP_SECURITY_DESCRIPTOR = 12'u32
-    FWP_UINT64 = 13'u32
-    FWP_UINT16 = 17'u32
-    FWP_BYTE_BLOB_TYPE = 3'u32
+    FWP_UINT8 = 1'u32
+    FWP_UINT16 = 2'u32
+    FWP_UINT32 = 3'u32
+    FWP_UINT64 = 4'u32
+    FWP_BYTE_ARRAY16_TYPE = 11'u32
+    FWP_BYTE_BLOB_TYPE = 12'u32
+    FWP_SECURITY_DESCRIPTOR = 14'u32
+    FWP_V4_ADDR_MASK = 0x100'u32
+    FWP_V6_ADDR_MASK = 0x101'u32
+    FWP_RANGE = 0x102'u32
 
     FWP_ACTION_BLOCK = 0x00002001'u32
     FWP_ACTION_PERMIT = 0x00002002'u32
@@ -278,7 +289,7 @@ when defined(windows):
   proc fwpmFilterDestroyEnumHandle0(engineHandle: Handle;
       enumHandle: Handle): DWORD {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmFilterDestroyEnumHandle0".}
-  proc fwpmFreeMemory0(p: pointer) {.stdcall, dynlib: "fwpuclnt",
+  proc fwpmFreeMemory0(p: ptr pointer) {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmFreeMemory0".}
 
   proc convertStringSecurityDescriptorToSecurityDescriptorW(
@@ -313,11 +324,21 @@ when defined(windows):
 
 
 
+  proc allocWide(s: string): ptr UncheckedArray[Utf16Char] =
+    ## Copy a string to a non-GC wide-char buffer. WFP structs store
+    ## raw pointers to display-data strings across the FFI call; Nim's
+    ## ORC GC can move or collect newWideCString results mid-call, so
+    ## every string embedded in a WFP struct must come from here.
+    let n = (s.len + 1) * 2
+    result = cast[ptr UncheckedArray[Utf16Char]](alloc(n))
+    let w = newWideCString(s)
+    copyMem(result, unsafeAddr w[0], n)
+
   proc fail(what: string; code: DWORD) {.noinline.} =
     raise newException(OSError, "sandwall wfp: " & what &
       " failed (win32 error " & $code & ")")
 
-  proc openEngine(name: WideCString): Handle =
+  proc openEngine(name: ptr UncheckedArray[Utf16Char]): Handle =
     var session: FWPM_SESSION0
     zeroMem(addr session, sizeof(session))
     session.displayData.name = name
@@ -327,7 +348,7 @@ when defined(windows):
     if rc != 0: fail("FwpmEngineOpen0", rc)
 
   proc ensureProviderAndSublayer(engine: Handle) =
-    let provName = newWideCString("sandwall")
+    let provName = allocWide("sandwall")
     var prov: FWPM_PROVIDER0
     zeroMem(addr prov, sizeof(prov))
     prov.providerKey = providerKey
@@ -357,13 +378,14 @@ when defined(windows):
     var n: uint32
     let erc = fwpmFilterEnum0(engine, eh, 256, addr entries, addr n)
     if erc != 0: fail("FwpmFilterEnum0", erc)
-    defer: fwpmFreeMemory0(entries)
+    var entriesP: pointer = entries
+    defer: fwpmFreeMemory0(addr entriesP)
     for i in 0 ..< n.int:
       let f = entries[i]
       if f[].subLayerKey == sublayerKey:
         result.add f[].filterId
 
-  proc addFilter(engine: Handle; key: GUID; name: WideCString;
+  proc addFilter(engine: Handle; key: GUID; name: ptr UncheckedArray[Utf16Char];
       layer: GUID; weight: uint64; actionType: uint32;
       conditions: openArray[FWPM_FILTER_CONDITION0]) =
     var f: FWPM_FILTER0
@@ -374,8 +396,9 @@ when defined(windows):
     f.providerKey = unsafeAddr providerKey
     f.layerKey = layer
     f.subLayerKey = sublayerKey
+    var weightVal = weight
     f.weight.kind = FWP_UINT64
-    f.weight.uint64Value = weight
+    f.weight.data.uint64Value = addr weightVal
     f.action.actionType = actionType
     f.numFilterConditions = conditions.len.uint32
     if conditions.len > 0:
@@ -389,7 +412,7 @@ when defined(windows):
     ## Idempotent install: provider + sublayer (tolerate existing),
     ## delete any previous filters of ours, then the 4 filters.
     doAssert validPortRange(firstPort, lastPort)
-    let engine = openEngine(newWideCString("sandwall-setup"))
+    let engine = openEngine(allocWide("sandwall-setup"))
     defer: discard fwpmEngineClose0(engine)
     ensureProviderAndSublayer(engine)
     for id in enumOurFilters(engine):
@@ -397,15 +420,15 @@ when defined(windows):
 
     # port range condition storage (referenced by pointer)
     var lo = FWP_VALUE0(kind: FWP_UINT16)
-    lo.uint16Value = firstPort
+    lo.data.uint16Value = firstPort
     var hi = FWP_VALUE0(kind: FWP_UINT16)
-    hi.uint16Value = lastPort
+    hi.data.uint16Value = lastPort
     var rng = FWP_RANGE0(valueLow: lo, valueHigh: hi)
     var portCond: FWPM_FILTER_CONDITION0
     portCond.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT
     portCond.matchType = FWP_MATCH_RANGE
     portCond.conditionValue.kind = FWP_RANGE
-    portCond.conditionValue.rangeValue = addr rng
+    portCond.conditionValue.data.rangeValue = addr rng
 
     # v4 permit: remote addr in 127.0.0.0/8 AND remote port in range.
     # Addrs are in network order: 127.0.0.0 = 0x7F000000, /8 mask.
@@ -414,17 +437,17 @@ when defined(windows):
     var permitV4Cond: array[2, FWPM_FILTER_CONDITION0]
     permitV4Cond[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
     permitV4Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV4Cond[0].conditionValue.kind = fwpV4AddrAndMaskKind
-    permitV4Cond[0].conditionValue.v4AddrMask = addr v4am
+    permitV4Cond[0].conditionValue.kind = FWP_V4_ADDR_MASK
+    permitV4Cond[0].conditionValue.data.v4AddrMask = addr v4am
     permitV4Cond[1] = portCond
-    addFilter(engine, permitV4Key, newWideCString("sandwall-permit-v4"),
+    addFilter(engine, permitV4Key, allocWide("sandwall-permit-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64,
       FWP_ACTION_PERMIT, permitV4Cond)
 
     # block condition: ALE_USER_ID vs SDDL-built security descriptor
     var sd: pointer
     var sdSize: DWORD
-    let sddl = newWideCString(sddlForUserSid(userSid))
+    let sddl = allocWide(sddlForUserSid(userSid))
     if convertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1,
         addr sd, addr sdSize) == 0:
       fail("ConvertStringSecurityDescriptorToSecurityDescriptorW",
@@ -435,9 +458,9 @@ when defined(windows):
     blockCond[0].fieldKey = FWPM_CONDITION_ALE_USER_ID
     blockCond[0].matchType = FWP_MATCH_EQUAL
     blockCond[0].conditionValue.kind = FWP_SECURITY_DESCRIPTOR
-    blockCond[0].conditionValue.sd = addr sdBlob
+    blockCond[0].conditionValue.data.sd = addr sdBlob
 
-    addFilter(engine, blockV4Key, newWideCString("sandwall-block-v4"),
+    addFilter(engine, blockV4Key, allocWide("sandwall-block-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64,
       FWP_ACTION_BLOCK, blockCond)
 
@@ -447,21 +470,21 @@ when defined(windows):
     var permitV6Cond: array[2, FWPM_FILTER_CONDITION0]
     permitV6Cond[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
     permitV6Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV6Cond[0].conditionValue.kind = fwpV6AddrKind
-    permitV6Cond[0].conditionValue.v6Addr = addr loopback6
+    permitV6Cond[0].conditionValue.kind = FWP_V6_ADDR_MASK
+    permitV6Cond[0].conditionValue.data.v6Addr = addr loopback6
     permitV6Cond[1] = portCond
-    addFilter(engine, permitV6Key, newWideCString("sandwall-permit-v6"),
+    addFilter(engine, permitV6Key, allocWide("sandwall-permit-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64,
       FWP_ACTION_PERMIT, permitV6Cond)
 
-    addFilter(engine, blockV6Key, newWideCString("sandwall-block-v6"),
+    addFilter(engine, blockV6Key, allocWide("sandwall-block-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64,
       FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallFence*() =
     ## Remove our filters, sublayer and provider. Missing objects are
     ## tolerated so uninstall is safe to run repeatedly.
-    let engine = openEngine(newWideCString("sandwall-setup"))
+    let engine = openEngine(allocWide("sandwall-setup"))
     defer: discard fwpmEngineClose0(engine)
     for id in enumOurFilters(engine):
       discard fwpmFilterDeleteById0(engine, id)
@@ -474,7 +497,7 @@ when defined(windows):
     var engine: Handle
     var session: FWPM_SESSION0
     zeroMem(addr session, sizeof(session))
-    let name = newWideCString("sandwall-status")
+    let name = allocWide("sandwall-status")
     session.displayData.name = name
     session.displayData.description = name
     let rc = fwpmEngineOpen0(nil, RPC_C_AUTHN_DEFAULT, nil,
@@ -505,72 +528,93 @@ when defined(windows):
       # WSAEACCES = 10013: blocked by the fence
       result = (if e.errorCode.int32 == 10013'i32: 0 else: 2)
 
-  proc getAppContainerSidBlob(): FWP_BYTE_BLOB =
-    let name = newWideCString("sandwall.fs")
+  proc convertSidToStringSidW(sid: PSID; str: ptr WideCString): WINBOOL {.stdcall,
+      dynlib: "advapi32", importc: "ConvertSidToStringSidW".}
+
+  proc getAppContainerSidString*(): string =
+    ## Derive the `sandwall.fs` AppContainer SID and return it as its
+    ## canonical S-string form (S-1-15-2-...). Uses the existing SDDL
+    ## builder to feed ALE_USER_ID conditions (AppContainer processes
+    ## run under their AC SID as the token user).
+    let name = allocWide("sandwall.fs")
     var sid: PSID = nil
     let hr = deriveAppContainerSidFromAppContainerName(name, addr sid)
     if hr != 0'i32:
       fail("DeriveAppContainerSidFromAppContainerName", cast[DWORD](hr))
-    let sidLen = getLengthSid(sid)
-    let data = localAlloc(0, cast[SIZE_T](sidLen))
-    if data == nil:
-      fail("localAlloc for SID blob", DWORD(getLastError()))
-    if copySid(sidLen, data, sid) == 0:
-      fail("CopySid", DWORD(getLastError()))
-    return FWP_BYTE_BLOB(size: cast[uint32](sidLen), data: cast[ptr uint8](data))
+    var wstr: WideCString = nil
+    if convertSidToStringSidW(sid, addr wstr) == 0:
+      fail("ConvertSidToStringSidW", DWORD(getLastError()))
+    result = $wstr
+    discard localFree(wstr)
+
+  proc buildAcSdBlob(): tuple[blob: FWP_BYTE_BLOB, sd: pointer] =
+    ## Build the FWP_BYTE_BLOB wrapping a self-relative security
+    ## descriptor whose DACL grants Connect access to the
+    ## `sandwall.fs` AppContainer SID. The caller must localFree
+    ## result.sd.
+    let acSid = getAppContainerSidString()
+    var sd: pointer
+    var sdSize: DWORD
+    let sddl = allocWide(sddlForUserSid(acSid))
+    if convertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1,
+        addr sd, addr sdSize) == 0:
+      fail("ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        DWORD(getLastError()))
+    result = (FWP_BYTE_BLOB(size: uint32(sdSize),
+      data: cast[ptr uint8](sd)), sd)
 
   proc installAcFence*() =
-    let engine = openEngine(newWideCString("sandwall-ac-setup"))
+    let engine = openEngine(allocWide("sandwall-ac-setup"))
     defer: discard fwpmEngineClose0(engine)
     ensureProviderAndSublayer(engine)
-    let acSidBlob = getAppContainerSidBlob()
-    defer: discard localFree(acSidBlob.data)
+    let (acSidBlob, sd) = buildAcSdBlob()
+    defer: discard localFree(sd)
 
     var v4am = FWP_V4_ADDR_AND_MASK(addr4: 0x7F000000'u32, mask: 0xFF000000'u32)
     var permitV4Cond: array[2, FWPM_FILTER_CONDITION0]
-    permitV4Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    permitV4Cond[0].fieldKey = FWPM_CONDITION_ALE_USER_ID
     permitV4Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV4Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
-    permitV4Cond[0].conditionValue.sd = addr acSidBlob
+    permitV4Cond[0].conditionValue.kind = FWP_SECURITY_DESCRIPTOR
+    permitV4Cond[0].conditionValue.data.sd = addr acSidBlob
     permitV4Cond[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
     permitV4Cond[1].matchType = FWP_MATCH_EQUAL
-    permitV4Cond[1].conditionValue.kind = fwpV4AddrAndMaskKind
-    permitV4Cond[1].conditionValue.v4AddrMask = addr v4am
-    addFilter(engine, parseGuid(acPermitV4GuidText), newWideCString("sandwall-ac-permit-v4"),
+    permitV4Cond[1].conditionValue.kind = FWP_V4_ADDR_MASK
+    permitV4Cond[1].conditionValue.data.v4AddrMask = addr v4am
+    addFilter(engine, parseGuid(acPermitV4GuidText), allocWide("sandwall-ac-permit-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV4Cond)
 
     var blockV4Cond: array[1, FWPM_FILTER_CONDITION0]
-    blockV4Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    blockV4Cond[0].fieldKey = FWPM_CONDITION_ALE_USER_ID
     blockV4Cond[0].matchType = FWP_MATCH_EQUAL
-    blockV4Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
-    blockV4Cond[0].conditionValue.sd = addr acSidBlob
-    addFilter(engine, parseGuid(acBlockV4GuidText), newWideCString("sandwall-ac-block-v4"),
+    blockV4Cond[0].conditionValue.kind = FWP_SECURITY_DESCRIPTOR
+    blockV4Cond[0].conditionValue.data.sd = addr acSidBlob
+    addFilter(engine, parseGuid(acBlockV4GuidText), allocWide("sandwall-ac-block-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockV4Cond)
 
     var loopback6: FWP_BYTE_ARRAY16
     loopback6.bytes[15] = 1
     var permitV6Cond: array[2, FWPM_FILTER_CONDITION0]
-    permitV6Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    permitV6Cond[0].fieldKey = FWPM_CONDITION_ALE_USER_ID
     permitV6Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV6Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
-    permitV6Cond[0].conditionValue.sd = addr acSidBlob
+    permitV6Cond[0].conditionValue.kind = FWP_SECURITY_DESCRIPTOR
+    permitV6Cond[0].conditionValue.data.sd = addr acSidBlob
     permitV6Cond[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
     permitV6Cond[1].matchType = FWP_MATCH_EQUAL
-    permitV6Cond[1].conditionValue.kind = fwpV6AddrKind
-    permitV6Cond[1].conditionValue.v6Addr = addr loopback6
-    addFilter(engine, parseGuid(acPermitV6GuidText), newWideCString("sandwall-ac-permit-v6"),
+    permitV6Cond[1].conditionValue.kind = FWP_V6_ADDR_MASK
+    permitV6Cond[1].conditionValue.data.v6Addr = addr loopback6
+    addFilter(engine, parseGuid(acPermitV6GuidText), allocWide("sandwall-ac-permit-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV6Cond)
 
     var blockV6Cond: array[1, FWPM_FILTER_CONDITION0]
-    blockV6Cond[0].fieldKey = FWPM_CONDITION_ALE_APP_ID
+    blockV6Cond[0].fieldKey = FWPM_CONDITION_ALE_USER_ID
     blockV6Cond[0].matchType = FWP_MATCH_EQUAL
-    blockV6Cond[0].conditionValue.kind = FWP_BYTE_BLOB_TYPE
-    blockV6Cond[0].conditionValue.sd = addr acSidBlob
-    addFilter(engine, parseGuid(acBlockV6GuidText), newWideCString("sandwall-ac-block-v6"),
+    blockV6Cond[0].conditionValue.kind = FWP_SECURITY_DESCRIPTOR
+    blockV6Cond[0].conditionValue.data.sd = addr acSidBlob
+    addFilter(engine, parseGuid(acBlockV6GuidText), allocWide("sandwall-ac-block-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockV6Cond)
 
   proc uninstallAcFence*() =
-    let engine = openEngine(newWideCString("sandwall-ac-setup"))
+    let engine = openEngine(allocWide("sandwall-ac-setup"))
     defer: discard fwpmEngineClose0(engine)
     for keyText in [acPermitV4GuidText, acBlockV4GuidText, acPermitV6GuidText, acBlockV6GuidText]:
       let key = parseGuid(keyText)
@@ -580,7 +624,7 @@ when defined(windows):
     var engine: Handle
     var session: FWPM_SESSION0
     zeroMem(addr session, sizeof(session))
-    let name = newWideCString("sandwall-ac-status")
+    let name = allocWide("sandwall-ac-status")
     session.displayData.name = name
     session.displayData.description = name
     let rc = fwpmEngineOpen0(nil, RPC_C_AUTHN_DEFAULT, nil, addr session, addr engine)
@@ -604,6 +648,7 @@ when defined(windows):
       for i in 0 ..< n.int:
         if entries[i][].filterKey == parseGuid(keyText):
           inc found
-      fwpmFreeMemory0(entries)
+      var entriesP: pointer = entries
+      fwpmFreeMemory0(addr entriesP)
 
     (found == 4, found, "")
