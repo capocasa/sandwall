@@ -190,17 +190,25 @@ filesystem policy are enforced with no setup step.
       when defined(windows):
         if "--status" in args:
           let st = fenceStatus()
-          echo "installed: ", st.installed, " filters: ", st.filters
-          if st.hint.len > 0: echo st.hint
-          else: echo "behavioral verify: ", verifyFenceBehavioral()
+          let ast = acFenceStatus()
+          echo "user fence: installed=", st.installed, " filters=", st.filters
+          echo "ac fence:   installed=", ast.installed, " filters=", ast.filters
+          if st.hint.len > 0: echo "  ", st.hint
+          if ast.hint.len > 0: echo "  ", ast.hint
           return 0
         if "--uninstall" in args:
           uninstallFence()
+          uninstallAcFence()
           echo "sandwall: wall filters removed"
           return 0
         try:
           let sid = setupSandwallUser()
           installFence(sid, FirstProxyPort, LastProxyPort)
+          try:
+            installAcFence()
+            echo "sandwall: AC fence installed"
+          except OSError as e:
+            stderr.writeLine("sandwall: AC fence install failed: " & e.msg)
           echo "sandwall: setup complete; sandwall user SID ", sid
           return 0
         except OSError as e:
