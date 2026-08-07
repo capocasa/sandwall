@@ -33,6 +33,8 @@ when isMainModule:
   import std/[os, syncio, strutils]
   when defined(posix):
     import std/posix except Time
+  when defined(windows):
+    import ./sandwall/wall/proxy
 
   const usage = """
 sandwall - a process sandbox backed by OS-native primitives
@@ -133,7 +135,41 @@ filesystem policy are enforced with no setup step.
       # internetClient capability (network left alone); host rules ->
       # the child gets no capability (full egress fence) and a wall
       # proxy enforces the allowlist (wired in the next chunk).
+      # Host rules: the no-capability AppContainer is the fence (all
+      # egress incl. loopback is denied - verified: loopback is blocked
+      # under EVERY capability, the loopback-exemption API is MSIX-only,
+      # and WFP ALE_APP_ID is unavailable without admin/BFE, so no
+      # capability combination lets the child reach a loopback proxy).
+      # The wall proxy still runs in THIS unrestricted process and its
+      # env (set on ourselves pre-spawn; the AC child rejects a custom
+      # env block, probe p119, but inherits ours) is handed to the child,
+      # so tools see the standard allowlist interface - but the child
+      # cannot actually reach the proxy, so the allowlist cannot pass
+      # traffic. Windows + host rules = airgap, and we say so.
       let netAllowed = r.hosts.len == 0
+      var wallProxy: WallProxy
+      if not netAllowed:
+        let polPath = if policyPath.len > 0: policyPath
+                      else:
+                        let p = getTempDir() / ("sandwall-" &
+                          $getCurrentProcessId() & "-policy")
+                        writeFile(p, renderPolicy(rules))
+                        p
+        stderr.writeLine("sandwall: host rules on Windows: the child is " &
+          "fully offline (the AppContainer egress fence also blocks " &
+          "loopback, so the wall proxy/allowlist cannot pass traffic)")
+        wallProxy = startWallProxy(polPath, projectDir)
+        let hp = "http://127.0.0.1:" & $wallProxy.port
+        let sp = "socks5h://127.0.0.1:" & $wallProxy.port
+        putEnv("http_proxy", hp)
+        putEnv("https_proxy", hp)
+        putEnv("HTTP_PROXY", hp)
+        putEnv("HTTPS_PROXY", hp)
+        putEnv("ALL_PROXY", sp)
+        putEnv("all_proxy", sp)
+        putEnv("NO_PROXY", "")
+        putEnv("no_proxy", "")
+        putEnv("WALL_PROXY_PORT", $wallProxy.port)
       try:
         return int(runSandboxed(r.writable, cmd, read = r.readonly,
                                 denied = r.denied,
@@ -141,6 +177,8 @@ filesystem policy are enforced with no setup step.
       except CatchableError as e:
         stderr.writeLine("sandwall: " & e.msg)
         return 127
+      finally:
+        if not netAllowed: stopWallProxy(wallProxy)
 
   proc cliMain(): int =
     let args = commandLineParams()

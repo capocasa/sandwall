@@ -4,7 +4,8 @@
 ## policy's HostList per target and hot-reloads the policy file on mtime
 ## change. Fenced processes reach the outside world only through here,
 ## so the fence (chunk 3) can be simple: block everything, permit
-## loopback.
+## loopback. Compiles on POSIX (poll) and Windows (WSAPoll); the unix
+## listener is POSIX-only.
 ##
 ## Access control: the listener binds 127.0.0.1 only, never 0.0.0.0, and
 ## there is no authentication. Loopback binding IS the access control -
@@ -16,7 +17,12 @@
 ## allow decision, via the OS resolver. Denies are logged to stderr;
 ## allows are silent unless `verbose` is set.
 
-import std/[locks, nativesockets, net, os, posix, strutils, syncio, times]
+import std/[locks, nativesockets, os, strutils, syncio, times]
+import std/net
+when defined(posix):
+  import std/posix
+else:
+  import winlean except Socket
 
 import ../rules
 import ./hosts
@@ -51,6 +57,54 @@ const
   handshakeTimeout = 30_000   ## ms to read the initial request
   upstreamTimeout = 15_000    ## ms to connect+read the upstream
   spliceBuf = 64 * 1024
+
+when defined(windows):
+  # Minimal winsock portability layer: the proxy code below is written
+  # against poll/recv/send/close; on Windows those map to WSAPoll and
+  # the ws2_32 calls. SocketHandle is already `int` in winlean, so only
+  # the narrow casts differ (handles stay in the low 32 bits in
+  # practice; every socket this file creates goes through WSAPoll for
+  # readiness, so a handle that does not would simply stall, never
+  # corrupt).
+  type
+    TPollfdW = object
+      fd: SocketHandle
+      events, revents: int16
+  proc wsaPoll(fds: ptr TPollfdW; nfds: culong; timeout: cint): cint
+    {.stdcall, dynlib: "ws2_32", importc: "WSAPoll".}
+  proc wsaRecv(s: SocketHandle; buf: pointer; len, flags: cint): cint
+    {.stdcall, dynlib: "ws2_32", importc: "recv".}
+  proc wsaSend(s: SocketHandle; buf: pointer; len, flags: cint): cint
+    {.stdcall, dynlib: "ws2_32", importc: "send".}
+  proc wsaSocket(af, typ, protocol: cint): SocketHandle
+    {.stdcall, dynlib: "ws2_32", importc: "socket".}
+  proc wsaConnect(s: SocketHandle; name: ptr SockAddr; namelen: cint): cint
+    {.stdcall, dynlib: "ws2_32", importc: "connect".}
+  proc wsaAccept(s: SocketHandle; a: ptr SockAddr; n: ptr cint): SocketHandle
+    {.stdcall, dynlib: "ws2_32", importc: "accept".}
+  proc wsaShutdown(s: SocketHandle; how: cint): cint
+    {.stdcall, dynlib: "ws2_32", importc: "shutdown".}
+  proc wsaIoctl(s: SocketHandle; cmd: clong; argp: ptr culong): cint
+    {.stdcall, dynlib: "ws2_32", importc: "ioctlsocket".}
+  proc inetNtopW(family: cint; pAddr: pointer; buf: WideCString;
+                 len: csize_t): WideCString
+    {.stdcall, dynlib: "ws2_32", importc: "InetNtopW".}
+  const
+    POLLIN_W: int16 = 0x0300    # POLLRDNORM|POLLRDBAND
+    POLLOUT_W: int16 = 0x0010   # POLLWRNORM
+    POLLERR_W: int16 = 0x0001
+    POLLHUP_W: int16 = 0x0002
+    POLLNVAL_W: int16 = 0x0004
+    FIONBIO_W: clong = -2147195266  # 0x8004667E as signed long
+  proc pollW(fds: ptr TPollfdW; nfds: int; timeout: cint): cint =
+    wsaPoll(fds, nfds.culong, timeout)
+  template interruptedW(): bool = osLastError().cint == WSAEINTR
+
+proc closeSock(fd: SocketHandle) =
+  when defined(posix):
+    discard posix.close(fd)
+  else:
+    discard closesocket(fd)
 
 # ------------------------------------------------------------- policy
 
@@ -100,13 +154,24 @@ proc recvFd(fd: SocketHandle; buf: pointer; len: int; timeoutMs = -1): int =
     if timeoutMs >= 0:
       let remain = int((deadline - epochTime()) * 1000)
       if remain <= 0: return -1
-      var pfd = TPollfd(fd: fd.cint, events: POLLIN)
-      let r = poll(addr pfd, 1, remain.cint)
-      if r <= 0: return -1
-      if (pfd.revents and (POLLERR or POLLNVAL)) != 0: return -1
-      if (pfd.revents and POLLIN) == 0: return -1  # HUP without data
-    let n = posix.recv(fd, cast[pointer](cast[int](buf) + off),
-                       (len - off).cint, 0'i32).int
+      when defined(posix):
+        var pfd = TPollfd(fd: fd.cint, events: POLLIN)
+        let r = poll(addr pfd, 1, remain.cint)
+        if r <= 0: return -1
+        if (pfd.revents and (POLLERR or POLLNVAL)) != 0: return -1
+        if (pfd.revents and POLLIN) == 0: return -1  # HUP without data
+      else:
+        var pfd = TPollfdW(fd: fd, events: POLLIN_W)
+        let r = pollW(addr pfd, 1, remain.cint)
+        if r <= 0: return -1
+        if (pfd.revents and (POLLERR_W or POLLNVAL_W)) != 0: return -1
+        if (pfd.revents and POLLIN_W) == 0: return -1
+    when defined(posix):
+      let n = posix.recv(fd, cast[pointer](cast[int](buf) + off),
+                         (len - off).cint, 0'i32).int
+    else:
+      let n = wsaRecv(fd, cast[pointer](cast[int](buf) + off),
+                      (len - off).cint, 0).int
     if n <= 0: return -1
     off.inc n
   len
@@ -115,12 +180,19 @@ proc sendFd(fd: SocketHandle; data: string): bool =
   ## Write all of `data`, ignoring SIGPIPE.
   var off = 0
   while off < data.len:
-    let flags = when defined(linux): MSG_NOSIGNAL else: 0'i32
-    let n = posix.send(fd, addr data[off], (data.len - off).cint, flags)
-    if n <= 0:
-      if n < 0 and osLastError().cint == EINTR: continue
-      return false
-    off.inc n
+    when defined(posix):
+      let flags = when defined(linux): MSG_NOSIGNAL else: 0'i32
+      let n = posix.send(fd, addr data[off], (data.len - off).cint, flags)
+      if n <= 0:
+        if n < 0 and osLastError().cint == EINTR: continue
+        return false
+      off.inc n
+    else:
+      let n = wsaSend(fd, addr data[off], (data.len - off).cint, 0)
+      if n <= 0:
+        if n < 0 and interruptedW(): continue
+        return false
+      off.inc n
   true
 
 proc dialUp(host: string; port: uint16): SocketHandle =
@@ -135,29 +207,56 @@ proc dialUp(host: string; port: uint16): SocketHandle =
   let deadline = epochTime() + upstreamTimeout / 1000
   var it = aiList
   while it != nil:
-    let fd = posix.socket(it.ai_family, it.ai_socktype, it.ai_protocol)
+    when defined(posix):
+      let fd = posix.socket(it.ai_family, it.ai_socktype, it.ai_protocol)
+    else:
+      let fd = wsaSocket(it.ai_family, it.ai_socktype, it.ai_protocol)
     if fd != osInvalidSocket:
-      let nb = fcntl(fd, F_GETFL, 0)
-      if nb >= 0:
-        discard fcntl(fd, F_SETFL, nb or O_NONBLOCK)
-        if posix.connect(fd, it.ai_addr, it.ai_addrlen) < 0:
-          let err = osLastError().cint
-          if err == EINPROGRESS:
-            let remain = int((deadline - epochTime()) * 1000)
-            if remain > 0:
-              var pfd = TPollfd(fd: fd.cint, events: POLLOUT)
-              if poll(addr pfd, 1, remain.cint) > 0 and
-                 (pfd.revents and POLLOUT) != 0:
-                var soerr: cint
-                var slen = SockLen(sizeof(soerr))
-                if getsockopt(fd, SOL_SOCKET, SO_ERROR, addr soerr,
-                              addr slen) == 0 and soerr == 0:
-                  discard fcntl(fd, F_SETFL, nb)  # back to blocking
-                  return fd
-          elif err == EINTR:
-            discard fcntl(fd, F_SETFL, nb)
-            return fd
-      discard posix.close(fd)
+      when defined(posix):
+        let nb = fcntl(fd, F_GETFL, 0)
+        if nb >= 0:
+          discard fcntl(fd, F_SETFL, nb or O_NONBLOCK)
+          if posix.connect(fd, it.ai_addr, it.ai_addrlen) < 0:
+            let err = osLastError().cint
+            if err == EINPROGRESS:
+              let remain = int((deadline - epochTime()) * 1000)
+              if remain > 0:
+                var pfd = TPollfd(fd: fd.cint, events: POLLOUT)
+                if poll(addr pfd, 1, remain.cint) > 0 and
+                   (pfd.revents and POLLOUT) != 0:
+                  var soerr: cint
+                  var slen = SockLen(sizeof(soerr))
+                  if getsockopt(fd, SOL_SOCKET, SO_ERROR, addr soerr,
+                                addr slen) == 0 and soerr == 0:
+                    discard fcntl(fd, F_SETFL, nb)  # back to blocking
+                    return fd
+            elif err == EINTR:
+              discard fcntl(fd, F_SETFL, nb)
+              return fd
+        discard posix.close(fd)
+      else:
+        var nbMode: culong = 1
+        if wsaIoctl(fd, FIONBIO_W, addr nbMode) == 0:
+          if wsaConnect(fd, it.ai_addr, it.ai_addrlen.cint) < 0:
+            let err = osLastError().cint
+            if err == WSAEWOULDBLOCK:
+              let remain = int((deadline - epochTime()) * 1000)
+              if remain > 0:
+                var pfd = TPollfdW(fd: fd, events: POLLOUT_W)
+                if pollW(addr pfd, 1, remain.cint) > 0 and
+                   (pfd.revents and POLLOUT_W) != 0:
+                  var soerr: cint
+                  var slen = SockLen(sizeof(soerr))
+                  if getsockopt(fd, SOL_SOCKET, SO_ERROR, addr soerr,
+                                addr slen) == 0 and soerr == 0:
+                    nbMode = 0
+                    discard wsaIoctl(fd, FIONBIO_W, addr nbMode)
+                    return fd
+            elif err == WSAEINTR:
+              nbMode = 0
+              discard wsaIoctl(fd, FIONBIO_W, addr nbMode)
+              return fd
+        discard closesocket(fd)
     it = it.ai_next
   osInvalidSocket
 
@@ -171,44 +270,69 @@ proc splice(a, b: SocketHandle) =
   var bufB = newString(spliceBuf)
   var aDead = false   # a -> b direction closed
   var bDead = false   # b -> a direction closed
+  proc shutdownWr(fd: SocketHandle) =
+    when defined(posix):
+      discard posix.shutdown(fd, SHUT_WR)
+    else:
+      discard wsaShutdown(fd, 1)  # SD_SEND
   while not (aDead and bDead):
-    var fds: array[2, TPollfd]
     # A dead direction's fd is removed from the poll set (fd < 0
     # makes poll ignore the entry): events=0 does NOT suffice,
     # error conditions (POLLERR|POLLHUP) are reported
     # unconditionally and the loop would busy-spin on the corpse.
-    fds[0] = TPollfd(fd: if aDead: -1.cint else: a.cint,
-                     events: POLLIN)
-    fds[1] = TPollfd(fd: if bDead: -1.cint else: b.cint,
-                     events: POLLIN)
-    let r = poll(addr fds[0], 2, -1)
-    if r < 0:
-      if osLastError().cint == EINTR: continue
-      break
+    when defined(posix):
+      var fds: array[2, TPollfd]
+      fds[0] = TPollfd(fd: if aDead: -1.cint else: a.cint,
+                       events: POLLIN)
+      fds[1] = TPollfd(fd: if bDead: -1.cint else: b.cint,
+                       events: POLLIN)
+      let r = poll(addr fds[0], 2, -1)
+      if r < 0:
+        if osLastError().cint == EINTR: continue
+        break
+      template revAt(i: int): untyped = fds[i].revents
+    else:
+      var fds: array[2, TPollfdW]
+      fds[0] = TPollfdW(fd: if aDead: osInvalidSocket else: a,
+                        events: POLLIN_W)
+      fds[1] = TPollfdW(fd: if bDead: osInvalidSocket else: b,
+                        events: POLLIN_W)
+      let r = pollW(addr fds[0], 2, -1)
+      if r < 0:
+        if interruptedW(): continue
+        break
+      template revAt(i: int): untyped = int(fds[i].revents)
+    const evIn = when defined(posix): int(POLLIN or POLLHUP)
+                 else: int(POLLIN_W or POLLHUP_W)
+    const evErr = when defined(posix): int(POLLERR or POLLNVAL)
+                  else: int(POLLERR_W or POLLNVAL_W)
     for i in 0 .. 1:
-      let rev = fds[i].revents
+      let rev = revAt(i)
       if rev == 0: continue
       let (src, dst, buf) =
         if i == 0: (a, b, addr bufA[0])
         else: (b, a, addr bufB[0])
       let dead = if i == 0: addr aDead else: addr bDead
-      if (rev and (POLLERR or POLLNVAL)) != 0:
+      if (rev and evErr) != 0:
         if not dead[]:
-          discard posix.shutdown(dst, SHUT_WR)
+          shutdownWr(dst)
           dead[] = true
         continue
-      if (rev and (POLLIN or POLLHUP)) != 0:
-        let n = posix.recv(src, buf, spliceBuf.cint, 0'i32)
+      if (rev and evIn) != 0:
+        when defined(posix):
+          let n = posix.recv(src, buf, spliceBuf.cint, 0'i32)
+        else:
+          let n = wsaRecv(src, buf, spliceBuf.cint, 0)
         if n > 0:
           var s = newString(n.int)
           copyMem(addr s[0], buf, n.int)
           if not sendFd(dst, s):
             if not dead[]:
-              discard posix.shutdown(dst, SHUT_WR)
+              shutdownWr(dst)
               dead[] = true
         else:
           if not dead[]:
-            discard posix.shutdown(dst, SHUT_WR)
+            shutdownWr(dst)
             dead[] = true
 
 # ----------------------------------------------------------- protocols
@@ -265,21 +389,27 @@ proc serveConnect(sh: var ProxyShared; fd: SocketHandle; first: char) =
     discard sendFd(fd, "HTTP/1.1 502 Bad Gateway\c\L\c\L")
     return
   if not sendFd(fd, "HTTP/1.1 200 Connection Established\c\L\c\L"):
-    discard posix.close(up)
+    closeSock(up)
     return
   splice(fd, up)
-  discard posix.close(up)
+  closeSock(up)
 
 proc ip4String(a: array[4, char]): string =
   $uint8(a[0]) & "." & $uint8(a[1]) & "." & $uint8(a[2]) & "." & $uint8(a[3])
 
 proc ip6String(a: array[16, char]): string =
-  var in6: In6Addr
-  copyMem(addr in6, unsafeAddr a[0], 16)
-  result = newString(64)
-  let r = inet_ntop(AF_INET.cint, addr in6, result.cstring, 64)
-  if r == nil: raise newException(ValueError, "bad IPv6 address")
-  result.setLen(r.len)
+  when defined(posix):
+    var in6: In6Addr
+    copyMem(addr in6, unsafeAddr a[0], 16)
+    result = newString(64)
+    let r = inet_ntop(AF_INET.cint, addr in6, result.cstring, 64)
+    if r == nil: raise newException(ValueError, "bad IPv6 address")
+    result.setLen(r.len)
+  else:
+    var buf = newWideCString("", 64)
+    let r = inetNtopW(23, unsafeAddr a[0], buf, 64)  # AF_INET6
+    if r == nil: raise newException(ValueError, "bad IPv6 address")
+    result = $buf
 
 proc socksReply(fd: SocketHandle; code: char) =
   discard sendFd(fd, "\x05" & code & "\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -341,10 +471,10 @@ proc serveSocks5(sh: var ProxyShared; fd: SocketHandle; first: char) =
     socksReply(fd, '\x05')   # connection refused
     return
   if not sendFd(fd, "\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"):
-    discard posix.close(up)
+    closeSock(up)
     return
   splice(fd, up)
-  discard posix.close(up)
+  closeSock(up)
 
 proc serveClient(sh: var ProxyShared; fd: SocketHandle) =
   ## One client connection, already accepted. Peek the first byte to
@@ -360,28 +490,43 @@ proc serveClient(sh: var ProxyShared; fd: SocketHandle) =
   except CatchableError:
     discard
   finally:
-    discard posix.close(fd)
+    closeSock(fd)
 
 proc acceptThread(sh: ptr ProxyShared) {.thread.} =
   while sh.running:
-    var pfds = newSeq[TPollfd](sh.listeners.len)
-    for i, l in sh.listeners:
-      pfds[i] = TPollfd(fd: l.cint, events: POLLIN)
-    if poll(addr pfds[0], pfds.len.Tnfds, 200) <= 0:
-      continue   # timeout or error: re-check sh.running
     var listener = osInvalidSocket
-    for pfd in pfds:
-      if (pfd.revents and POLLIN) != 0:
-        listener = SocketHandle(pfd.fd)
-        break
+    when defined(posix):
+      var pfds = newSeq[TPollfd](sh.listeners.len)
+      for i, l in sh.listeners:
+        pfds[i] = TPollfd(fd: l.cint, events: POLLIN)
+      if poll(addr pfds[0], pfds.len.Tnfds, 200) <= 0:
+        continue   # timeout or error: re-check sh.running
+      for pfd in pfds:
+        if (pfd.revents and POLLIN) != 0:
+          listener = SocketHandle(pfd.fd)
+          break
+    else:
+      var pfds = newSeq[TPollfdW](sh.listeners.len)
+      for i, l in sh.listeners:
+        pfds[i] = TPollfdW(fd: l, events: POLLIN_W)
+      if pollW(addr pfds[0], pfds.len, 200) <= 0:
+        continue
+      for pfd in pfds:
+        if (pfd.revents and POLLIN_W) != 0:
+          listener = pfd.fd
+          break
     if listener == osInvalidSocket: continue
     # Ready without O_NONBLOCK: accept must not return EAGAIN because
     # the forked bridge (or the fenced consumer) drained the pending
     # connection first. That is fine - one of the proxy processes got
     # it.
-    let fd = posix.accept(listener, nil, nil)
+    let fd = when defined(posix): posix.accept(listener, nil, nil)
+             else: wsaAccept(listener, nil, nil)
     if fd == osInvalidSocket:
-      if osLastError().cint == EINTR: continue
+      when defined(posix):
+        if osLastError().cint == EINTR: continue
+      else:
+        if interruptedW(): continue
       if not sh.running: break
       sleep(10)
       continue
@@ -396,26 +541,27 @@ proc acceptThread(sh: ptr ProxyShared) {.thread.} =
 
 # ------------------------------------------------------------- public
 
-proc listenUnix(path: string): SocketHandle =
-  ## Bind and listen on the AF_UNIX socket at `path`, replacing a stale
-  ## file. Filesystem permissions on the socket are the access control:
-  ## a unix listener exists only as the fenced side's bridge target.
-  result = posix.socket(AF_UNIX, SOCK_STREAM, 0)
-  if result == osInvalidSocket: raiseOSError(osLastError())
-  var sa: Sockaddr_un
-  sa.sun_family = TSa_Family(AF_UNIX)
-  if path.len >= sa.sun_path.len:
-    raise newException(ValueError, "sandwall proxy: unix socket path too long: " & path)
-  copyMem(addr sa.sun_path[0], cstring(path), path.len + 1)
-  removeFile(path)
-  if bindSocket(result, cast[ptr SockAddr](addr sa), SockLen(sizeof(sa))) != 0:
-    raiseOSError(osLastError())
-  if nativesockets.listen(result) != 0:
-    raiseOSError(osLastError())
-  # World-writable: a fenced child may run as another uid (Windows fence
-  # story aside, uid mapping makes this moot on Linux) and the socket is
-  # the sanctioned egress; the policy, not the file mode, is the ACL.
-  discard chmod(path, 0o777)
+when defined(posix):
+  proc listenUnix(path: string): SocketHandle =
+    ## Bind and listen on the AF_UNIX socket at `path`, replacing a stale
+    ## file. Filesystem permissions on the socket are the access control:
+    ## a unix listener exists only as the fenced side's bridge target.
+    result = posix.socket(AF_UNIX, SOCK_STREAM, 0)
+    if result == osInvalidSocket: raiseOSError(osLastError())
+    var sa: Sockaddr_un
+    sa.sun_family = TSa_Family(AF_UNIX)
+    if path.len >= sa.sun_path.len:
+      raise newException(ValueError, "sandwall proxy: unix socket path too long: " & path)
+    copyMem(addr sa.sun_path[0], cstring(path), path.len + 1)
+    removeFile(path)
+    if bindSocket(result, cast[ptr SockAddr](addr sa), SockLen(sizeof(sa))) != 0:
+      raiseOSError(osLastError())
+    if nativesockets.listen(result) != 0:
+      raiseOSError(osLastError())
+    # World-writable: a fenced child may run as another uid (Windows fence
+    # story aside, uid mapping makes this moot on Linux) and the socket is
+    # the sanctioned egress; the policy, not the file mode, is the ACL.
+    discard chmod(path, 0o777)
 
 proc startProxyListeners(policyPath, projectDir: string; port: uint16;
                          unixSockPath: string; verbose: bool): WallProxy =
@@ -432,8 +578,9 @@ proc startProxyListeners(policyPath, projectDir: string; port: uint16;
                                  verbose: verbose,
                                  running: true))
   p.sh.listeners.add(sock.getFd())
-  if unixSockPath.len > 0:
-    p.sh.listeners.add(listenUnix(unixSockPath))
+  when defined(posix):
+    if unixSockPath.len > 0:
+      p.sh.listeners.add(listenUnix(unixSockPath))
   initLock(p.sh.lock)
   p.sh.loadList()
   createThread(p.acceptThread, acceptThread, addr p.sh)
@@ -462,60 +609,62 @@ proc startWallProxy*(policyPath: string; projectDir: string;
   ## address checks are skipped (filesystem perms are the ACL).
   startProxyListeners(policyPath, projectDir, port, unixSockPath, verbose)
 
-proc proxyChild(dir, policyPath, projectDir: string; sockFd: SocketHandle;
-                deathFd, portFd: cint; verbose: bool) =
-  ## The forked proxy's whole lifetime: serve until the death pipe
-  ## says the sandboxed command tree is gone, then clean up the run
-  ## dir and exit. The dir exists only while this process lives, so a
-  ## crashed parent never leaves a listening proxy behind; the dir is
-  ## recreated below when the parent vanished before the child started
-  ## (the kernel keeps the bound sockets either way, this is for the
-  ## unix listener path and cleanup symmetry).
-  createDir(dir)
-  let ctx = cast[ptr ProxyCtx](allocShared0(sizeof(ProxyCtx)))
-  ctx[] = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
-                                   projectDir: projectDir,
-                                   verbose: verbose,
-                                   running: true))
-  ctx.sh.listeners.add(sockFd)
-  when defined(linux):
-    ctx.sh.listeners.add(listenUnix(dir / "proxy.sock"))
-  initLock(ctx.sh.lock)
-  ctx.sh.loadList()
-  var sa: Sockaddr_in
-  var slen = SockLen(sizeof(sa))
-  if getsockname(sockFd, cast[ptr SockAddr](addr sa), addr slen) != 0:
-    raiseOSError(osLastError())
-  let port = uint16(nativesockets.ntohs(sa.sin_port))
-  # Port back to the parent over a pipe: plain write(), not sendFd
-  # (posix.send is for sockets and fails ENOTSOCK on pipes).
-  var ps = $port
-  discard posix.write(portFd, addr ps[0], ps.len)
-  discard posix.close(portFd)
-  while true:
-    var fds = @[TPollfd(fd: deathFd, events: POLLIN, revents: 0)]
-    for l in ctx.sh.listeners:
-      fds.add TPollfd(fd: l.cint, events: POLLIN, revents: 0)
-    let r = poll(addr fds[0], fds.len.Tnfds, -1)
-    if r < 0:
-      if osLastError().cint == EINTR: continue
-      break
-    if fds[0].revents != 0: break   # command tree is gone
-    for i in 1 ..< fds.len:
-      if (fds[i].revents and POLLIN) == 0: continue
-      let fd = posix.accept(SocketHandle(fds[i].fd), nil, nil)
-      if fd == osInvalidSocket:
+when defined(posix):
+  proc proxyChild(dir, policyPath, projectDir: string; sockFd: SocketHandle;
+                  deathFd, portFd: cint; verbose: bool) =
+    ## The forked proxy's whole lifetime: serve until the death pipe
+    ## says the sandboxed command tree is gone, then clean up the run
+    ## dir and exit. The dir exists only while this process lives, so a
+    ## crashed parent never leaves a listening proxy behind; the dir is
+    ## recreated below when the parent vanished before the child started
+    ## (the kernel keeps the bound sockets either way, this is for the
+    ## unix listener path and cleanup symmetry).
+    createDir(dir)
+    let ctx = cast[ptr ProxyCtx](allocShared0(sizeof(ProxyCtx)))
+    ctx[] = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
+                                     projectDir: projectDir,
+                                     verbose: verbose,
+                                     running: true))
+    ctx.sh.listeners.add(sockFd)
+    when defined(linux):
+      ctx.sh.listeners.add(listenUnix(dir / "proxy.sock"))
+    initLock(ctx.sh.lock)
+    ctx.sh.loadList()
+    var sa: Sockaddr_in
+    var slen = SockLen(sizeof(sa))
+    if getsockname(sockFd, cast[ptr SockAddr](addr sa), addr slen) != 0:
+      raiseOSError(osLastError())
+    let port = uint16(nativesockets.ntohs(sa.sin_port))
+    # Port back to the parent over a pipe: plain write(), not sendFd
+    # (posix.send is for sockets and fails ENOTSOCK on pipes).
+    var ps = $port
+    discard posix.write(portFd, addr ps[0], ps.len)
+    discard posix.close(portFd)
+    while true:
+      var fds = @[TPollfd(fd: deathFd, events: POLLIN, revents: 0)]
+      for l in ctx.sh.listeners:
+        fds.add TPollfd(fd: l.cint, events: POLLIN, revents: 0)
+      let r = poll(addr fds[0], fds.len.Tnfds, -1)
+      if r < 0:
         if osLastError().cint == EINTR: continue
-        sleep(10)
-        continue
-      ctx.sh.maybeReload()
-      ctx.sh.serveClient(fd)
-      break
-  for l in ctx.sh.listeners:
-    discard posix.close(l)
-  deinitLock(ctx.sh.lock)
-  deallocShared(ctx)
-  removeDir(dir)
+        break
+      if fds[0].revents != 0: break   # command tree is gone
+      for i in 1 ..< fds.len:
+        if (fds[i].revents and POLLIN) == 0: continue
+        let fd = posix.accept(SocketHandle(fds[i].fd), nil, nil)
+        if fd == osInvalidSocket:
+          if osLastError().cint == EINTR: continue
+          sleep(10)
+          continue
+        ctx.sh.maybeReload()
+        ctx.sh.serveClient(fd)
+        break
+    for l in ctx.sh.listeners:
+      discard posix.close(l)
+    deinitLock(ctx.sh.lock)
+    deallocShared(ctx)
+    removeDir(dir)
+
 
 type
   SpawnedProxy* = object
@@ -526,60 +675,62 @@ type
     port*: uint16          ## loopback TCP port the proxy bound
     runDir*: string        ## holds proxy.sock (linux) and any policy copy
     sockPath*: string      ## AF_UNIX listener, linux only ("" elsewhere)
-    pid*: Pid
+    pid*: int32   ## Posix Pid; unused on Windows
 
-proc spawnWallProxy*(policyPath, projectDir: string;
-                     runDir = ""; verbose = false): SpawnedProxy =
-  ## Fork the wall proxy as a child process and return where it
-  ## listens. Call BEFORE restrict()/exec: after exec the in-process
-  ## proxy threads would be gone, and after restrict the child would
-  ## inherit the fence and be useless. `policyPath` is watched for
-  ## mtime changes, so editing the rules file between (or during) runs
-  ## is picked up on the next connection.
-  ##
-  ## The run dir (/tmp/sandwall-PID) is removed by the child on exit.
-  ## The child exits as soon as the last holder of the death pipe is
-  ## gone, which is when the restricting process and every descendant
-  ## of the command it exec'd have died.
-  let runDir = if runDir.len > 0: runDir
-               else: getTempDir() / ("sandwall-" & $getCurrentProcessId())
-  createDir(runDir)
-  let sock = newSocket(buffered = false)
-  sock.setSockOpt(OptReuseAddr, true)
-  sock.bindAddr(Port(0), "127.0.0.1")
-  sock.listen()
-  var deathPipe, portPipe: array[2, cint]
-  if posix.pipe(deathPipe) != 0 or posix.pipe(portPipe) != 0:
-    raiseOSError(osLastError())
-  let pid = posix.fork()
-  if pid == 0:
-    discard posix.close(deathPipe[1])
+when defined(posix):
+  proc spawnWallProxy*(policyPath, projectDir: string;
+                       runDir = ""; verbose = false): SpawnedProxy =
+    ## Fork the wall proxy as a child process and return where it
+    ## listens. Call BEFORE restrict()/exec: after exec the in-process
+    ## proxy threads would be gone, and after restrict the child would
+    ## inherit the fence and be useless. `policyPath` is watched for
+    ## mtime changes, so editing the rules file between (or during) runs
+    ## is picked up on the next connection.
+    ##
+    ## The run dir (/tmp/sandwall-PID) is removed by the child on exit.
+    ## The child exits as soon as the last holder of the death pipe is
+    ## gone, which is when the restricting process and every descendant
+    ## of the command it exec'd have died.
+    let runDir = if runDir.len > 0: runDir
+                 else: getTempDir() / ("sandwall-" & $getCurrentProcessId())
+    createDir(runDir)
+    let sock = newSocket(buffered = false)
+    sock.setSockOpt(OptReuseAddr, true)
+    sock.bindAddr(Port(0), "127.0.0.1")
+    sock.listen()
+    var deathPipe, portPipe: array[2, cint]
+    if posix.pipe(deathPipe) != 0 or posix.pipe(portPipe) != 0:
+      raiseOSError(osLastError())
+    let pid = posix.fork()
+    if pid == 0:
+      discard posix.close(deathPipe[1])
+      discard posix.close(portPipe[0])
+      try:
+        proxyChild(runDir, policyPath, projectDir, sock.getFd(),
+                   deathPipe[0], portPipe[1], verbose)
+      except CatchableError:
+        discard
+      exitnow(0)
+    if pid < 0:
+      raiseOSError(osLastError())
+    discard posix.close(deathPipe[0])
+    discard posix.close(portPipe[1])
+    var buf = newString(8)
+    let n = posix.read(portPipe[0], addr buf[0], 8)
     discard posix.close(portPipe[0])
-    try:
-      proxyChild(runDir, policyPath, projectDir, sock.getFd(),
-                 deathPipe[0], portPipe[1], verbose)
-    except CatchableError:
-      discard
-    exitnow(0)
-  if pid < 0:
-    raiseOSError(osLastError())
-  discard posix.close(deathPipe[0])
-  discard posix.close(portPipe[1])
-  var buf = newString(8)
-  let n = posix.read(portPipe[0], addr buf[0], 8)
-  discard posix.close(portPipe[0])
-  if n <= 0:
-    raise newException(IOError, "sandwall: wall proxy failed to start")
-  buf.setLen(n)
-  result.port = uint16(parseInt(buf))
-  result.runDir = runDir
-  when defined(linux):
-    result.sockPath = runDir / "proxy.sock"
-  result.pid = pid
-  # The death pipe write end is intentionally left open and leaked:
-  # the exec'd command and its descendants hold it, and its close is
-  # what tells the proxy child to exit. Same trick as the netns
-  # bridge (wall/netns.nim).
+    if n <= 0:
+      raise newException(IOError, "sandwall: wall proxy failed to start")
+    buf.setLen(n)
+    result.port = uint16(parseInt(buf))
+    result.runDir = runDir
+    when defined(linux):
+      result.sockPath = runDir / "proxy.sock"
+    result.pid = pid
+    # The death pipe write end is intentionally left open and leaked:
+    # the exec'd command and its descendants hold it, and its close is
+    # what tells the proxy child to exit. Same trick as the netns
+    # bridge (wall/netns.nim).
+
 
 proc stopWallProxy*(p: var WallProxy) =
   ## Close the listener, join the accept thread. Client threads are
@@ -588,7 +739,10 @@ proc stopWallProxy*(p: var WallProxy) =
   let ctx = cast[ptr ProxyCtx](p.acceptCtx)
   ctx.sh.running = false
   joinThread(ctx.acceptThread)
-  p.sock.close()
+  when defined(posix):
+    p.sock.close()
+  else:
+    closeSock(p.sock.getFd())
   p.sock = nil
   deinitLock(ctx.sh.lock)
   deallocShared(ctx)
