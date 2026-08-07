@@ -11,6 +11,18 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
   `deny`, `*` -> `read`. Arbitrary whitespace allowed between the word
   and the target. Old-format policy files must be rewritten; the parser
   silently drops old-style lines.
+- Windows: the restricted-token + CPAU backend (which could not spawn a
+  confined child on Windows 11) is replaced by an **AppContainer**
+  backend. The child runs under a lowbox token that denies filesystem and
+  network by default; writable paths get an ALLOW ACE + Low integrity
+  label for the AppContainer SID, read-only paths a read+execute grant,
+  and the stamps roll back after the child exits. Filesystem isolation is
+  verified on Windows 11. The WFP network fence (host rules) is not yet
+  wired to the AppContainer path; the CLI rejects host rules on Windows
+  for now. Inside a sandboxed `cmd`, run user executables by bare name or
+  relative path (not a drive-letter absolute path, which cmd under an
+  AppContainer refuses). Windows CLI tests now run natively (portable
+  `type`/`cmd` probes, pwsh-safe CI step).
 
 ## [0.2.0] - 2026-07-28
 

@@ -1,5 +1,18 @@
 # Plan: macOS and Windows backends for nimbox
 
+> **Status (2026-08): SUPERSEDED for Windows.** This document is the original
+> design plan. The macOS backend shipped as written (Seatbelt). The Windows
+> backend did NOT ship as the restricted-token + DENY-ACE design in "Phase 3"
+> below - that approach proved unworkable on Windows 11 (`CreateProcessAsUser`
+> with a hand-built restricted token fails with access denied; CPAU is broken).
+> The shipped Windows backend is an **AppContainer**: the child runs under a
+> lowbox token that denies filesystem and network by default, with ALLOW ACEs
+> plus a Low integrity label stamped for the AppContainer SID on writable
+> paths and read+execute grants on read-only paths (see `src/sandwall/acl.nim`
+> and `process.nim`, and the README "Windows notes"). Filesystem isolation is
+> verified live; the WFP network fence is not yet wired to the AppContainer
+> path. The Phase-3 text below is kept for history.
+
 Goal: make `restrict(writable, read)` and the `nimbox restrict ... -- CMD` CLI
 work on macOS and Windows, behind the same Nim API the Linux backend already
 exposes. The Nim user sees one API; compile-time `when` selects the backend;

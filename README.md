@@ -32,15 +32,28 @@ skip the policy layer.
 |----------|-----------|-------------|
 | Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy |
 | macOS | Seatbelt `sandbox_init_with_parameters` | Seatbelt loopback-only + allowlist proxy |
-| Windows | restricted token + ACLs | WFP filters on the sandwall user (`sandwall setup`) |
+| Windows | AppContainer (lowbox token) + DACL grants | WFP filters on the sandwall user (`sandwall setup`) |
 
 The Linux and macOS backends confine the calling thread via kernel hooks
 (Landlock domains, Seatbelt profiles). The Windows backend has no single
-syscall hook; it builds a restricted token carrying a fresh SID, stamps DENY
-ACEs on volume roots and ALLOW ACEs on the writable paths, then spawns the
-child with that token. ACLs roll back after the child exits. See
-`CROSSPLATFORM.md` for the design and `sandbox-research.md` for the
-prior-art survey.
+syscall hook; it runs the child in an **AppContainer** (a lowbox token that
+denies filesystem and network by default), stamping ALLOW ACEs and a Low
+integrity label for the AppContainer SID on each writable path and a
+read+execute grant on each read-only path. The stamps roll back after the
+child exits. See `CROSSPLATFORM.md` for the design and
+`sandbox-research.md` for the prior-art survey.
+
+Windows notes:
+- The network fence (host rules) is not yet wired to the AppContainer
+  backend; the CLI rejects host rules on Windows for now. The filesystem
+  sandbox is fully enforced.
+- A `cmd` inside the sandbox can run further executables by **bare name or
+  relative path** (`myexe`, `.\myexe`, `sub\myexe`) resolved against the
+  current directory, but **not** by drive-letter absolute path:
+  `cmd /c C:\path\some.exe` fails "Access is denied" (a cmd/AppContainer
+  quirk that affects even System32 exes). Run user-built executables
+  directly (`sandwall rules -- myexe`) or `cd` into their directory and
+  invoke them by name.
 
 ## Requirements
 
