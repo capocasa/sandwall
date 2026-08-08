@@ -177,9 +177,14 @@ when defined(linux):
     let attr = RulesetAttr(handledAccessFs: mask,
                            handledAccessNet: 0,
                            scoped: 0)
+    let attrSize = attrSizeForAbi(abi)
+    stderr.writeLine "LANDLOCK DEBUG abi=", abi, " mask=", mask,
+      " attrSize=", attrSize, " sizeof=", sizeof(attr)
     let fd = syscall(clong sysLandlockCreateRuleset,
-                     unsafeAddr attr, attrSizeForAbi(abi), 0.cuint)
-    if fd < 0: checkErrno("create_ruleset")
+                     unsafeAddr attr, attrSize, 0.cuint)
+    if fd < 0:
+      stderr.writeLine "LANDLOCK DEBUG create_ruleset errno=", int(osLastError())
+      checkErrno("create_ruleset")
     result.fd = cint fd
     result.abi = abi
 
