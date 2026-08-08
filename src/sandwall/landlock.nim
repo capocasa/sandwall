@@ -174,17 +174,13 @@ when defined(linux):
         "landlock: kernel does not support landlock (create_ruleset " &
         "version probe failed)")
     let mask = maskForAbi(abi)
-    # DEBUG: full mask with explicit size=16
-    block:
-      let ta = RulesetAttr(handledAccessFs: mask, handledAccessNet: 0, scoped: 0)
+    # DEBUG: binary search the failing bit
+    for testMask in [0x1FFF'u64, 0x3FFF'u64, 0x7FFF'u64, 0xFFFF'u64]:
+      let ta = RulesetAttr(handledAccessFs: testMask, handledAccessNet: 0, scoped: 0)
       let tf = syscall(clong sysLandlockCreateRuleset,
                        unsafeAddr ta, 16.culong, 0.cuint)
-      stderr.writeLine "LANDLOCK DEBUG fullmask size16 fd=", tf,
+      stderr.writeLine "LANDLOCK DEBUG mask=", testMask, " fd=", tf,
         " errno=", (if tf < 0: int(osLastError()) else: 0)
-      # also raw bytes: is handledAccessNet really 0 at offset 8?
-      let p = cast[ptr UncheckedArray[uint8]](unsafeAddr ta)
-      stderr.writeLine "LANDLOCK DEBUG bytes8-15=", p[8], ",", p[9], ",", p[10], ",", p[11],
-        ",", p[12], ",", p[13], ",", p[14], ",", p[15]
     let attr = RulesetAttr(handledAccessFs: mask,
                            handledAccessNet: 0,
                            scoped: 0)
