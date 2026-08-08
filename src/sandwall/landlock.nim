@@ -157,6 +157,7 @@ when defined(linux):
     Ruleset = object
       fd: cint
       abi: int
+      mask: uint64  # the probed, kernel-accepted access mask
 
   proc attrSizeForAbi(abi: int): culong =
     # The kernel validates attr_size against its own compiled struct, so
@@ -167,38 +168,41 @@ when defined(linux):
     if abi >= 2: result = 16.culong
     if abi >= 5: result = 24.culong
 
+  proc probeMask(abi: int): uint64 =
+    # Some kernels report an ABI version but don't actually accept every
+    # access right that version implies (e.g. backported ABI bumps missing
+    # IOCTL_DEV). create_ruleset with the full mask returns EINVAL on those.
+    # Probe the real supported mask: try the ABI-derived mask, and if the
+    # kernel rejects it, drop the highest unknown bit and retry.
+    result = maskForAbi(abi)
+    let attrSize = attrSizeForAbi(abi)
+    while result != 0:
+      let attr = RulesetAttr(handledAccessFs: result,
+                             handledAccessNet: 0, scoped: 0)
+      let fd = syscall(clong sysLandlockCreateRuleset,
+                       unsafeAddr attr, attrSize, 0.cuint)
+      if fd >= 0:
+        closeFd(cint fd)
+        return
+      if osLastError() != OSErrorCode(22): return result
+      result = result and (result - 1)  # clear the highest set bit
+
   proc createRuleset(): Ruleset =
     let abi = queryAbi()
     if abi < 0:
       raise newException(OSError,
         "landlock: kernel does not support landlock (create_ruleset " &
         "version probe failed)")
-    let mask = maskForAbi(abi)
-    # DEBUG: binary search the failing bit
-    for testMask in [0x1FFF'u64, 0x3FFF'u64, 0x7FFF'u64, 0xFFFF'u64]:
-      let ta = RulesetAttr(handledAccessFs: testMask, handledAccessNet: 0, scoped: 0)
-      let tf = syscall(clong sysLandlockCreateRuleset,
-                       unsafeAddr ta, 16.culong, 0.cuint)
-      stderr.writeLine "LANDLOCK DEBUG mask=", testMask, " fd=", tf,
-        " errno=", (if tf < 0: int(osLastError()) else: 0)
+    let mask = probeMask(abi)
     let attr = RulesetAttr(handledAccessFs: mask,
                            handledAccessNet: 0,
                            scoped: 0)
-    let attrSize = attrSizeForAbi(abi)
-    stderr.writeLine "LANDLOCK DEBUG abi=", abi, " mask=", mask,
-      " attrSize=", attrSize, " sizeof=", sizeof(attr)
-    # Try full struct size first; fall back to ABI-sized on EINVAL.
-    var fd = syscall(clong sysLandlockCreateRuleset,
-                     unsafeAddr attr, culong(sizeof(attr)), 0.cuint)
-    if fd < 0 and osLastError() == OSErrorCode(22):
-      stderr.writeLine "LANDLOCK DEBUG retry with attrSize=", attrSize
-      fd = syscall(clong sysLandlockCreateRuleset,
-                   unsafeAddr attr, attrSize, 0.cuint)
-    if fd < 0:
-      stderr.writeLine "LANDLOCK DEBUG create_ruleset errno=", int(osLastError())
-      checkErrno("create_ruleset")
+    let fd = syscall(clong sysLandlockCreateRuleset,
+                     unsafeAddr attr, attrSizeForAbi(abi), 0.cuint)
+    if fd < 0: checkErrno("create_ruleset")
     result.fd = cint fd
     result.abi = abi
+    result.mask = mask
 
   proc addRule(rs: var Ruleset; path: string; allowed: AccessFds) =
     if rs.fd < 0:
@@ -248,9 +252,8 @@ when defined(linux):
     ## is denied.
     var rs = createRuleset()
     try:
-      let mask = maskForAbi(rs.abi)
-      let w = writeRights(mask)
-      let r = readRights(mask)
+      let w = writeRights(rs.mask)
+      let r = readRights(rs.mask)
       # Track paths added with write rights so we don't add a redundant
       # read-only rule for the same path (write already includes read). A
       # read-only path added first is still upgraded by a later write rule,
