@@ -180,8 +180,13 @@ when defined(linux):
     let attrSize = attrSizeForAbi(abi)
     stderr.writeLine "LANDLOCK DEBUG abi=", abi, " mask=", mask,
       " attrSize=", attrSize, " sizeof=", sizeof(attr)
-    let fd = syscall(clong sysLandlockCreateRuleset,
-                     unsafeAddr attr, attrSize, 0.cuint)
+    # Try full struct size first; fall back to ABI-sized on EINVAL.
+    var fd = syscall(clong sysLandlockCreateRuleset,
+                     unsafeAddr attr, culong(sizeof(attr)), 0.cuint)
+    if fd < 0 and osLastError() == OSErrorCode(22):
+      stderr.writeLine "LANDLOCK DEBUG retry with attrSize=", attrSize
+      fd = syscall(clong sysLandlockCreateRuleset,
+                   unsafeAddr attr, attrSize, 0.cuint)
     if fd < 0:
       stderr.writeLine "LANDLOCK DEBUG create_ruleset errno=", int(osLastError())
       checkErrno("create_ruleset")
