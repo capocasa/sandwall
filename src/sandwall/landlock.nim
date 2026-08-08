@@ -174,6 +174,13 @@ when defined(linux):
         "landlock: kernel does not support landlock (create_ruleset " &
         "version probe failed)")
     let mask = maskForAbi(abi)
+    # DEBUG: try minimal mask first
+    let testAttr = RulesetAttr(handledAccessFs: 1'u64,
+                              handledAccessNet: 0,
+                              scoped: 0)
+    let testFd = syscall(clong sysLandlockCreateRuleset,
+                         unsafeAddr testAttr, culong(sizeof(testAttr)), 0.cuint)
+    stderr.writeLine "LANDLOCK DEBUG minimal-mask testFd=", testFd, " errno=", (if testFd < 0: int(osLastError()) else: 0)
     let attr = RulesetAttr(handledAccessFs: mask,
                            handledAccessNet: 0,
                            scoped: 0)
