@@ -178,9 +178,10 @@ when defined(linux):
     # Some kernels report an ABI version but don't actually accept every
     # access right that version implies (e.g. backported ABI bumps missing
     # IOCTL_DEV). create_ruleset with the full mask returns EINVAL on those.
-    # Probe by trying the ABI-derived mask; on EINVAL, drop the highest bit
-    # and retry. The last successful create_ruleset fd is reused as the
-    # ruleset (avoids opening and closing a throwaway fd).
+    # The Landlock access rights are contiguous bit 0..N, so the unsupported
+    # right is always the highest bit. On EINVAL, shift the mask down one bit
+    # (drop the top) and retry. The first successful fd is reused as the
+    # ruleset, avoiding a throwaway create+close.
     var mask = maskForAbi(abi)
     var fd: clong = -1
     while mask != 0:
@@ -190,7 +191,7 @@ when defined(linux):
                    unsafeAddr attr, attrSize, 0.cuint)
       if fd >= 0: break
       if osLastError() != OSErrorCode(22): checkErrno("create_ruleset")
-      mask = mask and (mask - 1)  # clear the highest set bit
+      mask = mask shr 1
     if fd < 0: checkErrno("create_ruleset")
     result.fd = cint fd
     result.abi = abi
