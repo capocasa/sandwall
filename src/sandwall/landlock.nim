@@ -168,37 +168,29 @@ when defined(linux):
     if abi >= 2: result = 16.culong
     if abi >= 5: result = 24.culong
 
-  proc probeMask(abi: int): uint64 =
-    # Some kernels report an ABI version but don't actually accept every
-    # access right that version implies (e.g. backported ABI bumps missing
-    # IOCTL_DEV). create_ruleset with the full mask returns EINVAL on those.
-    # Probe the real supported mask: try the ABI-derived mask, and if the
-    # kernel rejects it, drop the highest unknown bit and retry.
-    result = maskForAbi(abi)
-    let attrSize = attrSizeForAbi(abi)
-    while result != 0:
-      let attr = RulesetAttr(handledAccessFs: result,
-                             handledAccessNet: 0, scoped: 0)
-      let fd = syscall(clong sysLandlockCreateRuleset,
-                       unsafeAddr attr, attrSize, 0.cuint)
-      if fd >= 0:
-        closeFd(cint fd)
-        return
-      if osLastError() != OSErrorCode(22): return result
-      result = result and (result - 1)  # clear the highest set bit
-
   proc createRuleset(): Ruleset =
     let abi = queryAbi()
     if abi < 0:
       raise newException(OSError,
         "landlock: kernel does not support landlock (create_ruleset " &
         "version probe failed)")
-    let mask = probeMask(abi)
-    let attr = RulesetAttr(handledAccessFs: mask,
-                           handledAccessNet: 0,
-                           scoped: 0)
-    let fd = syscall(clong sysLandlockCreateRuleset,
-                     unsafeAddr attr, attrSizeForAbi(abi), 0.cuint)
+    let attrSize = attrSizeForAbi(abi)
+    # Some kernels report an ABI version but don't actually accept every
+    # access right that version implies (e.g. backported ABI bumps missing
+    # IOCTL_DEV). create_ruleset with the full mask returns EINVAL on those.
+    # Probe by trying the ABI-derived mask; on EINVAL, drop the highest bit
+    # and retry. The last successful create_ruleset fd is reused as the
+    # ruleset (avoids opening and closing a throwaway fd).
+    var mask = maskForAbi(abi)
+    var fd: clong = -1
+    while mask != 0:
+      let attr = RulesetAttr(handledAccessFs: mask,
+                             handledAccessNet: 0, scoped: 0)
+      fd = syscall(clong sysLandlockCreateRuleset,
+                   unsafeAddr attr, attrSize, 0.cuint)
+      if fd >= 0: break
+      if osLastError() != OSErrorCode(22): checkErrno("create_ruleset")
+      mask = mask and (mask - 1)  # clear the highest set bit
     if fd < 0: checkErrno("create_ruleset")
     result.fd = cint fd
     result.abi = abi
