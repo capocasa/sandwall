@@ -301,10 +301,10 @@ proc splice(a, b: SocketHandle) =
         if interruptedW(): continue
         break
       template revAt(i: int): untyped = int(fds[i].revents)
-    const evIn = when defined(posix): int(POLLIN or POLLHUP)
-                 else: int(POLLIN_W or POLLHUP_W)
-    const evErr = when defined(posix): int(POLLERR or POLLNVAL)
-                  else: int(POLLERR_W or POLLNVAL_W)
+    let evIn = when defined(posix): int(POLLIN or POLLHUP)
+               else: int(POLLIN_W or POLLHUP_W)
+    let evErr = when defined(posix): int(POLLERR or POLLNVAL)
+                else: int(POLLERR_W or POLLNVAL_W)
     for i in 0 .. 1:
       let rev = revAt(i)
       if rev == 0: continue

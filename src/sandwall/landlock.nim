@@ -158,6 +158,15 @@ when defined(linux):
       fd: cint
       abi: int
 
+  proc attrSizeForAbi(abi: int): culong =
+    # The kernel validates attr_size against its own compiled struct, so
+    # passing more bytes than the running ABI knows returns EINVAL. ABI v1
+    # has only handledAccessFs (8 bytes), v2 adds handledAccessNet (16),
+    # v5 adds scoped (24).
+    result = 8.culong
+    if abi >= 2: result = 16.culong
+    if abi >= 5: result = 24.culong
+
   proc createRuleset(): Ruleset =
     let abi = queryAbi()
     if abi < 0:
@@ -169,7 +178,7 @@ when defined(linux):
                            handledAccessNet: 0,
                            scoped: 0)
     let fd = syscall(clong sysLandlockCreateRuleset,
-                     unsafeAddr attr, sizeof(attr).culong, 0.cuint)
+                     unsafeAddr attr, attrSizeForAbi(abi), 0.cuint)
     if fd < 0: checkErrno("create_ruleset")
     result.fd = cint fd
     result.abi = abi
