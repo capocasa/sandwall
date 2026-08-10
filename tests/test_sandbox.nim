@@ -90,6 +90,41 @@ suite "sandwall CLI (sandboxed exec)":
       check: rc != 0
       check: not fileExists(target)
 
+    test "home stays confined; /etc is baseline-readable":
+      # Real system dirs, sandboxrc-style. $HOME is not in the policy,
+      # so the read must fail; a profile that under-enforces (e.g. a
+      # Seatbelt deny that doesn't stick, or a Landlock rule that
+      # silently widens) passes every tempdir test but fails here.
+      # /etc is a baseline-read path by design (resolver config, certs),
+      # so the read succeeds; an explicit deny must override the
+      # baseline.
+      let a = tempDir("sysread-a")
+      let marker = getHomeDir() / ".sandwall_test_marker_" & $getCurrentProcessId()
+      writeFile(marker, "secret")
+      try:
+        let rules = rulesFile("sysread", "allow " & a & "\n")
+        let rcHome = execCmd(sw(rules, catCmd(marker)))
+        check: rcHome != 0
+        when defined(linux):
+          # Baseline readability + the deny-carve-out are Landlock
+          # specifics (Seatbelt punches denies with trailing rules;
+          # Windows ACLs subtract natively).
+          let rcEtc = execCmd(sw(rules, catCmd("/etc/hosts")))
+          check: rcEtc == 0
+          let denyEtc = rulesFile("sysread-denyetc",
+            "allow " & a & "\ndeny /etc\n")
+          check: execCmd(sw(denyEtc, catCmd("/etc/hosts"))) != 0
+          let denyHosts = rulesFile("sysread-denyhosts",
+            "allow " & a & "\ndeny /etc/hosts\n")
+          check: execCmd(sw(denyHosts, catCmd("/etc/hosts"))) != 0
+          check: execCmd(sw(denyHosts, catCmd("/etc/hostname"))) == 0
+          let denySsh = rulesFile("sysread-denyssh",
+            "allow " & a & "\ndeny /etc/ssh\n")
+          check: execCmd(sw(denySsh, catCmd("/etc/ssh/ssh_config"))) != 0
+          check: execCmd(sw(denySsh, catCmd("/etc/hostname"))) == 0
+      finally:
+        removeFile(marker)
+
   test "readonly path is readable but not writable":
     let rw = tempDir("ro-rw")
     let ro = tempDir("ro-ro")

@@ -264,6 +264,44 @@ nimble test
 CLI tests shell out to the binary; library tests fork a child per scenario
 (since a Landlock domain is permanent for the thread that applies it).
 
+## Cross-compiling from Linux
+
+Both non-Linux targets build on a Linux dev box. The full `wall.nim` does
+not cross-compile yet (proxy/connect/netns are POSIX-only and not yet gated
+behind `when defined(windows)`), but the Windows-only submodules do.
+
+### macOS (osxcross)
+
+Needs [osxcross](https://github.com/tpoechtrager/osxcross) with an SDK
+installed (here at `/opt/osxcross`, SDK `MacOSX15.5.sdk`):
+
+```sh
+PATH=/opt/osxcross/bin:$PATH nim c --os:macosx --cpu:amd64 \
+  --clang.exe:x86_64-apple-darwin24.5-clang \
+  --clang.linkerexe:x86_64-apple-darwin24.5-clang \
+  --path:src -d:release -o:sandwall-osx src/sandwall.nim
+```
+
+The `darwin24.5` triple prefix tracks the SDK version; adjust to whatever
+`ls /opt/osxcross/bin` shows. Output is an x86_64 Mach-O you can `scp` to a
+Mac and run directly (no codesigning needed over ssh). For arm64 use
+`--cpu:arm64` with the `aarch64-apple-darwin24.5-clang` wrapper.
+
+### Windows (mingw)
+
+Needs the `x86_64-w64-mingw32` toolchain (`mingw-w64` package on most
+distros). Compile-only checks of the Windows modules:
+
+```sh
+nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src src/sandwall/wall/wfp.nim
+nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src src/sandwall/wall/winuser.nim
+```
+
+`--compileOnly` runs Nim's codegen and the C compile but skips linking; it
+catches API drift without needing a Windows host. The Windows test binaries
+(`tests/test_winwall.nim`) cross-build the same way minus `--compileOnly`,
+and run on a Windows machine.
+
 ## Layout
 
 ```

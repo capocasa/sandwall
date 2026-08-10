@@ -12,13 +12,14 @@
 ## No state, no init. Each call is a self-contained restriction. On a platform
 ## without a backend, it raises.
 
-import std/syncio
+import std/[syncio, strutils, os]
 import ./paths
 export paths.normalize
 
 when defined(linux):
   import ./landlock
   import ./mask
+  import ./baseline
   import ./wall/netns
   export landlock.backendSupported, landlock.backendName
 elif defined(macosx):
@@ -77,13 +78,24 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
       except OSError as e:
         stderr.writeLine("sandwall: " & e.msg &
           "; continuing WITHOUT network fencing")
-    if denied.len > 0:
+    # Denies under a baseline root are re-scoped inside Landlock
+    # itself (rules union there, a bind-mask would not help); the
+    # mount-namespace mask is only needed for denies narrowing a
+    # policy rule's own allow/readonly root.
+    var masked: seq[string]
+    for d in denied:
+      var underBaseline = false
+      for b in baselineRead:
+        if d == b or (d.len > b.len and d.startsWith(b & DirSep)):
+          underBaseline = true; break
+      if not underBaseline: masked.add d
+    if masked.len > 0:
       try:
-        maskDenied(denied)
+        maskDenied(masked)
       except OSError as e:
         stderr.writeLine("sandwall: " & e.msg &
           "; continuing without sub-path deny enforcement")
-    landlock.restrictImpl(writable, read)
+    landlock.restrictImpl(writable, read, denied)
     if fenceNet and proxySockPath.len > 0:
       # Landlock must still permit connecting to the unix socket: the
       # consumer must place proxySockPath under a writable path.

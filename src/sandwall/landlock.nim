@@ -11,10 +11,17 @@
 const landlockAvailable* = defined(linux)
 
 when defined(linux):
-  import std/[oserrors, sets]
+  import std/[oserrors, sets, os, strutils]
   import std/posix except Time
   import ./paths
   import ./baseline
+
+  proc isPathUnder(path, root: string): bool =
+    ## Local copy of rules.isPathUnder (importing rules would cycle:
+    ## rules imports baseline, restrict imports both).
+    path == root or
+      (path.len > root.len and path.startsWith(root) and
+       (root.endsWith(DirSep) or path[root.len] == DirSep))
   type AccessFds = distinct uint64
 
   # Syscall numbers are stable on every Linux/Arch combination (UAPI).
@@ -239,10 +246,13 @@ proc backendSupported*(): bool = landlockAvailable
 proc backendName*(): string = "landlock"
 
 when defined(linux):
-  proc restrictImpl*(writable, read: openArray[string]) =
+  proc restrictImpl*(writable, read, denied: openArray[string]) =
     ## Confine the calling thread via a single Landlock domain. Writable
     ## paths get full access, read paths get read + execute, everything else
-    ## is denied.
+    ## is denied. `denied` paths re-close auto-granted baseline roots (an
+    ## explicit `deny /etc` in the policy must beat the baseline's read
+    ## grant); paths outside the baseline need nothing since unmentioned
+    ## is already denied.
     var rs = createRuleset()
     try:
       let w = writeRights(rs.mask)
@@ -255,24 +265,77 @@ when defined(linux):
       var readSeen = initHashSet[string]()
       # Auto-add OS-specific baseline paths so sandboxed commands can exec,
       # load shared libraries, read /dev/urandom, and redirect to /dev/null
-      # without callers listing them explicitly.
+      # without callers listing them explicitly. Landlock rules union, so a
+      # baseline root covering an explicitly denied path cannot simply keep
+      # its grant: the root rule is dropped below and each sibling subtree
+      # is granted instead (a rule on a dir covers its whole content
+      # recursively, so direct children suffice; traversing the denied
+      # path's ancestors needs no rule). A deny narrowing a policy rule's
+      # own root is mask.nim's job instead.
+      for p in denied:
+        let dn = paths.normalize(p)
+        if dn.len == 0: continue
+        # Deny under a policy allow/readonly root is mask.nim's job
+        # (bind-mask over the real path, verified). Handle only denies
+        # that sit under an auto-granted baseline root, where Landlock
+        # union semantics would otherwise leave the grant intact.
+        var underPolicy = false
+        for w in writable:
+          let wn = paths.normalize(w)
+          if wn.len > 0 and isPathUnder(dn, wn): underPolicy = true; break
+        if not underPolicy:
+          for ro in read:
+            let rn = paths.normalize(ro)
+            if rn.len > 0 and isPathUnder(dn, rn): underPolicy = true; break
+        if underPolicy: continue
+        for b in baselineRead:
+          let bn = paths.normalize(b)
+          if bn.len == 0 or not isPathUnder(dn, bn) or dn == bn: continue
+          # Landlock dir rules are recursive: the baseline /etc
+          # grant is dropped below, and each direct child subtree of
+          # the baseline root is granted instead, except the one
+          # holding the deny. That makes the carve-out one level deep:
+          # a deny nested deeper (deny /etc/ssh/sshd_config) closes the
+          # whole top-level subtree (/etc/ssh), since any rule that
+          # would cover the nested parent also covers the deny. Document
+          # the policy as such; deep denies belong under policy roots
+          # (mask.nim) or on baseline children (deny /etc/ssh).
+          let rel = dn[bn.len + 1 .. ^1]
+          let deniedTop = bn & DirSep & rel.split(DirSep)[0]
+          for kind, pc in walkDir(bn):
+            let child = paths.normalize(pc)
+            if child.len == 0 or child == deniedTop: continue
+            if readSeen.containsOrIncl(child): continue
+            try: rs.addRule(child, r)
+            except OSError: discard
+          # Re-grant the root's own listing only: a full read rule on
+          # the dir would recursively cover the denied child too, but
+          # READ_DIR alone just keeps `ls <root>` working.
+          if not readSeen.containsOrIncl(bn):
+            try: rs.addRule(bn, AccessFds(uint64(LANDLOCK_ACCESS_FS_READ_DIR) and rs.mask))
+            except OSError: discard
       for p in baselineRead:
-        let n = normalize(p)
+        let n = paths.normalize(p)
         if n.len == 0 or readSeen.containsOrIncl(n): continue
+        var covered = false
+        for d in denied:
+          let dn = paths.normalize(d)
+          if dn.len > 0 and isPathUnder(dn, n): covered = true; break
+        if covered: continue
         try: rs.addRule(n, r)
         except OSError: discard
       for p in baselineWrite:
-        let n = normalize(p)
+        let n = paths.normalize(p)
         if n.len == 0 or writeSeen.containsOrIncl(n): continue
         try: rs.addRule(n, w)
         except OSError: discard
       for p in writable:
-        let n = normalize(p)
+        let n = paths.normalize(p)
         if n.len == 0 or writeSeen.containsOrIncl(n): continue
         try: rs.addRule(n, w)
         except OSError: discard
       for p in read:
-        let n = normalize(p)
+        let n = paths.normalize(p)
         if n.len == 0 or readSeen.containsOrIncl(n): continue
         try: rs.addRule(n, r)
         except OSError: discard

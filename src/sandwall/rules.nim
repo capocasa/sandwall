@@ -42,6 +42,7 @@
 ## `parsePolicy` once.
 
 import std/[os, strutils, tables]
+import ./baseline
 
 type
   AccessKind* = enum
@@ -267,13 +268,18 @@ proc resolve*(rules: openArray[Rule]): Resolved =
       of akWritable: result.writable.add k
       of akReadOnly: result.readonly.add k
       of akDeny:
-        # A deny only needs compensating enforcement when it narrows an
-        # allow that survives in the output lists.
+        # A deny needs compensating enforcement when it narrows an
+        # allow that survives in the output lists, or a baseline root
+        # the backends auto-grant (Landlock unions rules, so an
+        # explicit deny under a baseline root must be carried through).
         for w in result.writable:
           if isPathUnder(k, w): result.denied.add k; break
         if k notin result.denied:
           for ro in result.readonly:
             if isPathUnder(k, ro): result.denied.add k; break
+        if k notin result.denied:
+          for b in baselineRead:
+            if isPathUnder(k, b): result.denied.add k; break
 
 proc renderPolicy*(rules: openArray[Rule]): string =
   ## Human-readable dump of the effective rules, newest last (matching
