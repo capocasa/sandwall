@@ -32,7 +32,7 @@ type
 proc `$`*(e: ExitCode): string = $(int(e))
 
 when defined(windows):
-  import std/[winlean, widestrs]
+  import std/[winlean, widestrs, strutils]
   import ./acl  # currentAppContainerSid, rollbackAcls
 
   type
@@ -88,6 +88,37 @@ when defined(windows):
   proc convertStringSidToSidW(str: WideCString; sid: ptr winlean.PSID): WINBOOL
       {.stdcall, dynlib: "advapi32", importc: "ConvertStringSidToSidW".}
 
+  proc findExeInPath*(name: string): string =
+    ## Resolve a bare command name against PATH/PATHEXT like cmd does:
+    ## cwd first, then each PATH entry, trying the name as-is plus each
+    ## PATHEXT extension. Returns the input unchanged when the name
+    ## already carries a directory or resolves nowhere (CreateProcessW
+    ## then fails with its own error, as execvp would).
+    if name.len == 0: return name
+    for c in name:
+      if c in {'\\', '/', ':'}: return name
+    var exts: seq[string] = @[""]
+    let pathext = getEnv("PATHEXT")
+    if pathext.len > 0:
+      for e in pathext.split(';'):
+        let t = e.strip()
+        if t.len > 0: exts.add(t.toLowerAscii())
+    template matches(dir: string): string =
+      block:
+        var hit = ""
+        for e in exts:
+          let cand = dir / (name & e)
+          if fileExists(cand): hit = cand; break
+        hit
+    let inCwd = matches(getCurrentDir())
+    if inCwd.len > 0: return inCwd
+    for dir in getEnv("PATH").split(';'):
+      let d = dir.strip()
+      if d.len == 0: continue
+      let hit = matches(d)
+      if hit.len > 0: return hit
+    name
+
   proc spawnSandboxed*(cmd: openArray[string];
                        internetAccess = false): ExitCode =
     ## Spawn `cmd` in the prepared AppContainer (see `acl.restrictImpl`),
@@ -102,12 +133,37 @@ when defined(windows):
     # never be skipped.
     defer: rollbackAcls(currentAppContainerSid)
 
+    # CreateProcessW does no PATH search with a nil lpApplicationName,
+    # so resolve a bare name ourselves (execvp parity). Resolve against
+    # the PARENT's environment and cwd: the child's cwd is the same
+    # directory and the ACLs already cover these paths, so stamping
+    # happens before this point either way.
+    var appNameStr = ""
+    block:
+      var bare = cmd[0].len > 0
+      for c in cmd[0]:
+        if c in {'\\', '/', ':'}: bare = false; break
+      if bare:
+        let hit = findExeInPath(cmd[0])
+        if hit != cmd[0]: appNameStr = hit
+    # Build the UTF-16 appName manually: newWideCString under --gc:orc
+    # misbehaves here (observed returning the cwd for an unrelated
+    # input), so allocate and convert explicitly. Only ASCII paths
+    # (PATH entries) are resolved this way; exotic names still work
+    # via the cmdLine fallback.
+    var appName: WideCString = nil
+    if appNameStr.len > 0:
+      appName = cast[WideCString](alloc0((appNameStr.len + 1) * 2))
+      for i, c in appNameStr:
+        appName[i] = Utf16Char(ord(c))
     # CreateProcessW wants a single mutable UTF-16 command line. Build it by
     # quoting each arg with the Windows rules (std/os.quoteShellWindows).
     var cmdLine = ""
     for i, a in cmd:
       if i > 0: cmdLine.add(' ')
-      cmdLine.add(quoteShellWindows(a))
+      # argv[0] echoes lpApplicationName (execvp parity); child CRTs
+      # re-parse the line, so an unresolvable name still surfaces.
+      cmdLine.add(quoteShellWindows(if i == 0 and appNameStr.len > 0: appNameStr else: a))
     if cmdLine.len == 0:
       raise newException(ValueError, "sandwall.spawnSandboxed: empty command")
     let cmdLineW = newWideCString(cmdLine)
@@ -196,11 +252,12 @@ when defined(windows):
     # Explicit lpCurrentDirectory: the AppContainer virtualizes %TEMP%, and
     # inheriting a cwd the container cannot reach breaks cmd's redirects.
     let cwdW = newWideCString(getCurrentDir())
-    if createProcessExW(nil, cmdLineW, nil, nil, 1,
+    if createProcessExW(appName, cmdLineW, nil, nil, 1,
         DWORD(EXTENDED_STARTUPINFO_PRESENT), nil, cwdW,
         addr six, pi) == 0:
+      let prog = if appName != nil: $appName else: cmd[0]
       raise newException(OSError,
-        "sandwall: CreateProcessW failed: " & $getLastError())
+        "sandwall: CreateProcessW(" & prog & ") failed: " & $getLastError())
     # Parent must close its copy of the write end or reads never see EOF.
     discard closeHandle(pipeWrite)
     pipeWrite = 0

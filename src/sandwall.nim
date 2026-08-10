@@ -203,6 +203,7 @@ filesystem policy are enforced with no setup step.
         if "--uninstall" in args:
           uninstallFence()
           uninstallAcFence()
+          unexemptAcLoopback()
           echo "sandwall: wall filters removed"
           return 0
         try:
@@ -210,6 +211,7 @@ filesystem policy are enforced with no setup step.
           installFence(sid, FirstProxyPort, LastProxyPort)
           try:
             installAcFence()
+            exemptAcLoopback()
             echo "sandwall: AC fence installed"
           except OSError as e:
             stderr.writeLine("sandwall: AC fence install failed: " & e.msg)

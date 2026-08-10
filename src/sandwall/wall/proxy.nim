@@ -69,7 +69,11 @@ const
 when defined(windows):
   # Minimal winsock portability layer: the proxy code below is written
   # against poll/recv/send/close; on Windows those map to WSAPoll and
-  # the ws2_32 calls. SocketHandle is already `int` in winlean, so only
+  # the ws2_32 calls. closesocket comes from wfp.nim's winlean (this
+  # module's own winlean import excludes Socket, so an unqualified
+  # import would collide).
+  import std/winlean as wl
+  # SocketHandle is already `int` in winlean, so only
   # the narrow casts differ (handles stay in the low 32 bits in
   # practice; every socket this file creates goes through WSAPoll for
   # readiness, so a handle that does not would simply stall, never
@@ -112,7 +116,7 @@ proc closeSock(fd: SocketHandle) =
   when defined(posix):
     discard posix.close(fd)
   else:
-    discard closesocket(fd)
+    discard wl.closesocket(fd)
 
 # ------------------------------------------------------------- policy
 
@@ -661,7 +665,25 @@ proc startWallProxy*(policyPath: string; projectDir: string;
   ## accept loop on a background thread. Port 0 lets the caller read
   ## back `proxy.port`; consumers that need a fixed port range (the
   ## Windows fence story) pass explicit ports instead.
-  startProxyListeners(policyPath, projectDir, port, "", verbose)
+  when defined(windows):
+    # The AC fence permits loopback egress only to remote ports
+    # 60080-60089 (FirstProxyPort..LastProxyPort in wfp.nim, mirrored
+    # here to keep the import graph acyclic: wfp must not see this
+    # module's winlean-portability layer). An ephemeral port is
+    # unreachable through the fence: try each port in the permitted
+    # range until one binds.
+    const firstProxyPort = 60080'u16
+    const lastProxyPort = 60089'u16
+    for p in firstProxyPort .. lastProxyPort:
+      try:
+        return startProxyListeners(policyPath, projectDir, p, "", verbose)
+      except CatchableError:
+        continue
+    raise newException(OSError,
+      "sandwall proxy: no free port in the fence range " &
+      $firstProxyPort & "-" & $lastProxyPort)
+  else:
+    startProxyListeners(policyPath, projectDir, port, "", verbose)
 
 proc startWallProxy*(policyPath: string; projectDir: string;
                      unixSockPath: string; port: uint16 = 0;

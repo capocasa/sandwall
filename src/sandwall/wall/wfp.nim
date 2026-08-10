@@ -99,7 +99,7 @@ proc sddlForUserSid*(sid: string): string =
   "O:LSG:LSD:(A;;CC;;;" & sid & ")"
 
 when defined(windows):
-  import std/[winlean, widestrs, net]
+  import std/[winlean, widestrs, net, osproc]
 
   type SIZE_T* = uint
   {.passL: "-lfwpuclnt -ladvapi32".}
@@ -667,6 +667,25 @@ when defined(windows):
     for keyText in [acPermitV4GuidText, acBlockV4GuidText, acPermitV6GuidText, acBlockV6GuidText]:
       let key = parseGuid(keyText)
       discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
+
+  proc exemptAcLoopback*() =
+    ## Add the `sandwall.fs` AppContainer to the loopback exemption
+    ## list. Windows ships a built-in "AppContainerLoopback" block
+    ## filter (MPSSVC app-isolation sublayer) that silently drops an
+    ## AppContainer child's connects to 127.0.0.1 servers unless the
+    ## container is exempted; without this the sandboxed child can
+    ## never reach the wall proxy and every proxied request hangs on
+    ## SYN. Uses CheckNetIsolation, the supported interface (needs
+    ## admin, which setup already requires).
+    let rc = execCmd("CheckNetIsolation LoopbackExempt -a -n=sandwall.fs")
+    if rc != 0:
+      raise newException(OSError,
+        "sandwall: CheckNetIsolation LoopbackExempt failed: " & $rc)
+
+  proc unexemptAcLoopback*() =
+    ## Remove the loopback exemption. Best-effort: a missing entry is
+    ## not an error (uninstall must be safe to run repeatedly).
+    discard execCmd("CheckNetIsolation LoopbackExempt -d -n=sandwall.fs")
 
   proc acFenceStatus*(): tuple[installed: bool; filters: int; hint: string] =
     var engine: Handle

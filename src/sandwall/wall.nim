@@ -36,6 +36,7 @@ when defined(linux):
 when defined(windows):
   export wfp.installFence, wfp.uninstallFence, wfp.fenceStatus,
     wfp.installAcFence, wfp.uninstallAcFence, wfp.acFenceStatus,
+    wfp.exemptAcLoopback, wfp.unexemptAcLoopback,
     wfp.wfpProbeMain
   import ./wall/winuser
   export winuser
