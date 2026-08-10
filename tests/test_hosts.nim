@@ -8,8 +8,14 @@ proc listOf(text: string): HostList =
   parsePolicy(text, proj).resolve().hosts.toHostList()
 
 suite "host list matching":
-  test "empty list denies everything":
-    check not listOf("").allows("example.com", 443)
+  test "deny-only policy defaults to allow":
+    # Open by default: a policy that only names denies blocks exactly
+    # those; anything unmentioned goes through. (An empty HostList is
+    # never consulted at all - no host rules means no fence.)
+    let l = listOf("deny evil.com\n")
+    check not l.allows("evil.com", 443)
+    check l.allows("example.com", 443)
+    check not listOf("deny evil.com\nallow good.com\n").allows("other.com", 443)
 
   test "exact allow and deny":
     let l = listOf("allow example.com\ndeny evil.com\n")
@@ -57,8 +63,10 @@ suite "host list matching":
     check listOf("allow EXAMPLE.com\n").allows("example.COM", 443)
     check listOf("allow example.com\n").allows("example.com.", 443)
 
-  test "readonly-only host rules are skipped":
-    check not listOf("*example.com\n").allows("example.com", 443)
+  test "readonly host rules are skipped":
+    # readonly is meaningless for hosts and skipped; a readonly-only
+    # policy has no effective host rules, so the open default applies.
+    check listOf("readonly example.com\n").allows("example.com", 443)
 
   test "localhost is an ordinary name":
     let l = listOf("allow localhost\n")

@@ -149,14 +149,17 @@ when defined(linux):
 
   proc bridgeProcess(listener: SocketHandle; sockPath: string;
                      deathFd: cint) =
-    ## The bridge's whole lifetime: accept and splice, one connection
-    ## at a time. Single-threaded on purpose: threads do not survive a
-    ## later fork() of this process, and the fenced consumer forks
-    ## freely (runSandboxed nests it). Sequential accept keeps every
-    ## forked copy of the bridge a working one. Polls `deathFd`
-    ## alongside the listener: EOF there means the last holder of the
-    ## fenced command's pipe end is gone, so the bridge exits.
+    ## The bridge's whole lifetime: accept a connection, fork a worker
+    ## to splice it, reap finished workers, repeat. Fork-per-connection
+    ## because one kept-alive tunnel (a redirect target holding its
+    ## first connection open, say) must not starve the next accept;
+    ## worker processes are immune to the exec() that would kill
+    ## in-process threads. Polls `deathFd` alongside the listener: EOF
+    ## there means the last holder of the fenced command's pipe end is
+    ## gone, so the bridge exits; its workers die with it (session).
     while true:
+      var status: cint
+      discard waitpid(-1.Pid, status, WNOHANG)  # reap one zombie per turn
       var fds = [TPollfd(fd: listener.cint, events: POLLIN, revents: 0),
                  TPollfd(fd: deathFd, events: POLLIN, revents: 0)]
       let r = poll(addr fds[0], 2, -1)
@@ -171,7 +174,16 @@ when defined(linux):
         if osLastError().cint == EINTR: continue
         sleep(10)
         continue
-      serveBridgeConn(cfd, sockPath)
+      let wpid = posix.fork()
+      if wpid == 0:
+        discard posix.close(listener)
+        discard posix.close(deathFd)
+        serveBridgeConn(cfd, sockPath)
+        exitnow(0)
+      discard posix.close(cfd)  # worker owns the connection now
+      if wpid < 0:
+        # fork failed: serve inline rather than drop the connection
+        serveBridgeConn(cfd, sockPath)
 
   proc bridgeToUnix*(listenPort: uint16; sockPath: string): uint16 =
     ## Listen on 127.0.0.1:listenPort (0 = ephemeral) inside the netns

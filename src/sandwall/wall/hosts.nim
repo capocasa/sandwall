@@ -26,9 +26,11 @@
 ## so a fenced process cannot influence resolution at all (fenced
 ## processes cannot resolve; the DNS channel is closed by the fence).
 ##
-## The default is deny: a policy with host rules fences the network, so
-## a HostList is only consulted when fencing is on, and within it
-## silence means no.
+## The default depends on the policy's shape, mirroring the sandbox
+## philosophy that things are open until a rule closes them: a list
+## containing at least one allow rule denies whatever no rule mentions
+## (the allows are the whole world), while a list of only deny rules
+## allows whatever no rule mentions (the denies are the only fences).
 
 import std/strutils
 import ../rules
@@ -44,6 +46,7 @@ type
 
   HostList* = object
     matchers*: seq[HostMatcher]
+    hasAllow*: bool   ## any allow matcher present; flips the default
 
 proc toHostList*(hosts: seq[Rule]): HostList =
   ## Compile resolved host rules into matchers, preserving policy order.
@@ -62,6 +65,7 @@ proc toHostList*(hosts: seq[Rule]): HostList =
     elif m.host.startsWith("*."):
       m.isWildcard = true
       m.host = m.host[2 .. ^1]
+    if m.allow: result.hasAllow = true
     result.matchers.add m
 
 proc normalizeHost(host: string): string =
@@ -73,7 +77,10 @@ proc normalizeHost(host: string): string =
     result = result[1 .. ^2]
 
 proc allows*(l: HostList; host: string; port: uint16): bool =
-  ## Last-wins decision for `host:port`. Deny when nothing matches.
+  ## Last-wins decision for `host:port`. When nothing matches the
+  ## default is deny for an allowlist-shaped policy (any allow rule)
+  ## and allow for a deny-only policy.
+  result = not l.hasAllow
   let h = normalizeHost(host)
   for m in l.matchers:
     if m.port != 0 and m.port != port: continue

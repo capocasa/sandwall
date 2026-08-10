@@ -27,6 +27,15 @@ import ../rules
 import ./hosts
 
 type
+  ClientArg = ref object
+    ## Handoff to a per-connection worker thread. A ref (GC heap), not
+    ## allocShared: nim refs are thread-safe to pass between threads as
+    ## long as only one thread owns it at a time, which is exactly the
+    ## accept -> worker handoff here. (allocShared'd memory holding a
+    ## ptr back into ProxyShared is fine too, but ref is simpler.)
+    sh: ptr ProxyShared
+    fd: SocketHandle
+
   WallProxy* = object
     sock: Socket              ## listener on 127.0.0.1
     acceptCtx: pointer        ## heap ProxyCtx for stopWallProxy
@@ -365,33 +374,71 @@ proc readHttpHead(fd: SocketHandle; first: char): string =
     if result.endsWith("\c\L\c\L") or result.endsWith("\L\L"): return
 
 proc serveConnect(sh: var ProxyShared; fd: SocketHandle; first: char) =
-  ## Handle one HTTP CONNECT. Only CONNECT is valid; anything else
-  ## gets 405 (the proxy is not a general HTTP proxy).
+  ## Handle one HTTP request: CONNECT (a tunnel) or any other method
+  ## with an absolute-URI target (plain HTTP, forwarded).
   let head = readHttpHead(fd, first)
   let line = head.splitLines()[0]
   let parts = line.splitWhitespace()
-  if parts.len < 2 or parts[0] != "CONNECT":
-    discard sendFd(fd, "HTTP/1.1 405 Method Not Allowed\c\L\c\L")
+  if parts.len < 2:
+    discard sendFd(fd, "HTTP/1.1 400 Bad Request\c\L\c\L")
     return
   var host: string
   var port: uint16
-  try:
-    (host, port) = parseHostPort(parts[1])
-  except ValueError:
-    discard sendFd(fd, "HTTP/1.1 400 Bad Request\c\L\c\L")
-    return
-  if not sh.allowed(host, port):
-    discard sendFd(fd, "HTTP/1.1 403 Forbidden\c\L\c\L")
-    return
-  let up = dialUp(host, port)
-  if up == osInvalidSocket:
-    discard sendFd(fd, "HTTP/1.1 502 Bad Gateway\c\L\c\L")
-    return
-  if not sendFd(fd, "HTTP/1.1 200 Connection Established\c\L\c\L"):
+  if parts[0] == "CONNECT":
+    try:
+      (host, port) = parseHostPort(parts[1])
+    except ValueError:
+      discard sendFd(fd, "HTTP/1.1 400 Bad Request\c\L\c\L")
+      return
+    if not sh.allowed(host, port):
+      discard sendFd(fd, "HTTP/1.1 403 Forbidden\c\L\c\L")
+      return
+    let up = dialUp(host, port)
+    if up == osInvalidSocket:
+      discard sendFd(fd, "HTTP/1.1 502 Bad Gateway\c\L\c\L")
+      return
+    if not sendFd(fd, "HTTP/1.1 200 Connection Established\c\L\c\L"):
+      closeSock(up)
+      return
+    splice(fd, up)
     closeSock(up)
-    return
-  splice(fd, up)
-  closeSock(up)
+  else:
+    # Plain HTTP through the proxy: the request target is an
+    # absolute URI (http://host[:port]/path). The allow decision
+    # still runs on the requested name; the request line is rewritten
+    # to origin form before forwarding so the upstream sees a normal
+    # request.
+    let uri = parts[1]
+    if not uri.toLowerAscii.startsWith("http://"):
+      discard sendFd(fd, "HTTP/1.1 400 Bad Request\c\L" &
+        "sandwall: absolute http:// URI required\c\L\c\L")
+      return
+    let authority = uri[7 .. ^1].split('/', 1)[0]
+    try:
+      (host, port) = parseHostPort(authority)
+    except ValueError:
+      host = authority
+      port = 80
+    let path = if uri.len > 7 + authority.len: uri[7 + authority.len .. ^1]
+               else: "/"
+    if not sh.allowed(host, port):
+      discard sendFd(fd, "HTTP/1.1 403 Forbidden\c\L\c\L")
+      return
+    let up = dialUp(host, port)
+    if up == osInvalidSocket:
+      discard sendFd(fd, "HTTP/1.1 502 Bad Gateway\c\L\c\L")
+      return
+    let crlf = head.find("\c\L\c\L") >= 0
+    let nl = if crlf: "\c\L" else: "\L"
+    let splitAt = if crlf: head.find("\c\L\c\L") else: head.find("\L\L")
+    var fwd = parts[0] & " " & path
+    if parts.len > 2: fwd.add " " & parts[2]
+    fwd.add nl & head[line.len + nl.len ..< splitAt] & nl & nl
+    if not sendFd(up, fwd):
+      closeSock(up)
+      return
+    splice(fd, up)
+    closeSock(up)
 
 proc ip4String(a: array[4, char]): string =
   $uint8(a[0]) & "." & $uint8(a[1]) & "." & $uint8(a[2]) & "." & $uint8(a[3])
@@ -491,6 +538,30 @@ proc serveClient(sh: var ProxyShared; fd: SocketHandle) =
   finally:
     closeSock(fd)
 
+proc clientThread(ca: ClientArg) {.thread.} =
+  ## Serve one accepted connection. Thread-per-connection: a kept-alive
+  ## tunnel (splice has no idle timeout, deliberately) must not starve
+  ## the next CONNECT behind it.
+  ca.sh[].serveClient(ca.fd)
+
+proc serveAsync(sh: ptr ProxyShared; fd: SocketHandle) =
+  ## Hand an accepted connection to a fresh worker thread. The Thread
+  ## object lives on the shared heap, not this frame: the worker
+  ## thread's wrapper writes `thrd.core = nil` back through it AFTER
+  ## the client has been served, long past this proc's return
+  ## (stack-allocated, that write is a use-after-return that crashes
+  ## the worker). The handle is then deliberately leaked; it is ~40
+  ## bytes per connection on a per-run proxy. Detached, never joined.
+  let t = cast[ptr Thread[ClientArg]](allocShared0(sizeof(Thread[ClientArg])))
+  try:
+    createThread(cast[var Thread[ClientArg]](t), clientThread,
+                 ClientArg(sh: sh, fd: fd))
+    when defined(posix):
+      discard pthread_detach(cast[Pthread](t.sys))
+  except ResourceExhaustedError:
+    deallocShared(t)
+    sh[].serveClient(fd)
+
 proc acceptThread(sh: ptr ProxyShared) {.thread.} =
   while sh.running:
     var listener = osInvalidSocket
@@ -530,13 +601,7 @@ proc acceptThread(sh: ptr ProxyShared) {.thread.} =
       sleep(10)
       continue
     sh[].maybeReload()
-    sh[].serveClient(fd)
-    # Sequential: one client at a time. This keeps the accept loop
-    # single-threaded, which keeps it correct when a consumer forks
-    # after startWallProxy: the proxy then serves the loopback AND the
-    # unix listener from both processes. (Thread-per-connection here
-    # left the freshly accepted fd served only by the parent's thread,
-    # which fenced children bridged to the unix listener never reach.)
+    sh.serveAsync(fd)
 
 # ------------------------------------------------------------- public
 
@@ -656,7 +721,7 @@ when defined(posix):
           sleep(10)
           continue
         ctx.sh.maybeReload()
-        ctx.sh.serveClient(fd)
+        (addr ctx.sh).serveAsync(fd)
         break
     for l in ctx.sh.listeners:
       discard posix.close(l)

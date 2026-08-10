@@ -95,16 +95,24 @@ suite "wall proxy":
       check line.contains("403")
       c.close()
 
-  test "plain HTTP GET gets 405":
+  test "plain HTTP GET is forwarded, rewritten to origin form":
     withPolicy "allow 127.0.0.1\n":
       var p = startWallProxy(path, tmpDir)
       defer: p.stopWallProxy()
+      # The echo server reflects whatever the proxy forwards; the
+      # request line must have been rewritten from absolute-URI form
+      # to origin form, and the body must echo back through the splice.
       let c = dial("127.0.0.1", Port(p.port), buffered = false)
-      c.send("GET http://example.com/ HTTP/1.1\c\LHost: example.com\c\L\c\L")
-      var line = ""
-      line = recvLine(c, 5_000)
-      check line.contains("405")
+      c.send("GET http://127.0.0.1:" & $echoPort & "/some/path HTTP/1.1\c\L" &
+             "Host: 127.0.0.1\c\L\c\L")
+      let line = recvLine(c, 5_000)
+      check line == "GET /some/path HTTP/1.1"
       c.close()
+      # A denied host gets 403 without any upstream contact.
+      let d = dial("127.0.0.1", Port(p.port), buffered = false)
+      d.send("GET http://elsewhere.invalid/ HTTP/1.1\c\LHost: elsewhere.invalid\c\L\c\L")
+      check recvLine(d, 5_000).contains("403")
+      d.close()
 
   test "SOCKS5 allow and ruleset deny":
     withPolicy "allow localhost\n":
