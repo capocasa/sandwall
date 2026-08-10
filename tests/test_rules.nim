@@ -156,3 +156,31 @@ suite "render and append":
     check appendRule(f, "api.x.com:8443", akWritable)
     check readFile(f) == "readonly ./src\nallow\nallow api.x.com:8443\n"
     removeFile(f)
+
+  test "appendRule moves an existing rule to the end":
+    let f = getTempDir() / "sandwall-test-policy"
+    writeFile(f, "# comment\nallow ./src\nreadonly /lib\n")
+    check appendRule(f, "./src", akDeny)
+    check readFile(f) == "# comment\nreadonly /lib\ndeny ./src\n"
+    # flipping back strips the deny
+    check appendRule(f, "./src", akWritable)
+    check readFile(f) == "# comment\nreadonly /lib\nallow ./src\n"
+    removeFile(f)
+
+  test "appendRule host rules match on host:port, not the verb":
+    let f = getTempDir() / "sandwall-test-policy"
+    writeFile(f, "allow a.com:443\nallow a.com\ndeny b.com\n")
+    # same host, different port: both rules survive
+    check appendRule(f, "a.com:80", akDeny)
+    check readFile(f) == "allow a.com:443\nallow a.com\ndeny b.com\ndeny a.com:80\n"
+    # bare host strips the bare-host rule only
+    check appendRule(f, "a.com", akDeny)
+    check readFile(f) == "allow a.com:443\ndeny b.com\ndeny a.com:80\ndeny a.com\n"
+    removeFile(f)
+
+  test "appendRule leaves verb-prefix hosts and other paths alone":
+    let f = getTempDir() / "sandwall-test-policy"
+    writeFile(f, "deny.corp.internal\nallow ./src\nallow ./src2\n")
+    check appendRule(f, "./src", akDeny)
+    check readFile(f) == "deny.corp.internal\nallow ./src2\ndeny ./src\n"
+    removeFile(f)

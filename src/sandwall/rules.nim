@@ -293,19 +293,64 @@ proc renderPolicy*(rules: openArray[Rule]): string =
       let suffix = if r.port == 0: "" else: ":" & $r.port
       result.add label & "  " & r.host & suffix & "\n"
 
+proc replaceAccess*(text, target, verb: string): string =
+  ## Strip existing rules for `target` that carry a real access verb and
+  ## append `verb target` at the end. A rule only matches when the verb
+  ## stands alone at a word boundary, so a hostname like
+  ## `deny.corp.internal` is never mistaken for a deny rule. Path rules
+  ## compare literal: an exact string match, or a bare verb (which means
+  ## the project dir) when `target` is empty. Host rules compare on the
+  ## (host, port) pair, and a malformed host line is never stripped.
+  ## Lines that fail to parse keep their place, untouched.
+  let targetKey =
+    if classifyTarget(target) == rkPath: ("\x01", target)
+    else:
+      try:
+        let (h, p) = parseHost(target)
+        ("\x00", h & ":" & $p)
+      except ValueError:
+        ("\x00", "\x01" & target)  # unparseable: can never match a rule
+  var lines = text.splitLines
+  # splitLines yields a phantom empty tail for newline-terminated text;
+  # drop it or it would round-trip into a growing stack of blank lines.
+  if lines.len > 0 and lines[^1].len == 0: lines.setLen(lines.len - 1)
+  for raw in lines:
+    let line = raw.strip(leading = true, trailing = false)
+    if line.len == 0 or line[0] == '#':
+      result.add raw & "\n"
+      continue
+    let first = line.split(Whitespace, 1)[0]
+    var rest = ""
+    if first in ["allow", "deny", "readonly"]:
+      rest = line[first.len .. ^1].strip(leading = true, trailing = false)
+      let ruleKey =
+        if classifyTarget(rest) == rkPath: ("\x01", rest)
+        else:
+          try:
+            let (h, p) = parseHost(rest)
+            ("\x00", h & ":" & $p)
+          except ValueError:
+            ("\x00", "\x01" & rest)
+      if ruleKey == targetKey:
+        continue  # superseded: the new rule at the end replaces it
+    result.add raw & "\n"
+  result.add verb & (if target.len > 0: " " & target else: "") & "\n"
+
 proc appendRule*(policyFile, target: string; access: AccessKind): bool =
-  ## Append a single rule to `policyFile`. The literal `target` is
-  ## written as-is so relative targets stay relative and the file stays
-  ## portable and human-readable. Returns false on write failure.
+  ## Add a rule to `policyFile`. The literal `target` is written as-is
+  ## so relative targets stay relative and the file stays portable and
+  ## human-readable. Earlier rules for the same target are stripped, so
+  ## flipping allow -> deny (or back) moves the rule to the end instead
+  ## of stacking duplicates; other targets keep their order. Returns
+  ## false on write failure.
   let word =
     case access
     of akDeny: "deny"
     of akReadOnly: "readonly"
     of akWritable: "allow"
-  let line = word & (if target.len > 0: " " & target else: "") & "\n"
   try:
-    var f = open(policyFile, fmAppend)
-    try: f.write(line) finally: f.close()
+    let text = if fileExists(policyFile): readFile(policyFile) else: ""
+    writeFile(policyFile, replaceAccess(text, target, word))
   except CatchableError:
     return false
   true
