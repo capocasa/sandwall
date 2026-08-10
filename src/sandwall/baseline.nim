@@ -35,8 +35,8 @@ elif defined(windows):
   # ALL APPLICATION PACKAGES grant already on C:\Windows, so no baseline
   # stamping is needed (and C:\Windows is protected against our DACL writes
   # anyway). Writable paths get explicit grants; everything else is denied.
-  const baselineRead* = @[]
+  const baselineRead*: seq[string] = @[]
   const baselineWrite* = @[]
 else:
-  const baselineRead* = @[]
+  const baselineRead*: seq[string] = @[]
   const baselineWrite* = @[]
