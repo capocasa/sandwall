@@ -168,26 +168,10 @@ proc restrict*(rules: openArray[Rule]; projectDir: string;
              proxyPort = 0, proxySockPath = proxy.sockPath,
              bridgePort = addr bp)
     let fencePort = when defined(linux): bp else: proxy.port
-    # Env for the exec'd command: most tools honor http_proxy/
-    # ALL_PROXY; socks5h means DNS happens at the proxy (the fence
-    # has no resolver). WALL_PROXY_PORT is for tools that speak to
-    # the proxy directly (the connect adapter reads it).
-    let hp = "http://127.0.0.1:" & $fencePort
-    let sp = "socks5h://127.0.0.1:" & $fencePort
-    putEnv("http_proxy", hp)
-    putEnv("https_proxy", hp)
-    putEnv("HTTP_PROXY", hp)
-    putEnv("HTTPS_PROXY", hp)
-    putEnv("ALL_PROXY", sp)
-    putEnv("all_proxy", sp)
-    # No NO_PROXY on purpose: loopback targets must go through the
-    # proxy too - the fence permits only loopback, and the proxy is
-    # where the hostname allowlist lives. Tools bypassing the proxy
-    # for 127.0.0.1 would hit the fence (or, allowed, loopback
-    # services inside the netns see nothing useful).
-    putEnv("NO_PROXY", "")
-    putEnv("no_proxy", "")
-    putEnv("WALL_PROXY_PORT", $fencePort)
+    # Point the exec'd command's proxy env at the wall proxy. On linux
+    # the fenced side reaches it through the netns bridge's ephemeral
+    # in-netns port; on macOS at the proxy's own host-loopback port.
+    setProxyEnv(fencePort)
   else:
     # Windows: the net fence is keyed on the sandwall user and lives
     # on the spawn path (wall/winuser.nim), not in this in-process

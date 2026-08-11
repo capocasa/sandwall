@@ -833,3 +833,24 @@ proc stopWallProxy*(p: var WallProxy) =
   deinitLock(ctx.sh.lock)
   deallocShared(ctx)
   p.acceptCtx = nil
+
+
+proc setProxyEnv*(port: uint16) =
+  ## Point the process's proxy env at the wall proxy on 127.0.0.1:port.
+  ## http(s)_proxy for CONNECT, ALL_PROXY=socks5h so DNS happens at the
+  ## proxy (a fenced child has no resolver). NO_PROXY is cleared on
+  ## purpose: loopback targets must go through the proxy too, since the
+  ## fence permits only loopback and the allowlist lives in the proxy.
+  ## WALL_PROXY_PORT is for tools that speak to the proxy directly
+  ## (the connect adapter reads it).
+  let hp = "http://127.0.0.1:" & $port
+  let sp = "socks5h://127.0.0.1:" & $port
+  putEnv("http_proxy", hp)
+  putEnv("https_proxy", hp)
+  putEnv("HTTP_PROXY", hp)
+  putEnv("HTTPS_PROXY", hp)
+  putEnv("ALL_PROXY", sp)
+  putEnv("all_proxy", sp)
+  putEnv("NO_PROXY", "")
+  putEnv("no_proxy", "")
+  putEnv("WALL_PROXY_PORT", $port)

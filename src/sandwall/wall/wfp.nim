@@ -99,9 +99,11 @@ proc sddlForUserSid*(sid: string): string =
   "O:LSG:LSD:(A;;CC;;;" & sid & ")"
 
 when defined(windows):
-  import std/[winlean, widestrs, net, osproc]
+  import std/winlean except PSID
+  import std/[widestrs, net, osproc]
+  import ./winffi
+  export winffi.PSID
 
-  type SIZE_T* = uint
   {.passL: "-lfwpuclnt -ladvapi32".}
   {.compile: "csrc/wfp_shim.c".}
 
@@ -329,32 +331,10 @@ when defined(windows):
   proc fwpmFreeMemory0(p: ptr pointer) {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmFreeMemory0".}
 
-  proc convertStringSecurityDescriptorToSecurityDescriptorW(
-      stringSecurityDescriptor: WideCString; stringSDRevision: DWORD;
-      securityDescriptor: ptr pointer;
-      securityDescriptorSize: ptr DWORD): WINBOOL {.stdcall,
-      dynlib: "advapi32",
-      importc: "ConvertStringSecurityDescriptorToSecurityDescriptorW".}
-  proc localFree(hMem: pointer): pointer {.stdcall, dynlib: "kernel32",
-      importc: "LocalFree".}
-  type
-    PSID* = pointer
-    HRESULT* = int32
-
-  proc deriveAppContainerSidFromAppContainerName(name: WideCString;
-      sid: ptr PSID): HRESULT {.stdcall, dynlib: "userenv",
-      importc: "DeriveAppContainerSidFromAppContainerName".}
-
-  proc getLengthSid(pSid: PSID): DWORD {.stdcall, dynlib: "advapi32",
-      importc: "GetLengthSid".}
-
-  proc copySid(destSidLen: DWORD; destSid: PSID;
-      sourceSid: PSID): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "CopySid".}
-
-  proc localAlloc(uFlags: DWORD; bytes: SIZE_T): pointer {.stdcall, dynlib: "kernel32",
-      importc: "LocalAlloc".}
-
+  # SID / security-descriptor / LocalAlloc FFI is shared in winffi.
+  # (convertStringSecurityDescriptorToSecurityDescriptorW, getLengthSid,
+  # copySid, localAlloc, deriveAppContainerSidFromAppContainerName,
+  # convertSidToStringSidW, PSID, HRESULT). localFree comes from winlean.
   proc fwpmFilterDeleteByKey0(engineHandle: Handle;
       key: ptr GUID): DWORD {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmFilterDeleteByKey0".}
@@ -420,6 +400,42 @@ when defined(windows):
 
   proc guidToBytes(g: GUID): array[16, byte] = guidBytes(g)
 
+  # --- condition constructors -----------------------------------------
+  # Each fence is a permit/block pair over a small set of condition
+  # shapes. These build one FWPM_FILTER_CONDITION0; the value storage
+  # they point at must outlive the addFilter call (stack locals in the
+  # installer procs, which they do).
+
+  proc condRangePort(field: GUID; rng: ptr FWP_RANGE0): FWPM_FILTER_CONDITION0 =
+    result.fieldKey = field
+    result.matchType = FWP_MATCH_RANGE
+    result.conditionValue.kind = FWP_RANGE
+    result.conditionValue.data.rangeValue = rng
+
+  proc condV4Mask(field: GUID; m: ptr FWP_V4_ADDR_AND_MASK): FWPM_FILTER_CONDITION0 =
+    result.fieldKey = field
+    result.matchType = FWP_MATCH_EQUAL
+    result.conditionValue.kind = FWP_V4_ADDR_MASK
+    result.conditionValue.data.v4AddrMask = m
+
+  proc condV6Mask(field: GUID; m: ptr FWP_V6_ADDR_AND_MASK): FWPM_FILTER_CONDITION0 =
+    result.fieldKey = field
+    result.matchType = FWP_MATCH_EQUAL
+    result.conditionValue.kind = FWP_V6_ADDR_MASK
+    result.conditionValue.data.v6AddrMask = m
+
+  proc condSd(field: GUID; sd: ptr FWP_BYTE_BLOB): FWPM_FILTER_CONDITION0 =
+    result.fieldKey = field
+    result.matchType = FWP_MATCH_EQUAL
+    result.conditionValue.kind = FWP_SECURITY_DESCRIPTOR
+    result.conditionValue.data.sd = sd
+
+  proc condSid(field: GUID; sid: PSID): FWPM_FILTER_CONDITION0 =
+    result.fieldKey = field
+    result.matchType = FWP_MATCH_EQUAL
+    result.conditionValue.kind = FWP_SID
+    result.conditionValue.data.sid = sid
+
   proc addFilter(engine: Handle; key: GUID; name: ptr UncheckedArray[Utf16Char];
       layer: GUID; weight: uint64; actionType: uint32;
       conditions: openArray[FWPM_FILTER_CONDITION0]) =
@@ -472,33 +488,22 @@ when defined(windows):
     for key in [permitV4Key, blockV4Key, permitV6Key, blockV6Key]:
       discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
 
-    # port range condition storage (referenced by pointer)
+    # Shared condition value storage (referenced by pointer; stack
+    # locals here outlive each addFilter call). Addrs are network
+    # order: 127.0.0.0/8 permit, ::1 permit, the proxy port range.
     var lo = FWP_VALUE0(kind: FWP_UINT16)
     lo.data.uint16Value = firstPort
     var hi = FWP_VALUE0(kind: FWP_UINT16)
     hi.data.uint16Value = lastPort
     var rng = FWP_RANGE0(valueLow: lo, valueHigh: hi)
-    var portCond: FWPM_FILTER_CONDITION0
-    portCond.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT
-    portCond.matchType = FWP_MATCH_RANGE
-    portCond.conditionValue.kind = FWP_RANGE
-    portCond.conditionValue.data.rangeValue = addr rng
-
-    # v4 permit: remote addr in 127.0.0.0/8 AND remote port in range.
-    # Addrs are in network order: 127.0.0.0 = 0x7F000000, /8 mask.
+    var portCond = condRangePort(FWPM_CONDITION_IP_REMOTE_PORT, addr rng)
     var v4am = FWP_V4_ADDR_AND_MASK(addr4: 0x7F000000'u32,
       mask: 0xFF000000'u32)
-    var permitV4Cond: array[2, FWPM_FILTER_CONDITION0]
-    permitV4Cond[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
-    permitV4Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV4Cond[0].conditionValue.kind = FWP_V4_ADDR_MASK
-    permitV4Cond[0].conditionValue.data.v4AddrMask = addr v4am
-    permitV4Cond[1] = portCond
-    addFilter(engine, permitV4Key, allocWide("sandwall-permit-v4"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64,
-      FWP_ACTION_PERMIT, permitV4Cond)
+    var loopback6: FWP_V6_ADDR_AND_MASK
+    loopback6.v6addr[15] = 1
+    loopback6.prefixLength = 128
 
-    # block condition: ALE_USER_ID vs SDDL-built security descriptor
+    # Block: ALE_USER_ID matches the SDDL-built descriptor for userSid.
     var sd: pointer
     var sdSize: DWORD
     let sddl = allocWide(sddlForUserSid(userSid))
@@ -506,32 +511,24 @@ when defined(windows):
         addr sd, addr sdSize) == 0:
       fail("ConvertStringSecurityDescriptorToSecurityDescriptorW",
         DWORD(getLastError()))
-    defer: discard localFree(sd)
+    defer: localFree(sd)
     var sdBlob = FWP_BYTE_BLOB(size: uint32(sdSize), data: cast[ptr uint8](sd))
-    var blockCond: array[1, FWPM_FILTER_CONDITION0]
-    blockCond[0].fieldKey = FWPM_CONDITION_ALE_USER_ID
-    blockCond[0].matchType = FWP_MATCH_EQUAL
-    blockCond[0].conditionValue.kind = FWP_SECURITY_DESCRIPTOR
-    blockCond[0].conditionValue.data.sd = addr sdBlob
+    let blockCond = [condSd(FWPM_CONDITION_ALE_USER_ID, addr sdBlob)]
 
+    # v4/v6 permit (loopback + port range), then the block (user SID).
+    let permitV4 = [condV4Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v4am),
+                    portCond]
+    addFilter(engine, permitV4Key, allocWide("sandwall-permit-v4"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64,
+      FWP_ACTION_PERMIT, permitV4)
     addFilter(engine, blockV4Key, allocWide("sandwall-block-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64,
       FWP_ACTION_BLOCK, blockCond)
-
-    # v6 permit: remote addr == ::1 AND remote port in range
-    var loopback6: FWP_V6_ADDR_AND_MASK
-    loopback6.v6addr[15] = 1
-    loopback6.prefixLength = 128
-    var permitV6Cond: array[2, FWPM_FILTER_CONDITION0]
-    permitV6Cond[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
-    permitV6Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV6Cond[0].conditionValue.kind = FWP_V6_ADDR_MASK
-    permitV6Cond[0].conditionValue.data.v6AddrMask = addr loopback6
-    permitV6Cond[1] = portCond
+    let permitV6 = [condV6Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr loopback6),
+                    portCond]
     addFilter(engine, permitV6Key, allocWide("sandwall-permit-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64,
-      FWP_ACTION_PERMIT, permitV6Cond)
-
+      FWP_ACTION_PERMIT, permitV6)
     addFilter(engine, blockV6Key, allocWide("sandwall-block-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64,
       FWP_ACTION_BLOCK, blockCond)
@@ -586,9 +583,6 @@ when defined(windows):
       # WSAEACCES = 10013: blocked by the fence
       result = (if e.errorCode.int32 == 10013'i32: 0 else: 2)
 
-  proc convertSidToStringSidW(sid: PSID; str: ptr WideCString): WINBOOL {.stdcall,
-      dynlib: "advapi32", importc: "ConvertSidToStringSidW".}
-
   proc getAppContainerSidString*(): string =
     ## Derive the `sandwall.fs` AppContainer SID and return it as its
     ## canonical S-string form (S-1-15-2-...). Uses the existing SDDL
@@ -603,7 +597,7 @@ when defined(windows):
     if convertSidToStringSidW(sid, addr wstr) == 0:
       fail("ConvertSidToStringSidW", DWORD(getLastError()))
     result = $wstr
-    discard localFree(wstr)
+    localFree(wstr)
 
   proc getAcSidRaw*(): PSID =
     ## Derive the raw PSID for the `sandwall.fs` AppContainer.
@@ -617,49 +611,25 @@ when defined(windows):
     ensureProviderAndSublayer(engine)
     let acSid = getAcSidRaw()
 
+    # Same loopback permits as the user fence, but keyed on the
+    # AppContainer package SID instead of the port range + user SD.
     var v4am = FWP_V4_ADDR_AND_MASK(addr4: 0x7F000000'u32, mask: 0xFF000000'u32)
-    var permitV4Cond: array[2, FWPM_FILTER_CONDITION0]
-    permitV4Cond[0].fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID
-    permitV4Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV4Cond[0].conditionValue.kind = FWP_SID
-    permitV4Cond[0].conditionValue.data.sid = acSid
-    permitV4Cond[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
-    permitV4Cond[1].matchType = FWP_MATCH_EQUAL
-    permitV4Cond[1].conditionValue.kind = FWP_V4_ADDR_MASK
-    permitV4Cond[1].conditionValue.data.v4AddrMask = addr v4am
-    addFilter(engine, parseGuid(acPermitV4GuidText), allocWide("sandwall-ac-permit-v4"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV4Cond)
-
-    var blockV4Cond: array[1, FWPM_FILTER_CONDITION0]
-    blockV4Cond[0].fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID
-    blockV4Cond[0].matchType = FWP_MATCH_EQUAL
-    blockV4Cond[0].conditionValue.kind = FWP_SID
-    blockV4Cond[0].conditionValue.data.sid = acSid
-    addFilter(engine, parseGuid(acBlockV4GuidText), allocWide("sandwall-ac-block-v4"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockV4Cond)
-
     var loopback6: FWP_V6_ADDR_AND_MASK
     loopback6.v6addr[15] = 1
     loopback6.prefixLength = 128
-    var permitV6Cond: array[2, FWPM_FILTER_CONDITION0]
-    permitV6Cond[0].fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID
-    permitV6Cond[0].matchType = FWP_MATCH_EQUAL
-    permitV6Cond[0].conditionValue.kind = FWP_SID
-    permitV6Cond[0].conditionValue.data.sid = acSid
-    permitV6Cond[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS
-    permitV6Cond[1].matchType = FWP_MATCH_EQUAL
-    permitV6Cond[1].conditionValue.kind = FWP_V6_ADDR_MASK
-    permitV6Cond[1].conditionValue.data.v6AddrMask = addr loopback6
-    addFilter(engine, parseGuid(acPermitV6GuidText), allocWide("sandwall-ac-permit-v6"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV6Cond)
+    let pkgSid = condSid(FWPM_CONDITION_ALE_PACKAGE_ID, acSid)
 
-    var blockV6Cond: array[1, FWPM_FILTER_CONDITION0]
-    blockV6Cond[0].fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID
-    blockV6Cond[0].matchType = FWP_MATCH_EQUAL
-    blockV6Cond[0].conditionValue.kind = FWP_SID
-    blockV6Cond[0].conditionValue.data.sid = acSid
+    let permitV4 = [pkgSid, condV4Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v4am)]
+    addFilter(engine, parseGuid(acPermitV4GuidText), allocWide("sandwall-ac-permit-v4"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV4)
+    let blockCond = [pkgSid]
+    addFilter(engine, parseGuid(acBlockV4GuidText), allocWide("sandwall-ac-block-v4"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockCond)
+    let permitV6 = [pkgSid, condV6Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr loopback6)]
+    addFilter(engine, parseGuid(acPermitV6GuidText), allocWide("sandwall-ac-permit-v6"),
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV6)
     addFilter(engine, parseGuid(acBlockV6GuidText), allocWide("sandwall-ac-block-v6"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockV6Cond)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallAcFence*() =
     let engine = openEngine(allocWide("sandwall-ac-setup"))

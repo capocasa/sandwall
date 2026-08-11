@@ -148,17 +148,7 @@ filesystem policy are enforced with no setup step.
                         writeFile(p, renderPolicy(rules))
                         p
         wallProxy = startWallProxy(polPath, projectDir)
-        let hp = "http://127.0.0.1:" & $wallProxy.port
-        let sp = "socks5h://127.0.0.1:" & $wallProxy.port
-        putEnv("http_proxy", hp)
-        putEnv("https_proxy", hp)
-        putEnv("HTTP_PROXY", hp)
-        putEnv("HTTPS_PROXY", hp)
-        putEnv("ALL_PROXY", sp)
-        putEnv("all_proxy", sp)
-        putEnv("NO_PROXY", "")
-        putEnv("no_proxy", "")
-        putEnv("WALL_PROXY_PORT", $wallProxy.port)
+        setProxyEnv(wallProxy.port)
         # Check if the WFP fence is installed. If not, warn: the child
         # will have open network access despite host rules.
         let fenceInstalled = try: acFenceStatus().installed

@@ -20,29 +20,15 @@
 import ./paths
 
 when defined(windows):
-  import std/[winlean, widestrs, sets, syncio]
+  import std/winlean except PSID
+  import std/[widestrs, sets, syncio]
+  import ./wall/winffi
+  export winffi.PSID
 
-  # --- AppContainer profile FFI (userenv.dll) ---
-
-  type
-    PSID* = pointer
-    # winlean has no HRESULT alias.
-    HRESULT = int32
-
-  # The profile APIs live in userenv.dll, not kernel32/advapi32.
-  # CreateAppContainerProfile returns ERROR_ALREADY_EXISTS (0x800700b7)
-  # when the profile exists from a previous run; the SID is then obtained
-  # via DeriveAppContainerSidFromAppContainerName.
-  proc createAppContainerProfile(name, display, desc: WideCString;
-      caps: pointer; capCount: DWORD; sid: ptr PSID): HRESULT {.stdcall,
-      dynlib: "userenv", importc: "CreateAppContainerProfile".}
-
-  proc deriveAppContainerSidFromAppContainerName(name: WideCString;
-      sid: ptr PSID): HRESULT {.stdcall, dynlib: "userenv",
-      importc: "DeriveAppContainerSidFromAppContainerName".}
-
-  proc localFree(hMem: pointer): pointer {.stdcall, dynlib: "kernel32",
-      importc: "LocalFree".}
+  # AppContainer profile FFI lives in wall/winffi.nim (shared with
+  # wfp.nim and winuser.nim). CreateAppContainerProfile returns
+  # ERROR_ALREADY_EXISTS (0x800700b7) when the profile exists from a
+  # previous run; the SID then comes from deriveAppContainerSidFromAppContainerName.
 
   # --- ACL stamping FFI (accctrl.h / aclapi.h / winnt.h) ---
 
@@ -159,11 +145,7 @@ when defined(windows):
   # descriptor. The integrity label is applied via an SDDL SACL because
   # building a SYSTEM_MANDATORY_LABEL ACE by hand (SetEntriesInAcl rewrites
   # the ACE type) does not survive SetNamedSecurityInfo - verified by probes.
-  proc convertStringSecurityDescriptorToSecurityDescriptorW(sddl: WideCString;
-      rev: DWORD; sd: ptr pointer; size: ptr uint): WINBOOL {.stdcall,
-      dynlib: "advapi32",
-      importc: "ConvertStringSecurityDescriptorToSecurityDescriptorW".}
-
+  # convertStringSecurityDescriptorToSecurityDescriptorW comes from winffi.
   proc getSecurityDescriptorSacl(sd: pointer; present: ptr WINBOOL;
       sacl: ptr PACL; defaulted: ptr WINBOOL): WINBOOL {.stdcall,
       dynlib: "advapi32", importc: "GetSecurityDescriptorSacl".}
@@ -174,9 +156,7 @@ when defined(windows):
   # IsEqualSid/EqualSid/RtlEqualMemory are all compiler intrinsics on Windows
   # (none exported from any dll - "could not import"), so compare SIDs in pure
   # Nim: equal length plus a raw byte compare via equalMem.
-  proc getLengthSid(sid: PSID): DWORD {.stdcall, dynlib: "advapi32",
-      importc: "GetLengthSid".}
-
+  # getLengthSid comes from winffi.
   proc sameSid(a, b: PSID): bool =
     let la = getLengthSid(a)
     if la != getLengthSid(b): return false
@@ -302,7 +282,7 @@ when defined(windows):
       raise newException(OSError,
         "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
         " (error " & $rc0 & ")")
-    defer: discard localFree(sd)
+    defer: localFree(sd)
     var ea = buildExplicitAccess(sid, mode, rights, inheritance)
     var newAcl: PACL = nil
     let rc = setEntriesInAcl(1, addr ea, oldDacl, addr newAcl)
@@ -311,7 +291,7 @@ when defined(windows):
         "sandwall windows-acl: SetEntriesInAcl failed on " & path &
         " (error " & $rc & ")")
     # SetEntriesInAcl allocates with LocalAlloc; LocalFree releases it.
-    defer: discard localFree(newAcl)
+    defer: localFree(newAcl)
     writeDacl(path, newAcl)
 
   proc stampAce*(path: string; sid: PSID; mode: ACCESS_MODE;
@@ -346,7 +326,7 @@ when defined(windows):
       raise newException(OSError,
         "sandwall windows-acl: SDDL parse of label failed (error " &
         $getLastError() & ")")
-    defer: discard localFree(sd)
+    defer: localFree(sd)
     var present: WINBOOL = 0
     var sacl: PACL = nil
     var defaulted: WINBOOL = 0
@@ -395,7 +375,7 @@ when defined(windows):
       raise newException(OSError,
         "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
         " (error " & $rc0 & ")")
-    defer: discard localFree(sd)
+    defer: localFree(sd)
 
     # Compute the surviving size and count, skipping our SID's ACEs.
     let aceCount = cast[ptr uint16](cast[uint](oldDacl) + 2)[]

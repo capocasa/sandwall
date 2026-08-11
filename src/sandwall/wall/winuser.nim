@@ -23,6 +23,7 @@
 
 when defined(windows):
   import std/[winlean, widestrs, os, syncio, strutils]
+  import ./winffi
 
   {.passL: "-lnetapi32 -lbcrypt -lcrypt32".}
 
@@ -95,11 +96,7 @@ when defined(windows):
       referencedDomainName: WideCString; cchReferencedDomainName: ptr DWORD;
       peUse: ptr SID_NAME_USE): WINBOOL {.stdcall, dynlib: "advapi32",
       importc: "LookupAccountNameW".}
-  proc convertSidToStringSidW(sid: pointer;
-      stringSid: ptr WideCString): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "ConvertSidToStringSidW".}
-  proc localFree(hMem: pointer): pointer {.stdcall, dynlib: "kernel32",
-      importc: "LocalFree".}
+  # convertSidToStringSidW is shared in winffi; localFree comes from winlean.
 
   proc bcryptGenRandom(hAlgorithm: pointer; pbBuffer: ptr byte;
       cbBuffer: uint32; dwFlags: uint32): int32 {.stdcall,
@@ -164,7 +161,7 @@ when defined(windows):
     if cryptProtectData(addr input, nil, nil, nil, nil,
         DWORD(CRYPTPROTECT_UI_FORBIDDEN), addr output) == 0:
       fail("CryptProtectData")
-    defer: discard localFree(output.pbData)
+    defer: localFree(output.pbData)
     let dir = credPath()
     createDir(dir)
     var blob = newString(output.cbData.int)
@@ -185,7 +182,7 @@ when defined(windows):
       if cryptUnprotectData(addr input, nil, nil, nil, nil,
           DWORD(CRYPTPROTECT_UI_FORBIDDEN), addr output) == 0:
         return (false, "")
-      defer: discard localFree(output.pbData)
+      defer: localFree(output.pbData)
       var pw = newString(output.cbData.int)
       if pw.len > 0:
         copyMem(addr pw[0], output.pbData, pw.len)
@@ -210,9 +207,9 @@ when defined(windows):
         addr cchDomain, addr use) == 0:
       return ""
     var str: WideCString
-    if convertSidToStringSidW(sid, addr str) == 0:
+    if convertSidToStringSidW(cast[winffi.PSID](sid), addr str) == 0:
       fail("ConvertSidToStringSidW")
-    defer: discard localFree(str)
+    defer: localFree(str)
     $str
 
   proc setupSandwallUser*(): string =
