@@ -20,26 +20,22 @@
 ##   /            absolute path (POSIX)
 ##   X:           absolute path (Windows drive, e.g. C:\work)
 ##   ~            home-dir path
-##   .            path relative to the project dir; a bare access word
-##                with no target means the project dir itself
-##   [0-9A-Za-z]  host rule: hostname, IPv4, or IPv6 address, with an
+##   .            path relative to the project dir (`./foo`); a bare
+##                access word with no target means the project dir
+##                itself
+##   (else)       host rule: hostname, IPv4, or IPv6 address, with an
 ##                optional :port suffix (host:443, [::1]:8080). No port
-##                means all ports (stored as port 0)
-##   (else)       name that fails host validation (e.g. `src/foo`,
-##                `a b`): treated as a project-relative path. A bare
-##                single-label word is ambiguous; the host reading
-##                wins, so write `./src` (or `dir/src`) when you mean
-##                the project path
+##                means all ports (stored as port 0). A bare word is a
+##                host, never a path; targets that fail host validation
+##                are dropped
 ##
 ## `allow *` is special: a host rule matching all networks, i.e. "no
 ## network restrictions".
 ##
 ## Display and append contract path targets back to the portable form:
-## under the project dir as a relative name, or the bare target for
-## the project dir itself (a contracted bare single label like `src`
-## is written `./src` so it does not re-read as a host), under home as
-## `~/...`; everything else stays absolute. Internal rule storage
-## keeps canonical absolute paths.
+## under the project dir as `./name` (bare target for the project dir
+## itself), under home as `~/...`; everything else stays absolute.
+## Internal rule storage keeps canonical absolute paths.
 ##
 ## Rules run top-to-bottom; for paths, the last rule whose root covers a
 ## concrete path wins. Anything unmentioned is denied.
@@ -163,31 +159,26 @@ proc parseHost*(rest: string): tuple[host: string, port: uint16] =
 
 proc classifyTarget*(rest: string): RuleKind =
   ## Path or host, per the first-character convention in the module
-  ## docs. A bare name like `src/foo` (slash, space, or a Windows
-  ## drive marker inside) is a project-relative path, not a host.
+  ## docs: `./foo` is a path, a bare `foo` is a host. Targets that
+  ## fail host validation are dropped by parseHost, never re-read as
+  ## paths.
   if rest.len == 0: return rkPath
   let c = rest[0]
   if c in {'/', '~', '.'}: rkPath
   elif isAbsTarget(rest): rkPath
-  elif rest == "*" or rest.allCharsInSet({'0'..'9', 'a'..'f', 'A'..'F', ':'}): rkHost
-  elif rest.contains({'/', ' ', '\\'}): rkPath
-  elif rest.contains('.') or rest.contains(':') or isValidHost(rest): rkHost
-  else: rkPath
+  else: rkHost
 
 # ---------------------------------------------------------------- paths
 
 proc contractPath*(path, projectDir: string): string =
   ## The portable policy-file form of an absolute cleaned path: under
-  ## `projectDir` as a relative name (empty target, i.e. the bare verb,
-  ## for the project dir itself), under home as `~/...`, else absolute.
+  ## `projectDir` as `./name` (empty target, i.e. the bare verb, for
+  ## the project dir itself), under home as `~/...`, else absolute.
   ## Display and append only; internal rule storage stays absolute.
   let proj = projectDir.normalizedPath
   if path == proj: return ""
   if path.len > proj.len and path.startsWith(proj & DirSep):
-    let rel = path[proj.len + 1 .. ^1]
-    # a bare single label ("src") would re-read as a host, not a path
-    if rel.contains(DirSep) or rel.startsWith("."): return rel
-    return "." & DirSep & rel
+    return "." & DirSep & path[proj.len + 1 .. ^1]
   let home = getHomeDir().normalizedPath
   if home.len > 1 or (home.len == 1 and home != $DirSep):
     if path == home: return "~"
@@ -323,7 +314,7 @@ proc renderPolicy*(rules: openArray[Rule];
   ## Human-readable dump of the effective rules, newest last (matching
   ## file order). Hidden rules (implicit guards) are enforced but not
   ## shown. With a non-empty `projectDir`, path targets contract to the
-  ## portable form (`foo` under the project dir, bare for the project
+  ## portable form (`./foo` under the project dir, bare for the project
   ## dir itself, `~/...` under home); with empty, paths print absolute.
   var shown = 0
   for r in rules:
@@ -354,11 +345,11 @@ proc replaceAccess*(text, target, verb: string;
   ## `deny.corp.internal` is never mistaken for a deny rule. Host rules
   ## compare on the (host, port) pair, and a malformed host line is
   ## never stripped. Path rules compare on their resolved absolute
-  ## form when `projectDir` is given, so `foo`, `./foo`, and
-  ## `/proj/dir/foo` all match the same rule; without `projectDir`
-  ## they compare literal, an exact string match or a bare verb (the
-  ## project dir) when `target` is empty. Lines that fail to parse
-  ## keep their place, untouched.
+  ## form when `projectDir` is given, so `./foo` and `/proj/dir/foo`
+  ## match the same rule; without `projectDir` they compare literal,
+  ## an exact string match or a bare verb (the project dir) when
+  ## `target` is empty. Lines that fail to parse keep their place,
+  ## untouched.
   let cmpPaths = projectDir.len > 0
   let targetKey =
     if classifyTarget(target) == rkPath:
@@ -402,12 +393,12 @@ proc appendRule*(policyFile, target: string; access: AccessKind;
                  projectDir = ""): bool =
   ## Add a rule to `policyFile`. With a non-empty `projectDir` (the
   ## normal case), a path `target` is normalized to the portable file
-  ## form first: `/proj/dir/foo` and `./foo` both write as `foo`, the
-  ## project dir itself as the bare verb, home paths as `~/...`.
-  ## Earlier rules for the same target are stripped, so flipping
-  ## allow -> deny (or back) moves the rule to the end instead of
-  ## stacking duplicates; other targets keep their order. Host
-  ## targets pass through unchanged. Returns false on write failure.
+  ## form first: `/proj/dir/foo` writes as `./foo`, the project dir
+  ## itself as the bare verb, home paths as `~/...`. Earlier rules for
+  ## the same target are stripped, so flipping allow -> deny (or back)
+  ## moves the rule to the end instead of stacking duplicates; other
+  ## targets keep their order. Host targets pass through unchanged.
+  ## Returns false on write failure.
   let word =
     case access
     of akDeny: "deny"

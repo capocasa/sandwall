@@ -18,20 +18,21 @@ suite "target classification":
     check classifyTarget("./foo") == rkPath
     check classifyTarget(".") == rkPath
     check classifyTarget("") == rkPath
-  test "bare names are project-relative paths":
-    # a bare single-label word is ambiguous: a valid hostname wins,
-    # anything else is a project-relative path
+  test "bare words are hosts, never paths":
+    # ./foo is the only relative path form; a bare word classifies as
+    # a host and invalid ones are dropped by parseHost, never re-read
+    # as paths
     check classifyTarget("foo") == rkHost
-    check classifyTarget("src/main.nim") == rkPath
-    check classifyTarget("a b") == rkPath
+    check classifyTarget("src/main.nim") == rkHost
+    check classifyTarget("a b") == rkHost
   test "hosts":
     check classifyTarget("api.stripe.com") == rkHost
     check classifyTarget("1.2.3.4") == rkHost
     check classifyTarget("::1") == rkHost
     check classifyTarget("*") == rkHost
-    # a name with a space can never be a host; bad dotted targets
-    # fail parseHost later and are dropped, never become paths
-    check classifyTarget("bad host!") == rkPath
+    check classifyTarget("localhost") == rkHost
+    # bad targets still classify as hosts; parseHost drops them
+    check classifyTarget("bad host!") == rkHost
     check classifyTarget("999.1.1.1") == rkHost
 
 suite "host parsing":
@@ -85,14 +86,14 @@ suite "path parsing":
     check p[0].path == (proj / "src").normalizedPath
   test "bare relative resolves against project dir":
     let p = parsePolicy("allow src/foo\ndeny .git\n", proj)
-    check p.len == 2
-    check p[0].path == (proj / "src/foo").normalizedPath
-    check p[1].path == (proj / ".git").normalizedPath
-  test "bare single label is a host, not a path":
-    # ambiguity resolves to the host; project-relative paths need a
-    # slash, a dot, or ./
+    check p.len == 1
+    # src/foo is a bare word: a host (and an invalid one, dropped),
+    # never a project-relative path. .git is the ./ path form.
+    check p[0].path == (proj / ".git").normalizedPath
+  test "bare words are hosts, not paths":
     let p = parsePolicy("allow out\n", proj)
-    check p.len == 1 and p[0].kind == rkHost
+    check p.len == 1 and p[0].kind == rkHost and p[0].host == "out"
+    check parsePolicy("allow src/foo\n", proj).len == 0  # invalid host
   test "bad dotted host is dropped, not turned into a path":
     check parsePolicy("allow 999.1.1.1\n", proj).len == 0
   test "absolute kept, cleaned":
@@ -101,10 +102,8 @@ suite "path parsing":
       check p[0].path == "/etc"
   test "comments, blanks, garbage skipped":
     let p = parsePolicy("# note\n\nallow /tmp\nallow bad host!\n", proj)
-    check p.len == 2
+    check p.len == 1
     check p[0].path == (when defined(windows): "\\tmp" else: "/tmp")
-    # a name with a space is a path line, not a bad host
-    check p[1].kind == rkPath
 
 suite "checkPath":
   const text = "deny /\nallow /tmp\nallow ./\nreadonly /var\n"
@@ -234,9 +233,9 @@ suite "render and append":
 suite "contract and normalize":
   test "contractPath":
     check contractPath((proj / "foo").normalizedPath, proj) == "./foo"
-    check contractPath((proj / "a" / "foo").normalizedPath, proj) == "a/foo"
+    check contractPath((proj / "a" / "foo").normalizedPath, proj) == "./a/foo"
     check contractPath(proj.normalizedPath, proj) == ""
-    check contractPath((proj / ".git").normalizedPath, proj) == ".git"
+    check contractPath((proj / ".git").normalizedPath, proj) == "./.git"
     when not defined(windows):
       check contractPath("/etc/passwd", proj) == "/etc/passwd"
       let home = getHomeDir().normalizedPath
@@ -244,10 +243,9 @@ suite "contract and normalize":
       check contractPath(home, proj) == "~"
 
   test "renderPolicy contracts paths with projectDir":
-    let pol = parsePolicy("allow\ndeny .git\nreadonly ~/x\nallow /etc\n", proj)
+    let pol = parsePolicy("allow\ndeny ./.git\nreadonly ~/x\nallow /etc\n", proj)
     let s = renderPolicy(pol, proj)
-    check "allow     \n" in s or "allow   \n" in s
-    check "deny      .git\n" in s or "deny    .git\n" in s
+    check "./.git" in s
     check "~/x" in s
     check proj notin s
     when not defined(windows):
@@ -258,28 +256,25 @@ suite "contract and normalize":
     removeFile(f)
     check appendRule(f, (proj / "src").normalizedPath, akReadOnly, proj)
     check appendRule(f, "./build", akWritable, proj)
-    check appendRule(f, "out dir/x", akWritable, proj)
-    check readFile(f) == "readonly ./src\nallow ./build\nallow out dir/x\n"
+    check readFile(f) == "readonly ./src\nallow ./build\n"
     # absolute home target contracts to ~
     let home = getHomeDir().normalizedPath
     check appendRule(f, home / "dl", akDeny, proj)
-    check readFile(f) == "readonly ./src\nallow ./build\nallow out dir/x\ndeny ~/dl\n"
+    check readFile(f) == "readonly ./src\nallow ./build\ndeny ~/dl\n"
     removeFile(f)
 
-  test "appendRule dedupes ./foo, foo, and absolute forms":
+  test "appendRule dedupes ./foo and absolute forms":
     let f = getTempDir() / "sandwall-test-policy"
     writeFile(f, "# c\nallow ./src\nreadonly /lib\n")
-    check appendRule(f, "dir/src", akDeny, proj)
-    check readFile(f) == "# c\nallow ./src\nreadonly /lib\ndeny dir/src\n"
     check appendRule(f, "./src", akDeny, proj)
-    check readFile(f) == "# c\nreadonly /lib\ndeny dir/src\ndeny ./src\n"
+    check readFile(f) == "# c\nreadonly /lib\ndeny ./src\n"
     check appendRule(f, (proj / "src").normalizedPath, akWritable, proj)
-    check readFile(f) == "# c\nreadonly /lib\ndeny dir/src\nallow ./src\n"
+    check readFile(f) == "# c\nreadonly /lib\nallow ./src\n"
     # a pre-existing absolute rule in the file matches the same path
     writeFile(f, "deny " & (proj / "x").normalizedPath & "\n")
     check appendRule(f, "./x", akWritable, proj)
     check readFile(f) == "allow ./x\n"
-    # host targets pass through unchanged even with projectDir set
+    # bare words are hosts: untouched by path logic, pass through
     check appendRule(f, "a.com:443", akWritable, proj)
     check "allow a.com:443" in readFile(f)
     removeFile(f)
