@@ -24,10 +24,22 @@
 ##                with no target means the project dir itself
 ##   [0-9A-Za-z]  host rule: hostname, IPv4, or IPv6 address, with an
 ##                optional :port suffix (host:443, [::1]:8080). No port
-##                means all ports (stored as port 0).
+##                means all ports (stored as port 0)
+##   (else)       name that fails host validation (e.g. `src/foo`,
+##                `a b`): treated as a project-relative path. A bare
+##                single-label word is ambiguous; the host reading
+##                wins, so write `./src` (or `dir/src`) when you mean
+##                the project path
 ##
 ## `allow *` is special: a host rule matching all networks, i.e. "no
 ## network restrictions".
+##
+## Display and append contract path targets back to the portable form:
+## under the project dir as a relative name, or the bare target for
+## the project dir itself (a contracted bare single label like `src`
+## is written `./src` so it does not re-read as a host), under home as
+## `~/...`; everything else stays absolute. Internal rule storage
+## keeps canonical absolute paths.
 ##
 ## Rules run top-to-bottom; for paths, the last rule whose root covers a
 ## concrete path wins. Anything unmentioned is denied.
@@ -82,14 +94,6 @@ proc isAbsTarget*(rest: string): bool =
   if rest.len == 0: return false
   if rest[0] == '/': return true
   rest.len >= 2 and rest[0] in {'A'..'Z', 'a'..'z'} and rest[1] == ':'
-
-proc classifyTarget*(rest: string): RuleKind =
-  ## Path or host, per the first-character convention in the module docs.
-  if rest.len == 0: return rkPath
-  let c = rest[0]
-  if c in {'/', '~', '.'}: rkPath
-  elif isAbsTarget(rest): rkPath
-  else: rkHost
 
 # ---------------------------------------------------------------- hosts
 
@@ -157,7 +161,39 @@ proc parseHost*(rest: string): tuple[host: string, port: uint16] =
     raise newException(ValueError, "bad host: " & rest)
   (h, port)
 
+proc classifyTarget*(rest: string): RuleKind =
+  ## Path or host, per the first-character convention in the module
+  ## docs. A bare name like `src/foo` (slash, space, or a Windows
+  ## drive marker inside) is a project-relative path, not a host.
+  if rest.len == 0: return rkPath
+  let c = rest[0]
+  if c in {'/', '~', '.'}: rkPath
+  elif isAbsTarget(rest): rkPath
+  elif rest == "*" or rest.allCharsInSet({'0'..'9', 'a'..'f', 'A'..'F', ':'}): rkHost
+  elif rest.contains({'/', ' ', '\\'}): rkPath
+  elif rest.contains('.') or rest.contains(':') or isValidHost(rest): rkHost
+  else: rkPath
+
 # ---------------------------------------------------------------- paths
+
+proc contractPath*(path, projectDir: string): string =
+  ## The portable policy-file form of an absolute cleaned path: under
+  ## `projectDir` as a relative name (empty target, i.e. the bare verb,
+  ## for the project dir itself), under home as `~/...`, else absolute.
+  ## Display and append only; internal rule storage stays absolute.
+  let proj = projectDir.normalizedPath
+  if path == proj: return ""
+  if path.len > proj.len and path.startsWith(proj & DirSep):
+    let rel = path[proj.len + 1 .. ^1]
+    # a bare single label ("src") would re-read as a host, not a path
+    if rel.contains(DirSep) or rel.startsWith("."): return rel
+    return "." & DirSep & rel
+  let home = getHomeDir().normalizedPath
+  if home.len > 1 or (home.len == 1 and home != $DirSep):
+    if path == home: return "~"
+    if path.len > home.len and
+        path.startsWith(home & DirSep): return "~" & path[home.len .. ^1]
+  path
 
 proc normalizePolicyPath*(p: string; projectDir: string): string =
   ## Resolve a policy path target to an absolute, cleaned form. An empty
@@ -282,10 +318,13 @@ proc resolve*(rules: openArray[Rule]): Resolved =
           for b in baselineRead:
             if isPathUnder(k, b): result.denied.add k; break
 
-proc renderPolicy*(rules: openArray[Rule]): string =
+proc renderPolicy*(rules: openArray[Rule];
+                   projectDir = ""): string =
   ## Human-readable dump of the effective rules, newest last (matching
   ## file order). Hidden rules (implicit guards) are enforced but not
-  ## shown.
+  ## shown. With a non-empty `projectDir`, path targets contract to the
+  ## portable form (`foo` under the project dir, bare for the project
+  ## dir itself, `~/...` under home); with empty, paths print absolute.
   var shown = 0
   for r in rules:
     if not r.hidden: inc shown
@@ -300,22 +339,31 @@ proc renderPolicy*(rules: openArray[Rule]): string =
       of akWritable: "allow   "
     case r.kind
     of rkPath:
-      result.add label & "  " & r.path & "\n"
+      let p = if projectDir.len > 0: contractPath(r.path, projectDir)
+              else: r.path
+      result.add label & "  " & p & "\n"
     of rkHost:
       let suffix = if r.port == 0: "" else: ":" & $r.port
       result.add label & "  " & r.host & suffix & "\n"
 
-proc replaceAccess*(text, target, verb: string): string =
+proc replaceAccess*(text, target, verb: string;
+                    projectDir = ""): string =
   ## Strip existing rules for `target` that carry a real access verb and
   ## append `verb target` at the end. A rule only matches when the verb
   ## stands alone at a word boundary, so a hostname like
-  ## `deny.corp.internal` is never mistaken for a deny rule. Path rules
-  ## compare literal: an exact string match, or a bare verb (which means
-  ## the project dir) when `target` is empty. Host rules compare on the
-  ## (host, port) pair, and a malformed host line is never stripped.
-  ## Lines that fail to parse keep their place, untouched.
+  ## `deny.corp.internal` is never mistaken for a deny rule. Host rules
+  ## compare on the (host, port) pair, and a malformed host line is
+  ## never stripped. Path rules compare on their resolved absolute
+  ## form when `projectDir` is given, so `foo`, `./foo`, and
+  ## `/proj/dir/foo` all match the same rule; without `projectDir`
+  ## they compare literal, an exact string match or a bare verb (the
+  ## project dir) when `target` is empty. Lines that fail to parse
+  ## keep their place, untouched.
+  let cmpPaths = projectDir.len > 0
   let targetKey =
-    if classifyTarget(target) == rkPath: ("\x01", target)
+    if classifyTarget(target) == rkPath:
+      if cmpPaths: ("\x01", normalizePolicyPath(target, projectDir))
+      else: ("\x01", target)
     else:
       try:
         let (h, p) = parseHost(target)
@@ -336,7 +384,9 @@ proc replaceAccess*(text, target, verb: string): string =
     if first in ["allow", "deny", "readonly"]:
       rest = line[first.len .. ^1].strip(leading = true, trailing = false)
       let ruleKey =
-        if classifyTarget(rest) == rkPath: ("\x01", rest)
+        if classifyTarget(rest) == rkPath:
+          if cmpPaths: ("\x01", normalizePolicyPath(rest, projectDir))
+          else: ("\x01", rest)
         else:
           try:
             let (h, p) = parseHost(rest)
@@ -348,21 +398,27 @@ proc replaceAccess*(text, target, verb: string): string =
     result.add raw & "\n"
   result.add verb & (if target.len > 0: " " & target else: "") & "\n"
 
-proc appendRule*(policyFile, target: string; access: AccessKind): bool =
-  ## Add a rule to `policyFile`. The literal `target` is written as-is
-  ## so relative targets stay relative and the file stays portable and
-  ## human-readable. Earlier rules for the same target are stripped, so
-  ## flipping allow -> deny (or back) moves the rule to the end instead
-  ## of stacking duplicates; other targets keep their order. Returns
-  ## false on write failure.
+proc appendRule*(policyFile, target: string; access: AccessKind;
+                 projectDir = ""): bool =
+  ## Add a rule to `policyFile`. With a non-empty `projectDir` (the
+  ## normal case), a path `target` is normalized to the portable file
+  ## form first: `/proj/dir/foo` and `./foo` both write as `foo`, the
+  ## project dir itself as the bare verb, home paths as `~/...`.
+  ## Earlier rules for the same target are stripped, so flipping
+  ## allow -> deny (or back) moves the rule to the end instead of
+  ## stacking duplicates; other targets keep their order. Host
+  ## targets pass through unchanged. Returns false on write failure.
   let word =
     case access
     of akDeny: "deny"
     of akReadOnly: "readonly"
     of akWritable: "allow"
+  var t = target
+  if projectDir.len > 0 and classifyTarget(t) == rkPath and t.len > 0:
+    t = contractPath(normalizePolicyPath(t, projectDir), projectDir)
   try:
     let text = if fileExists(policyFile): readFile(policyFile) else: ""
-    writeFile(policyFile, replaceAccess(text, target, word))
+    writeFile(policyFile, replaceAccess(text, t, word, projectDir))
   except CatchableError:
     return false
   true

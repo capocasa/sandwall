@@ -18,11 +18,21 @@ suite "target classification":
     check classifyTarget("./foo") == rkPath
     check classifyTarget(".") == rkPath
     check classifyTarget("") == rkPath
+  test "bare names are project-relative paths":
+    # a bare single-label word is ambiguous: a valid hostname wins,
+    # anything else is a project-relative path
+    check classifyTarget("foo") == rkHost
+    check classifyTarget("src/main.nim") == rkPath
+    check classifyTarget("a b") == rkPath
   test "hosts":
     check classifyTarget("api.stripe.com") == rkHost
     check classifyTarget("1.2.3.4") == rkHost
     check classifyTarget("::1") == rkHost
     check classifyTarget("*") == rkHost
+    # a name with a space can never be a host; bad dotted targets
+    # fail parseHost later and are dropped, never become paths
+    check classifyTarget("bad host!") == rkPath
+    check classifyTarget("999.1.1.1") == rkHost
 
 suite "host parsing":
   test "bare hostname, all ports":
@@ -73,14 +83,28 @@ suite "path parsing":
     let p = parsePolicy("readonly ./src\n", proj)
     check p[0].access == akReadOnly
     check p[0].path == (proj / "src").normalizedPath
+  test "bare relative resolves against project dir":
+    let p = parsePolicy("allow src/foo\ndeny .git\n", proj)
+    check p.len == 2
+    check p[0].path == (proj / "src/foo").normalizedPath
+    check p[1].path == (proj / ".git").normalizedPath
+  test "bare single label is a host, not a path":
+    # ambiguity resolves to the host; project-relative paths need a
+    # slash, a dot, or ./
+    let p = parsePolicy("allow out\n", proj)
+    check p.len == 1 and p[0].kind == rkHost
+  test "bad dotted host is dropped, not turned into a path":
+    check parsePolicy("allow 999.1.1.1\n", proj).len == 0
   test "absolute kept, cleaned":
     when not defined(windows):
       let p = parsePolicy("deny /tmp/../etc\n", proj)
       check p[0].path == "/etc"
   test "comments, blanks, garbage skipped":
-    let p = parsePolicy("# note\n\nallow /tmp\n? bogus\n", proj)
-    check p.len == 1
+    let p = parsePolicy("# note\n\nallow /tmp\nallow bad host!\n", proj)
+    check p.len == 2
     check p[0].path == (when defined(windows): "\\tmp" else: "/tmp")
+    # a name with a space is a path line, not a bad host
+    check p[1].kind == rkPath
 
 suite "checkPath":
   const text = "deny /\nallow /tmp\nallow ./\nreadonly /var\n"
@@ -205,4 +229,57 @@ suite "render and append":
     writeFile(f, "deny.corp.internal\nallow ./src\nallow ./src2\n")
     check appendRule(f, "./src", akDeny)
     check readFile(f) == "deny.corp.internal\nallow ./src2\ndeny ./src\n"
+    removeFile(f)
+
+suite "contract and normalize":
+  test "contractPath":
+    check contractPath((proj / "foo").normalizedPath, proj) == "./foo"
+    check contractPath((proj / "a" / "foo").normalizedPath, proj) == "a/foo"
+    check contractPath(proj.normalizedPath, proj) == ""
+    check contractPath((proj / ".git").normalizedPath, proj) == ".git"
+    when not defined(windows):
+      check contractPath("/etc/passwd", proj) == "/etc/passwd"
+      let home = getHomeDir().normalizedPath
+      check contractPath(home / "foo", proj) == "~/foo"
+      check contractPath(home, proj) == "~"
+
+  test "renderPolicy contracts paths with projectDir":
+    let pol = parsePolicy("allow\ndeny .git\nreadonly ~/x\nallow /etc\n", proj)
+    let s = renderPolicy(pol, proj)
+    check "allow     \n" in s or "allow   \n" in s
+    check "deny      .git\n" in s or "deny    .git\n" in s
+    check "~/x" in s
+    check proj notin s
+    when not defined(windows):
+      check "/etc" in s
+
+  test "appendRule normalizes targets to the portable form":
+    let f = getTempDir() / "sandwall-test-policy"
+    removeFile(f)
+    check appendRule(f, (proj / "src").normalizedPath, akReadOnly, proj)
+    check appendRule(f, "./build", akWritable, proj)
+    check appendRule(f, "out dir/x", akWritable, proj)
+    check readFile(f) == "readonly ./src\nallow ./build\nallow out dir/x\n"
+    # absolute home target contracts to ~
+    let home = getHomeDir().normalizedPath
+    check appendRule(f, home / "dl", akDeny, proj)
+    check readFile(f) == "readonly ./src\nallow ./build\nallow out dir/x\ndeny ~/dl\n"
+    removeFile(f)
+
+  test "appendRule dedupes ./foo, foo, and absolute forms":
+    let f = getTempDir() / "sandwall-test-policy"
+    writeFile(f, "# c\nallow ./src\nreadonly /lib\n")
+    check appendRule(f, "dir/src", akDeny, proj)
+    check readFile(f) == "# c\nallow ./src\nreadonly /lib\ndeny dir/src\n"
+    check appendRule(f, "./src", akDeny, proj)
+    check readFile(f) == "# c\nreadonly /lib\ndeny dir/src\ndeny ./src\n"
+    check appendRule(f, (proj / "src").normalizedPath, akWritable, proj)
+    check readFile(f) == "# c\nreadonly /lib\ndeny dir/src\nallow ./src\n"
+    # a pre-existing absolute rule in the file matches the same path
+    writeFile(f, "deny " & (proj / "x").normalizedPath & "\n")
+    check appendRule(f, "./x", akWritable, proj)
+    check readFile(f) == "allow ./x\n"
+    # host targets pass through unchanged even with projectDir set
+    check appendRule(f, "a.com:443", akWritable, proj)
+    check "allow a.com:443" in readFile(f)
     removeFile(f)
