@@ -3,6 +3,16 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.7] - 2026-08-13
+
+### Added
+
+- `Rule.hidden`: rules flagged hidden are enforced by `checkPath` and
+  `resolve` like any other rule but skipped by `renderPolicy`. For
+  implicit guard rules a host application adds on top of the parsed
+  policy (3code uses it to keep its own policy files read-only without
+  showing them in the rule dump).
+
 ## [0.2.4] - 2026-08-08
 
 ### Fixed
