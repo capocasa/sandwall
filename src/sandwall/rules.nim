@@ -53,6 +53,7 @@ type
 
   Rule* = object
     access*: AccessKind
+    hidden*: bool      ## Guard rules: enforced, but not rendered
     case kind*: RuleKind
     of rkPath:
       path*: string        ## canonical absolute path
@@ -283,10 +284,15 @@ proc resolve*(rules: openArray[Rule]): Resolved =
 
 proc renderPolicy*(rules: openArray[Rule]): string =
   ## Human-readable dump of the effective rules, newest last (matching
-  ## file order).
-  if rules.len == 0:
+  ## file order). Hidden rules (implicit guards) are enforced but not
+  ## shown.
+  var shown = 0
+  for r in rules:
+    if not r.hidden: inc shown
+  if shown == 0:
     return "(no sandbox rules)"
   for r in rules:
+    if r.hidden: continue
     let label =
       case r.access
       of akDeny: "deny    "

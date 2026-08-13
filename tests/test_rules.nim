@@ -142,6 +142,28 @@ suite "concatenated levels":
       check pol.checkPath((proj / "f").normalizedPath) == akWritable
 
 suite "render and append":
+  test "hidden rules are enforced but not rendered":
+    var pol = parsePolicy("allow ./\n", proj)
+    pol.add Rule(access: akReadOnly, kind: rkPath, hidden: true,
+                 path: (proj / ".sandbox").normalizedPath)
+    pol.add Rule(access: akDeny, kind: rkPath, hidden: true,
+                 path: (proj / "guarded").normalizedPath)
+    check pol.checkPath((proj / ".sandbox").normalizedPath) == akReadOnly
+    check pol.checkPath((proj / "guarded").normalizedPath) == akDeny
+    check pol.checkPath((proj / "other").normalizedPath) == akWritable
+    let s = renderPolicy(pol)
+    check ".sandbox" notin s
+    check "guarded" notin s
+    check "allow" in s
+    # Hidden rules survive resolve like any other.
+    let r = pol.resolve()
+    check (proj / ".sandbox").normalizedPath in r.readonly
+    # A policy of only hidden rules renders as the empty policy.
+    let onlyHidden = @[Rule(access: akReadOnly, kind: rkPath,
+                            hidden: true,
+                            path: (proj / ".sandbox").normalizedPath)]
+    check renderPolicy(onlyHidden) == "(no sandbox rules)"
+
   test "render shows kinds and ports":
     let pol = parsePolicy("allow ./\nreadonly /lib\ndeny /secret\nallow a.com:443\nallow *\n", proj)
     let s = renderPolicy(pol)
