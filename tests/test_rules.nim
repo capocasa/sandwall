@@ -252,6 +252,8 @@ suite "contract and normalize":
       if resolved != base:
         check contractPath(base / "x", resolved) == "./x"
         check contractPath(resolved / "x", base) == "./x"
+        # nonexistent tail still resolves through the existing prefix
+        check contractPath(base / "missing" / "x", resolved) == "./missing/x"
       removeDir(base)
 
   test "renderPolicy contracts paths with projectDir":

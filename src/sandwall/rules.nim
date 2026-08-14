@@ -174,12 +174,23 @@ proc canonicalForDisplay(p: string): string =
   ## Symlink-resolved form for display contraction only. macOS returns
   ## /var/... from $TMPDIR but /private/var/... from getcwd; comparing
   ## one against the other without resolving makes every temp-dir path
-  ## miss the project prefix and render absolute.
-  try:
-    let r = expandFilename(p)
-    if r.len > 0: r else: p
-  except CatchableError:
-    p
+  ## miss the project prefix and render absolute. Resolution is
+  ## prefix-wise: realpath fails on paths that do not exist yet, so
+  ## resolve the longest existing ancestor and re-append the tail.
+  var dir = p
+  var tail = ""
+  while dir.len > 0:
+    try:
+      let r = expandFilename(dir)
+      if r.len > 0:
+        return if tail.len > 0: r & tail else: r
+    except CatchableError:
+      discard
+    let (head, last) = splitPath(dir)
+    if last.len == 0: break
+    tail = DirSep & last & tail
+    dir = head.normalizedPath
+  p
 
 proc contractPath*(path, projectDir: string): string =
   ## The portable policy-file form of an absolute cleaned path: under
