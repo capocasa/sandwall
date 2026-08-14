@@ -170,15 +170,28 @@ proc classifyTarget*(rest: string): RuleKind =
 
 # ---------------------------------------------------------------- paths
 
+proc canonicalForDisplay(p: string): string =
+  ## Symlink-resolved form for display contraction only. macOS returns
+  ## /var/... from $TMPDIR but /private/var/... from getcwd; comparing
+  ## one against the other without resolving makes every temp-dir path
+  ## miss the project prefix and render absolute.
+  try:
+    let r = expandFilename(p)
+    if r.len > 0: r else: p
+  except CatchableError:
+    p
+
 proc contractPath*(path, projectDir: string): string =
   ## The portable policy-file form of an absolute cleaned path: under
   ## `projectDir` as `./name` (empty target, i.e. the bare verb, for
   ## the project dir itself), under home as `~/...`, else absolute.
   ## Display and append only; internal rule storage stays absolute.
   let proj = projectDir.normalizedPath
-  if path == proj: return ""
-  if path.len > proj.len and path.startsWith(proj & DirSep):
-    return "." & DirSep & path[proj.len + 1 .. ^1]
+  let pathC = canonicalForDisplay(path)
+  let projC = canonicalForDisplay(proj)
+  if pathC == projC: return ""
+  if pathC.len > projC.len and pathC.startsWith(projC & DirSep):
+    return "." & DirSep & pathC[projC.len + 1 .. ^1]
   let home = getHomeDir().normalizedPath
   if home.len > 1 or (home.len == 1 and home != $DirSep):
     if path == home: return "~"

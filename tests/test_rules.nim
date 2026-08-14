@@ -242,6 +242,18 @@ suite "contract and normalize":
       check contractPath(home / "foo", proj) == "~/foo"
       check contractPath(home, proj) == "~"
 
+  test "contractPath matches symlinked forms of the same dir":
+    # macOS: getTempDir returns /var/... while getcwd resolves the
+    # /private symlink; the two must contract to the same ./ form.
+    when defined(posix) and not defined(windows):
+      let base = getTempDir() / ("sandwall-contract-" & $getCurrentProcessId())
+      createDir(base)
+      let resolved = expandFilename(base)
+      if resolved != base:
+        check contractPath(base / "x", resolved) == "./x"
+        check contractPath(resolved / "x", base) == "./x"
+      removeDir(base)
+
   test "renderPolicy contracts paths with projectDir":
     let pol = parsePolicy("allow\ndeny ./.git\nreadonly ~/x\nallow /etc\n", proj)
     let s = renderPolicy(pol, proj)

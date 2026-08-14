@@ -126,3 +126,11 @@ when defined(macosx):
       check "(allow network-outbound (remote ip \"localhost:*\"))" in fenced
       check "(allow network-inbound (local ip \"localhost:*\"))" in fenced
       check "network" notin seatbelt.buildProfile(["/tmp"], [], [])
+
+    test "readonly under a writable root subtracts the write":
+      # A bare allow-read under a writable root leaves the root's
+      # file-write* grant in force; readonly must punch a write-deny
+      # hole (the policy-file guard relies on this).
+      let p = seatbelt.buildProfile(["/tmp"], ["/tmp/policy"], [])
+      check "(deny file-write*" in p
+      check "(literal \"/tmp/policy\")" in p

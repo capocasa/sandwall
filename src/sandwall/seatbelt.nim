@@ -133,6 +133,13 @@ proc buildProfile*(writable, read: openArray[string];
     result.add("(allow file-write* file-read*\n  (subpath " & quote(w) & "))\n")
   for p in rpaths:
     result.add("(allow file-read*\n  (subpath " & quote(p) & "))\n")
+  # A read-only path under a writable root must subtract the write the
+  # root just granted: readonly is a narrowing, not an annotation. Emit
+  # a write-deny after the allows so last-match-wins punches the hole.
+  # Covers the path itself and everything below it.
+  for p in rpaths:
+    result.add("(deny file-write*\n  (subpath " & quote(p) & ")")
+    result.add("\n  (literal " & quote(p) & "))\n")
   # Denies last: Seatbelt is last-match-wins, so a trailing deny
   # reliably punches a hole in the broader allows above. (Putting
   # denies first and splitting the allow around them was tried; the
