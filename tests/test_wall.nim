@@ -125,7 +125,11 @@ when defined(macosx):
       let fenced = seatbelt.buildProfile(["/tmp"], [], [], egress = false)
       check "(allow network-outbound (remote ip \"localhost:*\"))" in fenced
       check "(allow network-inbound (local ip \"localhost:*\"))" in fenced
-      check "network" notin seatbelt.buildProfile(["/tmp"], [], [])
+      # open egress is unrestricted: bare allows, no remote filter
+      let open = seatbelt.buildProfile(["/tmp"], [], [])
+      check "(allow network-outbound)\n" in open
+      check "(allow network-inbound)\n" in open
+      check "localhost:*" notin open
 
     test "readonly under a writable root subtracts the write":
       # A bare allow-read under a writable root leaves the root's

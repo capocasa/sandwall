@@ -157,6 +157,13 @@ proc buildProfile*(writable, read: openArray[string];
     # decision 8).
     result.add("(allow network-outbound (remote ip \"localhost:*\"))\n")
     result.add("(allow network-inbound (local ip \"localhost:*\"))\n")
+  else:
+    # Open network: a policy without host rules means "no network
+    # restriction", but (deny default) covers sockets too, so the open
+    # case needs explicit allows or every connect() dies on macOS (on
+    # Linux the same policy simply never enters a netns).
+    result.add("(allow network-outbound)\n")
+    result.add("(allow network-inbound)\n")
 
 proc backendSupported*(): bool = true
 
