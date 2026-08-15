@@ -8,8 +8,8 @@
 ##
 ## Windows has no fork, and a token cannot narrow the current process,
 ## only a spawned one. `spawnSandboxedAndWait` runs the command as the
-## dedicated `sandwall` user via CreateProcessWithLogonW (lpDesktop set:
-## without it children die 0xC0000142), inside a KILL_ON_JOB_CLOSE Job.
+## dedicated `sandwall` user via CreateProcessWithLogonW (lpDesktop
+## NULL; see rtoken.nim), inside a KILL_ON_JOB_CLOSE Job.
 ## `restrict` stamped the sandbox user's ALLOW grants on the writable
 ## roots beforehand; per-run DENY narrowing is rolled back in a defer.
 ## See rtoken.nim for why the dedicated user (and not a restricted

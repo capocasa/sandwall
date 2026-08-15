@@ -35,6 +35,7 @@ when isMainModule:
     import std/posix except Time
   when defined(windows):
     import ./sandwall/wall/proxy
+    import ./sandwall/wall/stdio
 
   const usage = """
 sandwall - a process sandbox backed by OS-native primitives
@@ -219,6 +220,18 @@ filesystem policy are enforced with no setup step.
         wfpProbeMain()
       else:
         0  # internal: nothing to probe on POSIX
+    of "stdio-relay":
+      # The CPLW child's stdio hop: spawnSandboxed prefixes the
+      # sandboxed command with `<self> stdio-relay --`. 3code.exe has
+      # its own copy of this dispatch under `wall stdio-relay`.
+      when defined(windows):
+        if args.len < 3 or args[1] != "--":
+          stderr.writeLine("sandwall: stdio-relay needs -- CMD")
+          return 2
+        stdio.relayMain(args[2 .. ^1])
+      else:
+        stderr.writeLine("sandwall: stdio-relay is Windows-only")
+        return 2
     else:
       runMain(args)
 

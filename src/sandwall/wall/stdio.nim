@@ -102,6 +102,7 @@ when defined(windows):
         return
       inc(done, n)
 
+
   proc pumpThread(p: ptr RelayPipe) {.thread.} =
     ## Connect the server end, then relay every byte into our stdout
     ## until the relay child closes its end (EOF). Detached; dies at
@@ -122,8 +123,8 @@ when defined(windows):
     ## Start the detached pump thread for `p`.
     let pp = cast[ptr RelayPipe](allocShared0(sizeof(RelayPipe)))
     pp[] = p
-    var t: Thread[ptr RelayPipe]
-    createThread(t, pumpThread, pp)
+    var t = cast[ptr Thread[ptr RelayPipe]](allocShared0(sizeof(Thread[ptr RelayPipe])))
+    createThread(t[], pumpThread, pp)
     # The thread object is heap-stashed by createThread's copy when the
     # system thread registry is off; leaking the handle is fine - the
     # thread ends at pipe EOF (closeRelay) and the process exit reaps.
@@ -144,7 +145,8 @@ when defined(windows):
 
   proc connectChildPipe(name: string): Handle =
     ## The relay side: wait for the pipe to appear, open the client
-    ## end (write side), return the handle.
+    ## end (write side), return the handle. The handle is marked
+    ## inheritable so the real command can take it as its stdio.
     let wname = newWideCString(name)
     var waited = 0
     while waitNamedPipeW(wname, 1000'i32) == 0:
@@ -155,7 +157,9 @@ when defined(windows):
       if waited > 10: return 0
     const genericWrite = 0x40000000'i32
     const openExisting = 3'i32
-    createFileW(wname, DWORD(genericWrite), 0'i32, nil,
+    var sa = SECURITY_ATTRIBUTES(nLength: DWORD(sizeof(SECURITY_ATTRIBUTES)),
+      lpSecurityDescriptor: nil, bInheritHandle: 1)
+    createFileW(wname, DWORD(genericWrite), 0'i32, addr sa,
       DWORD(openExisting), 0'i32, 0)
 
   proc relayMain*(cmd: openArray[string]): int =

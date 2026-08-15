@@ -20,9 +20,12 @@
 ##      default). DENY ACEs for deny-narrowing are stamped on the
 ##      denied path and rolled back after the run.
 ##   3. `spawnSandboxed` runs the child as that user via
-##      CreateProcessWithLogonW with lpDesktop="winsta0\default" (the
-##      desktop string is REQUIRED: without it the child fails DLL
-##      init with 0xC0000142). The user boundary IS the confinement:
+##      CreateProcessWithLogonW with lpDesktop NULL: with the winsta0
+##      + default-desktop ACL grants from setup in place, NULL lets
+##      the child init in the caller's desktop; an explicit
+##      "winsta0\default" string instead kills console-subsystem
+##      children at loader init with 0xC0000142 (verified on Win11
+##      26100). The user boundary IS the confinement:
 ##      the sandbox user can write nowhere except the stamped roots.
 ##      msys2 survives because the child is a normal user process with
 ##      a normal namespace and its own logon session.
@@ -105,9 +108,22 @@ when defined(windows):
       "sandwall windows-user: " & what & " failed (error " & $getLastError() & ")")
 
   {.compile: "csrc/spawn_shim.c".}
-  proc swSpawnWithLogon(user, domain, password, cmdline, cwd: WideCString;
+  proc swSpawnWithLogon(user, domain, password, cmdline, env, cwd: WideCString;
       outProcess: ptr Handle): DWORD {.stdcall, importc: "sw_spawn_with_logon",
       sideEffect.}
+
+  proc getEnvironmentStringsW(): WideCString {.stdcall,
+      dynlib: "kernel32", importc: "GetEnvironmentStringsW".}
+  proc freeEnvironmentStringsW(env: WideCString): WINBOOL {.stdcall,
+      dynlib: "kernel32", importc: "FreeEnvironmentStringsW".}
+
+  proc buildEnvBlockW(): WideCString =
+    ## The LIVE process environment (so NIMBOX_OUT_PIPE and the
+    ## wall-proxy vars putenv'd by the caller arrive). CPLW with a NULL
+    ## env gives the child a fresh block instead: the relay would see
+    ## no pipe name and TEMP/TMP would point into the sandwall user's
+    ## absent profile. Leaked (a few KB per run; freed at exit).
+    getEnvironmentStringsW()
 
   proc convertStringSidToSidW(str: WideCString; sid: ptr winlean.PSID): WINBOOL
       {.stdcall, dynlib: "advapi32", importc: "ConvertStringSidToSidW".}
@@ -249,7 +265,7 @@ when defined(windows):
     ## CreateProcessWithLogonW cannot inherit pipe handles across the
     ## logon boundary (and CreateProcessAsUserW needs privileges the
     ## non-elevated caller lacks, error 1314), so the command line is
-    ## prefixed with `<self> wall stdio-relay`: two named pipes
+    ## prefixed with `<self> stdio-relay`: two named pipes
     ## (everyone DACL) are handed over via the environment, the relay
     ## opens them by name, installs them as its stdio, and spawns the
     ## real CMD with ordinary handle inheritance. The parent pumps the
@@ -274,7 +290,7 @@ when defined(windows):
     relayPipe = stdio.createRelayPipe(tag)
     putenv("NIMBOX_OUT_PIPE", relayPipe.childName)
     let relay = when defined(swNoRelay): ""
-                else: getAppFilename() & " wall stdio-relay --"
+                else: getAppFilename() & " stdio-relay --"
     let cmdW = newWideCString(relay & " " & quoteCmdLine(cmd))
     let userW = newWideCString(winuser.sandwallUserName)
     let domW = newWideCString(".")
@@ -282,7 +298,8 @@ when defined(windows):
     let cwdW: WideCString = when defined(swNullCwd): nil
                             else: newWideCString(getCurrentDir())
     var ph: Handle = 0
-    let rc = swSpawnWithLogon(userW, domW, pwW, cmdW, cwdW, addr ph)
+    let envW = buildEnvBlockW()
+    let rc = swSpawnWithLogon(userW, domW, pwW, cmdW, envW, cwdW, addr ph)
     if rc != 0:
       raise newException(OSError,
         "sandwall windows-user: CreateProcessWithLogonW failed (error " &
