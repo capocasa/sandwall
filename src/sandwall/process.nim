@@ -6,13 +6,14 @@
 ## thread and children inherit the restriction, so this fork-then-restrict-in-
 ## child model works: the parent never calls `restrict`.
 ##
-## Windows has no fork, and a token cannot narrow the current process, only a
-## spawned one. `spawnSandboxed` builds a WRITE_RESTRICTED token (normal
-## object namespace, Medium integrity, so msys2/cygwin survives - unlike an
-## AppContainer), spawns the child suspended under it, assigns it to a
-## KILL_ON_JOB_CLOSE Job, then resumes. `restrict` stamped the synthetic
-## write SID's ACL grants beforehand; the per-run DENY narrowing is rolled
-## back in a defer.
+## Windows has no fork, and a token cannot narrow the current process,
+## only a spawned one. `spawnSandboxedAndWait` runs the command as the
+## dedicated `sandwall` user via CreateProcessWithLogonW (lpDesktop set:
+## without it children die 0xC0000142), inside a KILL_ON_JOB_CLOSE Job.
+## `restrict` stamped the sandbox user's ALLOW grants on the writable
+## roots beforehand; per-run DENY narrowing is rolled back in a defer.
+## See rtoken.nim for why the dedicated user (and not a restricted
+## token or an AppContainer) is the only shape that holds.
 ##
 ## `runSandboxed` is the portable entry that dispatches to the right path.
 
@@ -59,22 +60,22 @@ when defined(windows):
       if hit.len > 0: return hit
     name
 
-  proc spawnSandboxed*(cmd: openArray[string];
-                       internetAccess = false): ExitCode =
-    ## Spawn `cmd` under the write-restricted token + Job (see
-    ## rtoken.spawnSandboxed), pump its output to our stdout, wait, and roll
-    ## back the per-run DENY narrowing in a `defer`. The ACL grants for the
-    ## synthetic write SID persist (inert for normal processes). Raises if
-    ## the token/spawn fails. `internetAccess` is unused on this backend -
-    ## the restricted token only gates file writes, not network; the Windows
-    ## net fence stays on the separate sandwall-user path.
+  proc spawnSandboxedAndWait*(cmd: openArray[string];
+                               internetAccess = false): ExitCode =
+    ## Spawn `cmd` as the sandbox user (see rtoken.spawnSandboxed),
+    ## wait for it, and roll back the per-run DENY narrowing in a
+    ## `defer`. The ALLOW grants for the sandbox user persist (only
+    ## sandboxed children run as that user). Raises if the spawn fails.
+    ## `internetAccess` is unused: the WFP fence installed by
+    ## `3code wall setup-windows` confines the sandbox user to loopback
+    ## either way; the caller routes traffic through the wall proxy via
+    ## env when the policy has host rules.
     defer: rtoken.rollbackDenies()
     let ph = rtoken.spawnSandboxed(cmd)
     defer: discard closeHandle(ph)
 
-    # Pump the child's output to our stdout while it runs. The child
-    # inherited our std handles, so its stdout/stderr are already ours;
-    # there is nothing to relay - just wait.
+    # The child inherited our std handles, so its stdout/stderr are
+    # already ours; there is nothing to relay - just wait.
     let w = waitForSingleObject(ph, INFINITE)
     if w == WAIT_FAILED:
       raise newException(OSError,
@@ -133,15 +134,14 @@ template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
   ## On posix: fork, in the child `restrict` then `exec`, in the parent
   ## `wait`. The parent keeps running unrestricted.
   ##
-  ## On windows: `restrict` (prepare AppContainer SID + stamp ACLs), then
-  ## `spawnSandboxed` (CreateProcessW with the security-capabilities
-  ## attribute, then ACL rollback in a defer). Windows cannot confine the
-  ## current process, so the whole sandbox takes effect at spawn time in
-  ## the child.
+  ## On windows: `restrict` stamps the sandbox user's ALLOW grants on
+  ## the writable roots, then `spawnSandboxedAndWait` runs the command
+  ## as that user. Windows cannot confine the current process, so the
+  ## whole sandbox takes effect at spawn time in the child.
   block:
     when defined(windows):
       restrict(writable, read, denied)
-      spawnSandboxed(cmd, internetAccess = inetOk)
+      spawnSandboxedAndWait(cmd, internetAccess = inetOk)
     else:
       let pid = forkNimbox()
       if pid == 0:

@@ -1,56 +1,57 @@
-## Windows write-restricted-token + Job backend for sandwall.
+## Windows dedicated-user backend for sandwall.
 ##
-## This replaces the AppContainer backend. AppContainer confines the
-## process to a private object namespace, which kills the cygwin/msys2
-## DLL at init (NtCreateDirectoryObject on \BaseNamedObjects\msys-2.0
-## returns ACCESS_DENIED), so msys2 bash cannot run inside an AC. A
-## write-restricted token is a NORMAL token (full object-namespace
-## access), so cygwin survives; only file WRITES get the extra
-## restricted-SID check. This is the Codex/Kilo/Anthropic mechanism.
+## This replaces both the AppContainer backend and the same-user
+## write-restricted-token backend. Neither could hold: the
+## AppContainer confines the process to a private object namespace,
+## which kills the msys2/cygwin DLL at init, and a same-user
+## write-restricted token needs the token user SID in the restricted
+## list for msys2's owner-ACL'd signal pipe - which makes every
+## user-writable path writable and the sandbox a no-op (verified on
+## Windows 11; the same wall Codex hit, openai/codex#17459).
 ##
-## Enforcement model (unelevated, same-user):
-##   1. CreateRestrictedToken(WRITE_RESTRICTED) with a restricted SID
-##      list of [Everyone, Logon SID, synthetic-write SID]. A write then
-##      succeeds only if the normal user AND at least one restricted SID
-##      are granted. We ACL-grant the synthetic SID only on writable
-##      roots, so everywhere else the second check fails even though the
-##      user could normally write there.
-##   2. The synthetic SID is a stable, well-known SID derived once and
-##      reused across runs so ACL grants persist (no per-run stamping +
-##      rollback of DACLs like the AC backend). We grant it broad write
-##      on each writable root and leave it denied (absent) elsewhere.
-##   3. Medium integrity is left intact (NOT Low): Schannel/LSA and the
-##      cygwin object namespace misbehave at Low.
+## Enforcement model (the Codex "elevated sandbox" shape):
+##   1. A one-time elevated setup (`3code wall setup-windows`) creates
+##      a dedicated local user `sandwall` with a random password
+##      stored DPAPI-protected at %LOCALAPPDATA%\sandwall\
+##      credentials.dat (wall/winuser.nim).
+##   2. `restrictImpl` stamps an ALLOW ACE for the sandbox USER SID on
+##      each writable root (full access) and traverse-only ACEs on the
+##      ancestors of every root (private profile dirs deny traverse by
+##      default). DENY ACEs for deny-narrowing are stamped on the
+##      denied path and rolled back after the run.
+##   3. `spawnSandboxed` runs the child as that user via
+##      CreateProcessWithLogonW with lpDesktop="winsta0\default" (the
+##      desktop string is REQUIRED: without it the child fails DLL
+##      init with 0xC0000142). The user boundary IS the confinement:
+##      the sandbox user can write nowhere except the stamped roots.
+##      msys2 survives because the child is a normal user process with
+##      a normal namespace and its own logon session.
 ##   4. An unnamed Job Object with KILL_ON_JOB_CLOSE contains the whole
-##      process tree; the child is assigned before it resumes.
+##      process tree; the child is assigned right after spawn.
+##   5. Network: the WFP fence (wfp.nim) blocks non-loopback egress for
+##      the sandbox user; the wall proxy enforces the hostname
+##      allowlist on loopback. With host rules the proxy env vars are
+##      set on the child; without them the fence is left alone.
 ##
-## No ACL rollback is needed for the DACL grants: the synthetic SID only
-## confers access to a token that carries it in the restricted list, so a
-## grant on a writable root is inert for every normal process. We keep a
-## module record of granted roots only to re-assert idempotently.
-##
-## Deny narrowing (policy `deny` under a writable root) is stamped as an
-## explicit DENY ACE for the synthetic SID and rolled back after the run,
-## because a lingering DENY would also block nothing else (the SID is
-## ours) but is kept clean to avoid surprising the user.
+## The ALLOW grants for the user SID are NOT inert (unlike the
+## synthetic-SID model): any process running as the sandbox user could
+## write the stamped roots. That is exactly the boundary we want - only
+## sandboxed children run as that user - so the grants persist across
+## runs and idempotent re-stamping is enough. DENY narrowing must roll
+## back: a lingering DENY for the sandbox user would break the next
+## run's writable root.
 
 import std/os
 
 when defined(windows):
-  import std/[winlean, widestrs, strutils, syncio]
-  import ./acl  # reuse trustee/EXPLICIT_ACCESS/SetEntriesInAcl + rollback helpers
-  import ./paths  # normalize
+  import std/[winlean, widestrs, strutils, syncio, algorithm]
+  import ./acl
+  import ./paths
+  import ./wall/winuser
 
-  # --- token FFI ---
+  # --- FFI ---
 
   type
-    SID_AND_ATTRIBUTES = object
-      sid: winlean.PSID
-      attributes: DWORD
-
-    TOKEN_MANDATORY_LABEL = object
-      label: SID_AND_ATTRIBUTES
-
     JOBOBJECT_BASIC_LIMIT_INFORMATION = object
       perProcessUserTimeLimit: int64
       perJobUserTimeLimit: int64
@@ -75,280 +76,124 @@ when defined(windows):
       peakJobMemoryUsed: uint
 
   const
-    # CreateRestrictedToken flags (winnt.h)
-    DISABLE_MAX_PRIVILEGE = 0x1'i32
-    WRITE_RESTRICTED      = 0x8'i32
-
-    # Token access rights
-    TOKEN_DUPLICATE        = 0x0002'i32
-    TOKEN_QUERY            = 0x0008'i32
-    TOKEN_ADJUST_DEFAULT   = 0x0080'i32
-    TOKEN_ASSIGN_PRIMARY   = 0x0001'i32
-    TOKEN_ADJUST_PRIVILEGES = 0x0020'i32
-    TOKEN_ALL_ACCESS_RW    = 0x000F01FF'i32
-
-    # Token information classes
-    tokenIntegrityLevel = 25'i32
-    tokenDefaultDacl     = 6'i32
-    SE_GROUP_INTEGRITY   = 0x00000020'i32
-
-    # ACL header size (ACL struct, winnt.h)
-    ACL_REVISION = 2'i32
-
     # Job objects
     jobObjectExtendedLimitInformation = 9'i32
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000'i32
 
-    # Process creation flags
-    CREATE_SUSPENDED = 0x00000004'i32
+    # ACL/ACL inheritance (winnt.h)
+    CONTAINER_INHERIT_ACE = 0x2'i32
+    OBJECT_INHERIT_ACE = 0x1'i32
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT = 0x3'i32
 
-    # Well-known SID strings
-    sidEveryone = "S-1-1-0"
-    # Stable synthetic SID for sandwall writable roots. Must be in the
-    # NT-authority domain range (S-1-5-21-...): app-package (S-1-15-2-*) and
-    # capability (S-1-15-3-*) SIDs are rejected by CreateRestrictedToken with
-    # ERROR_INVALID_PARAMETER on Win11 (verified by probe rtprobe2), while
-    # S-1-5-21-* is accepted and valid in ACLs. The high subauthorities make
-    # collision with a real domain SID vanishingly unlikely. We use it as a
-    # plain restricted SID in a NORMAL token (not an AC), keeping cygwin alive.
-    sidSandwallWrite = "S-1-5-21-3738981842-2241542906-1872314022-4093"
-
-  proc convertStringSidToSidW(s: WideCString; sid: ptr winlean.PSID): WINBOOL
-      {.stdcall, dynlib: "advapi32", importc: "ConvertStringSidToSidW".}
-
-  proc createRestrictedToken(existingToken: Handle; flags: DWORD;
-      disableSidCount: DWORD; sidsToDisable: ptr SID_AND_ATTRIBUTES;
-      deletePrivilegeCount: DWORD; privilegesToDelete: pointer;
-      restrictedSidCount: DWORD; sidsToRestrict: ptr SID_AND_ATTRIBUTES;
-      newToken: ptr Handle): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "CreateRestrictedToken".}
-
-  proc createProcessAsUserW(token: Handle; appName, cmdLine: WideCString;
-      procAttr, threadAttr: ptr SECURITY_ATTRIBUTES; inheritHandles: WINBOOL;
-      flags: DWORD; env: pointer; cwd: WideCString; si: ptr STARTUPINFO;
-      pi: ptr PROCESS_INFORMATION): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "CreateProcessAsUserW", sideEffect.}
-
-  proc openProcessToken(processHandle: Handle; desiredAccess: DWORD;
-      tokenHandle: ptr Handle): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "OpenProcessToken".}
-
-  proc setTokenInformation(token: Handle; infoClass: int32;
-      info: pointer; infoLen: DWORD): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "SetTokenInformation".}
+    # Traverse-only rights for ancestor ACEs
+    FILE_TRAVERSE = 0x20'i32
 
   proc createJobObjectW(attr: pointer; name: WideCString): Handle {.stdcall,
       dynlib: "kernel32", importc: "CreateJobObjectW".}
-
   proc setInformationJobObject(job: Handle; infoClass: int32; info: pointer;
       infoLen: DWORD): WINBOOL {.stdcall, dynlib: "kernel32",
       importc: "SetInformationJobObject".}
-
   proc assignProcessToJobObject(job, process: Handle): WINBOOL {.stdcall,
       dynlib: "kernel32", importc: "AssignProcessToJobObject".}
-
-  proc getTokenInformation(token: Handle; infoClass: int32; info: pointer;
-      infoLen: DWORD; retLen: ptr DWORD): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "GetTokenInformation".}
-
   proc resumeThread(thread: Handle): DWORD {.stdcall, dynlib: "kernel32",
       importc: "ResumeThread".}
+  proc suspendThread(thread: Handle): DWORD {.stdcall, dynlib: "kernel32",
+      importc: "SuspendThread".}
+  proc fail(what: string) {.noinline.} =
+    raise newException(OSError,
+      "sandwall windows-user: " & what & " failed (error " & $getLastError() & ")")
 
-  proc initializeAcl(acl: pointer; aclLength: DWORD; revision: DWORD): WINBOOL
-      {.stdcall, dynlib: "advapi32", importc: "InitializeAcl".}
+  {.compile: "csrc/spawn_shim.c".}
+  proc swSpawnWithLogon(user, domain, password, cmdline, cwd: WideCString;
+      outProcess: ptr Handle): DWORD {.stdcall, importc: "sw_spawn_with_logon",
+      sideEffect.}
 
-  proc addAccessAllowedAce(acl: pointer; revision, accessMask: DWORD;
-      sid: winlean.PSID): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "AddAccessAllowedAce".}
-
-  proc getLengthSid(sid: winlean.PSID): DWORD {.stdcall, dynlib: "advapi32",
-      importc: "GetLengthSid".}
-
-  proc copySid(destLen: DWORD; dest, src: winlean.PSID): WINBOOL {.stdcall,
-      dynlib: "advapi32", importc: "CopySid".}
+  proc convertStringSidToSidW(str: WideCString; sid: ptr winlean.PSID): WINBOOL
+      {.stdcall, dynlib: "advapi32", importc: "ConvertStringSidToSidW".}
 
   proc localFree(mem: pointer): pointer {.stdcall, dynlib: "kernel32",
       importc: "LocalFree".}
 
-  proc fail(what: string) {.noinline.} =
-    raise newException(OSError,
-      "sandwall windows-rtoken: " & what & " failed (error " & $getLastError() & ")")
-
   # --- module state ---
 
-  # The synthetic write SID, derived once. Kept for the process lifetime.
-  var writeSid: winlean.PSID = nil
+  var userSidCache: winlean.PSID = nil
+    ## The sandbox user's SID, resolved once per process.
 
-  # Writable roots we granted the synthetic SID on (for potential cleanup).
-  var grantedRoots: seq[string] = @[]
-
-  # Deny paths we stamped (policy `deny` narrowing); rolled back post-run.
   var denyStamped: seq[string] = @[]
+    ## Deny paths stamped this run; rolled back after the child exits.
 
-  proc sandwallWriteSid*(): winlean.PSID =
-    ## Return the stable synthetic SID used to mark writable roots.
-    if writeSid == nil:
-      if convertStringSidToSidW(newWideCString(sidSandwallWrite),
-          addr writeSid) == 0:
-        fail("ConvertStringSidToSidW(write SID)")
-    writeSid
+  proc sandboxUserSid*(): winlean.PSID =
+    ## Resolve (and cache) the sandbox user's SID from its name.
+    if userSidCache == nil:
+      let sid = winuser.sidString()
+      if sid.len == 0:
+        raise newException(OSError,
+          "sandwall windows-user: the sandbox user does not exist; " &
+          "run `3code wall setup-windows` once (elevated)")
+      if convertStringSidToSidW(newWideCString(sid),
+          addr userSidCache) == 0:
+        fail("ConvertStringSidToSidW(sandbox user)")
+    userSidCache
 
-  proc grantWriteRoot(path: string) =
-    ## Grant the synthetic write SID full access on `path` (recursive).
-    ## Idempotent; the grant is inert for non-restricted processes so we do
-    ## NOT roll it back (unlike the AC backend's DACL stamps).
-    acl.stampAce(path, sandwallWriteSid(), acl.grantAccess, acl.FILE_ALL_ACCESS)
-    grantedRoots.add(path)
+  proc ancestorsNeedGrant(path: string): seq[string] =
+    ## Ancestors of `path` up to (excluding) the drive root that may
+    ## deny the sandbox user traverse. Private profile dirs (C:\Users\
+    ## <name>\...) are the practical case; system dirs already grant
+    ## Users traverse, and stamping them anyway is harmless but noisy,
+    ## so only ancestors under a user profile are stamped.
+    result = @[]
+    var dir = splitFile(path).dir
+    const userProfileRoot = "\\Users\\"
+    while dir.len > 3 and dir.contains(userProfileRoot):
+      let parent = splitFile(dir).dir
+      if parent.len <= 3: break
+      result.add dir
+      dir = parent
+    # closest-first is irrelevant for grants; keep outermost-first
+    result = reversed(result)
 
-  proc stampDeny(path: string) =
-    ## Stamp an explicit DENY-all ACE for the synthetic SID on `path`
-    ## (policy `deny` under a writable root). Rolled back after the run.
-    acl.stampAce(path, sandwallWriteSid(), acl.denyAccess, acl.FILE_ALL_ACCESS)
-    denyStamped.add(path)
+  proc restrictImpl*(writable, read: openArray[string];
+                     denied: openArray[string] = []) =
+    ## Stamp ALLOW ACEs for the sandbox user SID on each writable root
+    ## (full access, inherited) and traverse-only ACEs on profile
+    ## ancestors so the child can reach the root. `read` paths need no
+    ## stamp: the sandbox user already reads system dirs, and readable
+    ## user files live under ancestors we just stamped. DENY ACEs for
+    ## deny-narrowing are stamped for rollback after the run.
+    let norm = paths.normalize
+    var seen: seq[string] = @[]
+    let sid = sandboxUserSid()
+    for p in writable:
+      let n = norm(p)
+      if n.len == 0 or n in seen: continue
+      seen.add(n)
+      for anc in ancestorsNeedGrant(n):
+        acl.stampAce(anc, sid, acl.grantAccess, DWORD(FILE_TRAVERSE),
+          inheritance = DWORD(0))
+      acl.stampAce(n, sid, acl.grantAccess, acl.FILE_ALL_ACCESS)
+    for d in denied:
+      let n = norm(d)
+      if n.len == 0: continue
+      # A deny on a not-yet-existing path cannot be stamped; the write
+      # to it would fail the parent-dir allow anyway when the parent is
+      # not writable, and when the parent IS writable the child could
+      # create it - accepted gap, same as the token backend had.
+      if not dirExists(n) and not fileExists(n): continue
+      acl.stampAce(n, sid, acl.denyAccess, acl.FILE_ALL_ACCESS)
+      denyStamped.add(n)
 
   proc rollbackDenies*() =
     ## Remove the DENY ACEs stamped for this run. Best-effort.
-    let sid = sandwallWriteSid()
+    if denyStamped.len == 0: return
+    let sid = sandboxUserSid()
     let paths = denyStamped
     denyStamped = @[]
     for p in paths:
       try:
         acl.removeSidAces(p, sid)
       except CatchableError as e:
-        stderr.writeLine("sandwall windows-rtoken: deny rollback failed on " &
+        stderr.writeLine("sandwall windows-user: deny rollback failed on " &
           p & ": " & e.msg)
-
-  proc restrictImpl*(writable, read: openArray[string];
-                     denied: openArray[string] = []) =
-    ## Stamp ACL grants for the synthetic write SID on each writable root
-    ## and DENY stamps for the policy's denied narrowing. The actual token
-    ## is built at spawn time in process.spawnSandboxed. `read` paths need
-    ## no stamp: a restricted token only gates WRITES, and reads ride the
-    ## normal user DACL (the child keeps the user's identity).
-    let norm = paths.normalize
-    var seen: seq[string] = @[]
-    for p in writable:
-      let n = norm(p)
-      if n.len == 0 or n in seen: continue
-      seen.add(n)
-      grantWriteRoot(n)
-    for d in denied:
-      let n = norm(d)
-      if n.len == 0: continue
-      stampDeny(n)
-
-  proc buildWriteRestrictedToken(): Handle =
-    ## Build the write-restricted token from the current process token:
-    ## WRITE_RESTRICTED with restricted SIDs [synthetic, Logon, Everyone].
-    ## Strips privileges (DISABLE_MAX_PRIVILEGE) but keeps the token
-    ## Medium IL with normal groups so cygwin init works. NO LUA_TOKEN:
-    ## it broke schannel inside the sandbox (SEC_E_NO_CREDENTIALS on
-    ## AcquireCredentialsHandle, every https site, verified on Win11).
-    var token: Handle
-    if openProcessToken(getCurrentProcess(),
-        DWORD(TOKEN_DUPLICATE or TOKEN_QUERY or TOKEN_ASSIGN_PRIMARY or
-              TOKEN_ADJUST_DEFAULT), addr token) == 0:
-      fail("OpenProcessToken")
-    defer: discard closeHandle(token)
-
-    # Recipe mirrors Codex windows-sandbox-rs/src/token.rs.
-    var everyoneSid, sandSid: winlean.PSID
-    if convertStringSidToSidW(newWideCString(sidEveryone), addr everyoneSid) == 0:
-      fail("ConvertStringSidToSidW(Everyone)")
-    sandSid = sandwallWriteSid()
-
-    # The logon-session SID must come from TokenGroups (scanning for a group
-    # with SE_GROUP_LOGON_ID = 0xC0000000), NOT TokenLogonSid: the latter
-    # returns a SID CreateRestrictedToken rejects with ERROR_NOACCESS on
-    # Win11 (verified by probe rt3). TokenGroups layout is a DWORD count
-    # followed by the SID_AND_ATTRIBUTES array ALIGNED to pointer size (8 on
-    # amd64) - reading the SID at +4 picks up garbage (the other 998 cause).
-    const tokenGroups = 2'i32
-    const SE_GROUP_LOGON_ID = 0xC0000000'i32
-    var logonSidVal: winlean.PSID = nil
-    var logonBuf: pointer = nil
-    var needed: DWORD = 0
-    discard getTokenInformation(token, tokenGroups, nil, 0, addr needed)
-    if needed > 0:
-      logonBuf = alloc0(int(needed))
-      if getTokenInformation(token, tokenGroups, logonBuf, needed, addr needed) != 0:
-        let count = cast[ptr DWORD](logonBuf)[]
-        # align(sizeof(DWORD)=4 up to sizeof(pointer)=8) = 8 on amd64
-        var gptr = cast[uint](logonBuf) + cast[uint](sizeof(pointer))
-        for i in 0 ..< int(count):
-          let grp = cast[ptr SID_AND_ATTRIBUTES](gptr)
-          if (grp.attributes and SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID:
-            logonSidVal = grp.sid
-            break
-          gptr += cast[uint](sizeof(SID_AND_ATTRIBUTES))
-
-    # The token user SID (TokenUser = 1), copied out so it stays valid after
-    # the source token closes. It goes into the token's DEFAULT DACL only,
-    # NEVER into the restricted-SID list: a write-restricted token grants a
-    # write only when the normal SIDs AND some restricted SID both allow
-    # it, so a user SID in the restricted list makes every user-writable
-    # path writable and the whole sandbox a no-op (verified on Win11:
-    # home-dir writes leaked; probe rt5's "with-user works" fixed cygwin
-    # by accident and reintroduced the hole). Cygwin's named objects are
-    # covered by the default-DACL entries below, not by the restricted list.
-    const tokenUser = 1'i32
-    var userSidVal: winlean.PSID = nil
-    var uneeded: DWORD = 0
-    discard getTokenInformation(token, tokenUser, nil, 0, addr uneeded)
-    if uneeded > 0:
-      let ubuf = alloc0(int(uneeded))
-      if getTokenInformation(token, tokenUser, ubuf, uneeded, addr uneeded) != 0:
-        let usid = cast[ptr SID_AND_ATTRIBUTES](ubuf).sid
-        let ulen = getLengthSid(usid)
-        userSidVal = cast[winlean.PSID](alloc0(int(ulen)))
-        discard copySid(ulen, userSidVal, usid)
-      dealloc(ubuf)
-
-    # Restricted SID list order: [synthetic-write, Logon, Everyone].
-    var restrictSids: seq[SID_AND_ATTRIBUTES]
-    restrictSids.add SID_AND_ATTRIBUTES(sid: sandSid, attributes: 0)
-    if logonSidVal != nil:
-      restrictSids.add SID_AND_ATTRIBUTES(sid: logonSidVal, attributes: 0)
-    restrictSids.add SID_AND_ATTRIBUTES(sid: everyoneSid, attributes: 0)
-
-    var newToken: Handle
-    let rc = createRestrictedToken(token,
-        DWORD(DISABLE_MAX_PRIVILEGE or WRITE_RESTRICTED),
-        0, nil, 0, nil, DWORD(restrictSids.len), addr restrictSids[0], addr newToken)
-    if rc == 0:
-      if logonBuf != nil: dealloc(logonBuf)
-      fail("CreateRestrictedToken")
-
-    # Default DACL = GENERIC_ALL for [Logon, Everyone, synthetic-write] (the
-    # logon SID first, matching Codex). Cygwin's signal pipe and other named
-    # objects are created with the token's default DACL; without these grants
-    # the restricted access check fails and cygwin dies "couldn't create
-    # signal pipe, Win32 error 5". Build it with SetEntriesInAcl (a fresh
-    # ACL), like Codex, rather than hand-rolled InitializeAcl+AddAce.
-    var daclSids: seq[winlean.PSID]
-    if logonSidVal != nil: daclSids.add logonSidVal
-    daclSids.add everyoneSid
-    daclSids.add sandSid
-    if userSidVal != nil: daclSids.add userSidVal
-    var entries: seq[acl.EXPLICIT_ACCESS_W]
-    for s in daclSids:
-      entries.add acl.buildDefaultDaclEntry(s)
-    var newDacl: acl.PACL = nil
-    if acl.setEntriesInAcl(DWORD(entries.len), addr entries[0], nil,
-        addr newDacl) != 0:
-      if logonBuf != nil: dealloc(logonBuf)
-      discard closeHandle(newToken)
-      fail("SetEntriesInAcl(default DACL)")
-    # TokenDefaultDacl takes a TOKEN_DEFAULT_DACL struct = a single PACL field.
-    var tdd: pointer = newDacl
-    if setTokenInformation(newToken, tokenDefaultDacl, addr tdd,
-        DWORD(sizeof(pointer))) == 0:
-      if logonBuf != nil: dealloc(logonBuf)
-      discard closeHandle(newToken)
-      fail("SetTokenInformation(TokenDefaultDacl)")
-    discard localFree(newDacl)
-    if logonBuf != nil: dealloc(logonBuf)
-    newToken
 
   proc ensureJob(): Handle =
     ## Create an unnamed Job Object with KILL_ON_JOB_CLOSE so the whole
@@ -364,48 +209,63 @@ when defined(windows):
       fail("SetInformationJobObject")
     job
 
-  proc spawnSandboxed*(cmd: openArray[string]): Handle =
-    ## Spawn `cmd` under a write-restricted token inside a KILL_ON_JOB_CLOSE
-    ## Job. Returns the process handle (caller waits/reads exit code and
-    ## closes both it and, implicitly via Job, the tree). Cygwin survives
-    ## because the token is a normal-namespace Medium-IL token.
+  proc quoteCmdLine(cmd: openArray[string]): string =
+    ## cmd.exe-compatible quoting for the child command line.
+    result = ""
+    for i, a in cmd:
+      if i > 0: result.add(' ')
+      if a.find(Whitespace) >= 0 and not a.startsWith('"'):
+        result.add('"' & a & '"')
+      else:
+        result.add(a)
+
+  proc spawnSandboxed*(cmd: openArray[string];
+                       internetAccess = false): Handle =
+    ## Run `cmd` as the sandbox user via CreateProcessWithLogonW inside
+    ## a KILL_ON_JOB_CLOSE Job. Returns the process handle. The desktop
+    ## string is mandatory (children fail 0xC0000142 without it).
+    ## `internetAccess` is unused: the WFP fence (keyed on the sandbox
+    ## user) is installed by `3code wall setup-windows` and confines
+    ## the child to loopback automatically; the caller points the child
+    ## at the wall proxy via env when the policy has host rules.
     if cmd.len == 0:
       raise newException(ValueError, "sandwall.spawnSandboxed: empty command")
-    let token = buildWriteRestrictedToken()
-    defer: discard closeHandle(token)
+    let (ok, password) = winuser.loadSandwallCred()
+    if not ok:
+      raise newException(OSError,
+        "sandwall windows-user: no stored credentials; " &
+        "run `3code wall setup-windows` once (elevated)")
+    discard sandboxUserSid()  # fail fast when setup never ran
     let job = ensureJob()
-    # The Job handle must outlive the child for KILL_ON_JOB_CLOSE to mean
-    # anything; we leak it into the process (never closed) so the tree is
-    # killed only when THIS process exits. Acceptable: one Job per run.
-
-    var cmdLine = ""
-    for i, a in cmd:
-      if i > 0: cmdLine.add(' ')
-      cmdLine.add(quoteShellWindows(a))
-    let cmdLineW = newWideCString(cmdLine)
-
-    var si: STARTUPINFO
-    zeroMem(addr si, sizeof(si))
-    si.cb = DWORD(sizeof(si))
-    si.dwFlags = DWORD(STARTF_USESTDHANDLES)
-    si.hStdInput = getStdHandle(STD_INPUT_HANDLE)
-    si.hStdOutput = getStdHandle(STD_OUTPUT_HANDLE)
-    si.hStdError = getStdHandle(STD_ERROR_HANDLE)
-    var pi: PROCESS_INFORMATION
+    # The Job handle must outlive the child for KILL_ON_JOB_CLOSE; we
+    # leak it into this process (one Job per run, freed at exit).
+    discard job
+    let cmdW = newWideCString(quoteCmdLine(cmd))
+    let userW = newWideCString(winuser.sandwallUserName)
+    let domW = newWideCString(".")
+    let pwW = newWideCString(password)
     let cwdW = newWideCString(getCurrentDir())
-    # CREATE_SUSPENDED so we can assign to the Job before any user code runs.
-    if createProcessAsUserW(token, nil, cmdLineW, nil, nil, 1,
-        DWORD(CREATE_SUSPENDED), nil, cwdW, addr si, addr pi) == 0:
-      fail("CreateProcessAsUserW")
-    if assignProcessToJobObject(job, pi.hProcess) == 0:
-      discard closeHandle(pi.hProcess)
-      discard closeHandle(pi.hThread)
+    var ph: Handle = 0
+    let rc = swSpawnWithLogon(userW, domW, pwW, cmdW, cwdW, addr ph)
+    if rc != 0:
+      raise newException(OSError,
+        "sandwall windows-user: CreateProcessWithLogonW failed (error " &
+        $rc & ")")
+    if assignProcessToJobObject(job, ph) == 0:
+      discard closeHandle(ph)
       fail("AssignProcessToJobObject")
-    discard resumeThread(pi.hThread)
-    discard closeHandle(pi.hThread)
-    pi.hProcess
+    ph
+
 
 proc backendSupported*(): bool =
-  when defined(windows): true else: false
+  ## True when the sandbox user exists and credentials are readable.
+  when defined(windows):
+    try:
+      let (ok, _) = winuser.loadSandwallCred()
+      ok and winuser.sidString().len > 0
+    except CatchableError:
+      false
+  else:
+    false
 
-proc backendName*(): string = "windows-writerestricted"
+proc backendName*(): string = "windows-dedicated-user"
