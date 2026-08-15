@@ -7,21 +7,14 @@
 ## child model works: the parent never calls `restrict`.
 ##
 ## Windows has no fork, and a token cannot narrow the current process, only a
-## spawned one. `spawnSandboxed` does it in one call: `CreateProcessW` with
-## the PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES attribute carrying the
-## AppContainer SID prepared by `restrict`, then rolls back the ACLs in a
-## defer.
+## spawned one. `spawnSandboxed` builds a WRITE_RESTRICTED token (normal
+## object namespace, Medium integrity, so msys2/cygwin survives - unlike an
+## AppContainer), spawns the child suspended under it, assigns it to a
+## KILL_ON_JOB_CLOSE Job, then resumes. `restrict` stamped the synthetic
+## write SID's ACL grants beforehand; the per-run DENY narrowing is rolled
+## back in a defer.
 ##
 ## `runSandboxed` is the portable entry that dispatches to the right path.
-##
-## Running user exes inside the AppContainer (verified on Windows 11):
-## the AC child runs any exe whose directory carries an AC-SID read+execute
-## grant plus a Low integrity label. A `cmd` inside the AC can itself spawn
-## further exes given as a bare name or relative path (`myexe`, `.\myexe`,
-## `sub\myexe`) resolved against the cwd, but NOT as a drive-letter
-## absolute path - `cmd /c C:\path\some.exe` fails "Access is denied" even
-## for System32 exes. So to run a user exe from a sandboxed `cmd`, cd into
-## its (writable/readonly) directory and invoke it by name.
 
 import std/os
 import ./restrict
@@ -33,60 +26,7 @@ proc `$`*(e: ExitCode): string = $(int(e))
 
 when defined(windows):
   import std/[winlean, widestrs, strutils]
-  import ./acl  # currentAppContainerSid, rollbackAcls
-
-  type
-    # STARTUPINFOEXW: STARTUPINFO plus the attribute list pointer. winlean
-    # has no binding, so define it here. Layout: plain concatenation.
-    STARTUPINFOEX = object
-      si: STARTUPINFO
-      lpAttributeList: pointer
-
-    # SECURITY_CAPABILITIES (winnt.h), 24 bytes on amd64. Empty capabilities
-    # (nil/0) means maximum lockdown: no network, no fs beyond DACL grants.
-    SECURITY_CAPABILITIES = object
-      appContainerSid: pointer
-      capabilities: pointer
-      capabilityCount: DWORD
-      reserved: DWORD
-
-    SID_AND_ATTRIBUTES = object
-      sid: winlean.PSID
-      attributes: DWORD
-
-  const
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009'u
-    EXTENDED_STARTUPINFO_PRESENT = 0x00080000'i32
-
-  proc setHandleInformation(hObject: Handle; dwMask, dwFlags: DWORD): WINBOOL
-      {.stdcall, dynlib: "kernel32", importc: "SetHandleInformation".}
-
-  proc initializeProcThreadAttributeList(list: pointer; count: DWORD;
-      flags: DWORD; size: ptr uint): WINBOOL {.stdcall, dynlib: "kernel32",
-      importc: "InitializeProcThreadAttributeList".}
-
-  # GOTCHA: the Attribute parameter is a DWORD_PTR passed BY VALUE (Nim
-  # `uint`, not `ptr DWORD`). By-reference fails with ERROR_NOT_SUPPORTED.
-  proc updateProcThreadAttribute(list: pointer; flags: DWORD; attr: uint;
-      value: pointer; size: uint; prev: pointer; retSize: pointer): WINBOOL
-      {.stdcall, dynlib: "kernel32", importc: "UpdateProcThreadAttribute".}
-
-  proc deleteProcThreadAttributeList(list: pointer) {.stdcall,
-      dynlib: "kernel32", importc: "DeleteProcThreadAttributeList".}
-
-  # winlean's createProcessW takes `var STARTUPINFO`; the extended form
-  # needs STARTUPINFOEX, so declare a twin against it.
-  proc createProcessExW(lpApplicationName, lpCommandLine: WideCString;
-      lpProcessAttributes: ptr SECURITY_ATTRIBUTES;
-      lpThreadAttributes: ptr SECURITY_ATTRIBUTES;
-      bInheritHandles: WINBOOL; dwCreationFlags: DWORD;
-      lpEnvironment, lpCurrentDirectory: WideCString;
-      lpStartupInfo: ptr STARTUPINFOEX;
-      lpProcessInformation: var PROCESS_INFORMATION): WINBOOL {.stdcall,
-      dynlib: "kernel32", importc: "CreateProcessW", sideEffect.}
-
-  proc convertStringSidToSidW(str: WideCString; sid: ptr winlean.PSID): WINBOOL
-      {.stdcall, dynlib: "advapi32", importc: "ConvertStringSidToSidW".}
+  import ./rtoken  # spawnSandboxed, rollbackDenies
 
   proc findExeInPath*(name: string): string =
     ## Resolve a bare command name against PATH/PATHEXT like cmd does:
@@ -121,168 +61,26 @@ when defined(windows):
 
   proc spawnSandboxed*(cmd: openArray[string];
                        internetAccess = false): ExitCode =
-    ## Spawn `cmd` in the prepared AppContainer (see `acl.restrictImpl`),
-    ## wait for it, and roll back the stamped ACLs in a `defer` so cleanup
-    ## runs whether CreateProcess succeeds or the child errors. Raises if no
-    ## sandbox was prepared (`restrict` not called) or CreateProcess fails.
-    if currentAppContainerSid == nil:
-      raise newException(OSError, "sandwall: restrict() must be called first")
+    ## Spawn `cmd` under the write-restricted token + Job (see
+    ## rtoken.spawnSandboxed), pump its output to our stdout, wait, and roll
+    ## back the per-run DENY narrowing in a `defer`. The ACL grants for the
+    ## synthetic write SID persist (inert for normal processes). Raises if
+    ## the token/spawn fails. `internetAccess` is unused on this backend -
+    ## the restricted token only gates file writes, not network; the Windows
+    ## net fence stays on the separate sandwall-user path.
+    defer: rtoken.rollbackDenies()
+    let ph = rtoken.spawnSandboxed(cmd)
+    defer: discard closeHandle(ph)
 
-    # Rollback runs unconditionally, including on the raise paths below. This
-    # is the one mutation-bearing operation in the Windows backend and must
-    # never be skipped.
-    defer: rollbackAcls(currentAppContainerSid)
-
-    # CreateProcessW does no PATH search with a nil lpApplicationName,
-    # so resolve a bare name ourselves (execvp parity). Resolve against
-    # the PARENT's environment and cwd: the child's cwd is the same
-    # directory and the ACLs already cover these paths, so stamping
-    # happens before this point either way.
-    var appNameStr = ""
-    block:
-      var bare = cmd[0].len > 0
-      for c in cmd[0]:
-        if c in {'\\', '/', ':'}: bare = false; break
-      if bare:
-        let hit = findExeInPath(cmd[0])
-        if hit != cmd[0]: appNameStr = hit
-    # Build the UTF-16 appName manually: newWideCString under --gc:orc
-    # misbehaves here (observed returning the cwd for an unrelated
-    # input), so allocate and convert explicitly. Only ASCII paths
-    # (PATH entries) are resolved this way; exotic names still work
-    # via the cmdLine fallback.
-    var appName: WideCString = nil
-    if appNameStr.len > 0:
-      appName = cast[WideCString](alloc0((appNameStr.len + 1) * 2))
-      for i, c in appNameStr:
-        appName[i] = Utf16Char(ord(c))
-    # CreateProcessW wants a single mutable UTF-16 command line. Build it by
-    # quoting each arg with the Windows rules (std/os.quoteShellWindows).
-    var cmdLine = ""
-    for i, a in cmd:
-      if i > 0: cmdLine.add(' ')
-      # argv[0] echoes lpApplicationName (execvp parity); child CRTs
-      # re-parse the line, so an unresolvable name still surfaces.
-      cmdLine.add(quoteShellWindows(if i == 0 and appNameStr.len > 0: appNameStr else: a))
-    if cmdLine.len == 0:
-      raise newException(ValueError, "sandwall.spawnSandboxed: empty command")
-    let cmdLineW = newWideCString(cmdLine)
-
-    # Attribute list carrying SECURITY_CAPABILITIES: the two-call sizing
-    # pattern (first call fails but returns the size), then the update.
-    #
-    # `internetAccess` (set when the policy has no host rules) grants the
-    # internetClient capability: without it the AppContainer is fully
-    # airgapped, which would over-block fs-only policies relative to POSIX
-    # (no host rules = network left alone). The capability only counts
-    # with attributes = SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT
-    # (0x14; enabled alone is inert - probe p124). With host rules the
-    # caller leaves this false and the no-capability container IS the
-    # fence: all egress incl. loopback is denied, so the only way out is
-    # the wall proxy via the proxy env the parent sets before spawning.
-    var capSids: array[1, SID_AND_ATTRIBUTES]
-    var sc: SECURITY_CAPABILITIES
-    sc.appContainerSid = currentAppContainerSid
-    sc.reserved = 0
-    if internetAccess:
-      var icSid: winlean.PSID
-      if convertStringSidToSidW(newWideCString("S-1-15-3-1"), addr icSid) == 0:
-        raise newException(OSError,
-          "sandwall: ConvertStringSidToSidW(internetClient) failed: " &
-          $getLastError())
-      capSids[0].sid = icSid
-      capSids[0].attributes = 0x14'i32
-      sc.capabilities = addr capSids[0]
-      sc.capabilityCount = 1
-    else:
-      sc.capabilities = nil
-      sc.capabilityCount = 0
-
-    var listSize: uint = 0
-    discard initializeProcThreadAttributeList(nil, 1, 0, addr listSize)
-    let attrList = alloc0(listSize.int)
-    defer: dealloc(attrList)
-    if initializeProcThreadAttributeList(attrList, 1, 0, addr listSize) == 0:
-      raise newException(OSError,
-        "sandwall: InitializeProcThreadAttributeList failed: " & $getLastError())
-    defer: deleteProcThreadAttributeList(attrList)
-    if updateProcThreadAttribute(attrList, 0,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, addr sc,
-        uint(sizeof(sc)), nil, nil) == 0:
-      raise newException(OSError,
-        "sandwall: UpdateProcThreadAttribute failed: " & $getLastError())
-
-    # The AppContainer child cannot run a binary unless CreateProcess is
-    # given explicit, valid std handles (STARTF_USESTDHANDLES) and
-    # bInheritHandles=TRUE; with plain inherited std handles (bInheritHandles
-    # = FALSE) spawning any exe inside the container fails with access denied
-    # (verified by probe bisection). Redirect the child's stdout+stderr into
-    # an inheritable anonymous pipe we pump back to our own stdout.
-    var sa: SECURITY_ATTRIBUTES
-    sa.nLength = DWORD(sizeof(sa))
-    sa.lpSecurityDescriptor = nil
-    sa.bInheritHandle = 1
-    var pipeRead, pipeWrite: Handle
-    if createPipe(pipeRead, pipeWrite, sa, 0) == 0:
-      raise newException(OSError,
-        "sandwall: CreatePipe failed: " & $getLastError())
-    # The read end stays with the parent; do not let the child inherit it.
-    discard setHandleInformation(pipeRead, 1, 0)  # HANDLE_FLAG_INHERIT, off
-    defer:
-      discard closeHandle(pipeRead)
-      discard closeHandle(pipeWrite)
-
-    var six = default(STARTUPINFOEX)
-    six.si.cb = DWORD(sizeof(six))
-    six.si.dwFlags = DWORD(STARTF_USESTDHANDLES)
-    six.si.hStdInput = getStdHandle(STD_INPUT_HANDLE)
-    six.si.hStdOutput = pipeWrite
-    six.si.hStdError = pipeWrite
-    six.lpAttributeList = attrList
-    var pi = default(PROCESS_INFORMATION)
-
-    # NOTE: the AppContainer child rejects a custom environment block
-    # (lpEnvironment) outright - CreateProcessW fails with
-    # ERROR_NO_ENVIRONMENT (203) no matter the content (verified by probe
-    # p119). So the child always inherits our environment; there is no way
-    # to inject a modified PATH. Nested exe execution instead relies on
-    # bare-name/relative invocation resolving against the cwd (see the
-    # step-5 note in the module header).
-
-    # Explicit lpCurrentDirectory: the AppContainer virtualizes %TEMP%, and
-    # inheriting a cwd the container cannot reach breaks cmd's redirects.
-    let cwdW = newWideCString(getCurrentDir())
-    if createProcessExW(appName, cmdLineW, nil, nil, 1,
-        DWORD(EXTENDED_STARTUPINFO_PRESENT), nil, cwdW,
-        addr six, pi) == 0:
-      let prog = if appName != nil: $appName else: cmd[0]
-      raise newException(OSError,
-        "sandwall: CreateProcessW(" & prog & ") failed: " & $getLastError())
-    # Parent must close its copy of the write end or reads never see EOF.
-    discard closeHandle(pipeWrite)
-    pipeWrite = 0
-    defer:
-      discard closeHandle(pi.hProcess)
-      discard closeHandle(pi.hThread)
-
-    # Pump the child's output to our stdout while it runs. ReadFile blocks
-    # until data arrives or the pipe closes, so this also naturally waits.
-    let outHandle = getStdHandle(STD_OUTPUT_HANDLE)
-    var buf: array[4096, char]
-    while true:
-      var nread: int32 = 0
-      let ok = readFile(pipeRead, addr buf[0], int32(buf.len), addr nread, nil)
-      if ok == 0 or nread == 0: break
-      discard writeFile(outHandle, addr buf[0], nread, nil, nil)
-
-    # Ensure the child has fully exited (the pump ends at pipe close, which
-    # is process exit, but wait to be certain before reading the exit code).
-    let w = waitForSingleObject(pi.hProcess, INFINITE)
+    # Pump the child's output to our stdout while it runs. The child
+    # inherited our std handles, so its stdout/stderr are already ours;
+    # there is nothing to relay - just wait.
+    let w = waitForSingleObject(ph, INFINITE)
     if w == WAIT_FAILED:
       raise newException(OSError,
         "sandwall: WaitForSingleObject failed: " & $getLastError())
     var code: int32 = 0
-    if getExitCodeProcess(pi.hProcess, code) == 0:
+    if getExitCodeProcess(ph, code) == 0:
       raise newException(OSError,
         "sandwall: GetExitCodeProcess failed: " & $getLastError())
     result = ExitCode(int(code))

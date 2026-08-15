@@ -26,8 +26,8 @@ elif defined(macosx):
   import ./seatbelt
   export seatbelt.backendSupported, seatbelt.backendName
 elif defined(windows):
-  import ./acl
-  export acl.backendSupported, acl.backendName
+  import ./rtoken
+  export rtoken.backendSupported, rtoken.backendName
 
 proc restrict*(writable: openArray[string]; read: openArray[string] = [];
                denied: openArray[string] = [];
@@ -107,7 +107,7 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
     # fenceNet stays a no-op here: the Windows wall is keyed on the
     # sandwall user's SID (wfp.nim) and therefore lives on the spawn
     # path (wall.winuser.spawnAsSandwall), not in this in-process call.
-    acl.restrictImpl(writable, read, denied)
+    rtoken.restrictImpl(writable, read, denied)
   else:
     {.error: "sandwall restrict has no backend for this platform".}
 

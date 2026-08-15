@@ -33,14 +33,17 @@ when defined(windows):
   # --- ACL stamping FFI (accctrl.h / aclapi.h / winnt.h) ---
 
   type
-    # ACCESS_MODE (accctrl.h): GRANT_ACCESS for stamps, REVOKE_ACCESS for
-    # rollback. Sized to int32 to match the Win32 enum.
-    ACCESS_MODE {.size: sizeof(int32).} = enum
+    # ACCESS_MODE (accctrl.h): GRANT_ACCESS for stamps, DENY_ACCESS for
+    # policy narrowing. Sized to int32 to match the Win32 enum. The order
+    # matters: DENY_ACCESS=3, REVOKE_ACCESS=4 (winnt.h); an earlier version
+    # swapped them, so a "deny" stamp silently REVOKEd (a no-op strip) and
+    # deny narrowing under a writable root never took (verified on Win11).
+    ACCESS_MODE* {.size: sizeof(int32).} = enum
       notUsedAccess = 0
       grantAccess   ## allow
       setAccess
+      denyAccess    ## deny (policy narrowing)
       revokeAccess  ## strip all existing ACEs for the trustee
-      denyAccess    ## deny (unused: AppContainer denies by default)
       setAudit
       setAllAudit
 
@@ -51,7 +54,7 @@ when defined(windows):
       trusteeIsObjectsAndSid
       trusteeIsObjectsAndName
 
-    TRUSTEE_TYPE {.size: sizeof(int32).} = enum
+    TRUSTEE_TYPE* {.size: sizeof(int32).} = enum
       trusteeIsUnknown = 0
       trusteeIsUser
       trusteeIsGroup
@@ -74,7 +77,7 @@ when defined(windows):
 
     # Win32 TRUSTEE_W (accctrl.h). Layout verified amd64: 32 bytes,
     # ptstrName at offset 24.
-    TRUSTEE_W {.bycopy.} = object
+    TRUSTEE_W* {.bycopy.} = object
       pMultipleTrustee: pointer
       multipleTrusteeOperation: int32  # NO_MULTIPLE_TRUSTEE = 0
       trusteeForm: TRUSTEE_FORM
@@ -82,13 +85,13 @@ when defined(windows):
       ptstrName: pointer               # PSID when trusteeForm = TRUSTEE_IS_SID
 
     # Win32 EXPLICIT_ACCESS_W. Layout verified amd64: 48 bytes, trustee at 16.
-    EXPLICIT_ACCESS_W {.bycopy.} = object
+    EXPLICIT_ACCESS_W* {.bycopy.} = object
       grfAccessPermissions: DWORD
       grfAccessMode: ACCESS_MODE
       grfInheritance: DWORD
       trustee: TRUSTEE_W
 
-    PACL = pointer
+    PACL* = pointer
 
   const
     # SECURITY_INFORMATION flags (winnt.h)
@@ -242,7 +245,7 @@ when defined(windows):
     currentAppContainerSid = sid
     return sid
 
-  proc buildExplicitAccess(sid: PSID; mode: ACCESS_MODE; rights: DWORD;
+  proc buildExplicitAccess*(sid: PSID; mode: ACCESS_MODE; rights: DWORD;
       inheritance: DWORD): EXPLICIT_ACCESS_W =
     ## Construct an EXPLICIT_ACCESS_W for `sid` (TRUSTEE_IS_SID) with the given
     ## access mode, rights, and inheritance flags.
@@ -255,6 +258,14 @@ when defined(windows):
     result.trustee.trusteeForm = trusteeIsSid
     result.trustee.trusteeType = trusteeIsUser
     result.trustee.ptstrName = sid
+
+  proc buildDefaultDaclEntry*(sid: PSID): EXPLICIT_ACCESS_W =
+    ## EXPLICIT_ACCESS granting GENERIC_ALL (no inheritance) for a token
+    ## default DACL, with TRUSTEE_IS_UNKNOWN (not TRUSTEE_IS_USER): the SIDs
+    ## are a mix of well-known and session SIDs, and UNKNOWN avoids the name
+    ## lookup a typed trustee can trigger. Matches Codex's token default DACL.
+    result = buildExplicitAccess(sid, grantAccess, DWORD(0x10000000'i32), 0)
+    result.trustee.trusteeType = trusteeIsUnknown
 
   proc writeDacl(path: string; acl: PACL) =
     ## Write `acl` as the new DACL for `path`. Raises OSError on failure.
@@ -357,7 +368,7 @@ when defined(windows):
         "sandwall windows-acl: SetNamedSecurityInfo(label-clear) failed on " & path &
         " (error " & $rc & ")")
 
-  proc removeSidAces(path: string; sid: PSID) =
+  proc removeSidAces*(path: string; sid: PSID) =
     ## Strip every ACE whose trustee SID equals `sid` from `path`'s DACL.
     ## SetEntriesInAcl/REVOKE_ACCESS is NOT usable here: on this Windows 11
     ## build it leaves behind a ghost ACCESS_DENIED (mask 0) ACE for the
