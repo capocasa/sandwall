@@ -18,14 +18,13 @@ export wfp.FirstProxyPort, wfp.LastProxyPort, wfp.validPortRange,
   wfp.providerGuidText, wfp.sublayerGuidText, wfp.permitV4GuidText,
   wfp.blockV4GuidText, wfp.permitV6GuidText, wfp.blockV6GuidText
 
-when defined(posix):
-  # proxy/connect are POSIX-only today (AF_UNIX bridge, posix poll/
-  # splice loops). Windows gets the fence (wfp) and the user (winuser)
-  # but no in-library proxy yet; 3code runs the proxy via its own
-  # POSIX binary.
-  import ./wall/proxy
-  export proxy
+import ./wall/proxy
+export proxy
 
+when defined(posix):
+  # connect is the SOCKS5 stdio pump for git ProxyCommand; the netns
+  # bridge story is POSIX-only, so is this. The proxy itself (above)
+  # compiles on Windows too (WSAPoll portability layer).
   import ./wall/connect
   export connect
 
@@ -34,6 +33,8 @@ when defined(linux):
   export netns
 
 when defined(windows):
+  import ./wall/stdio
+  export stdio
   export wfp.installFence, wfp.uninstallFence, wfp.fenceStatus,
     wfp.installAcFence, wfp.uninstallAcFence, wfp.acFenceStatus,
     wfp.exemptAcLoopback, wfp.unexemptAcLoopback,

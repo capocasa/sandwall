@@ -41,13 +41,14 @@
 ## back: a lingering DENY for the sandbox user would break the next
 ## run's writable root.
 
-import std/os
+import std/[os, times]
 
 when defined(windows):
   import std/[winlean, widestrs, strutils, syncio, algorithm]
   import ./acl
   import ./paths
   import ./wall/winuser
+  import ./wall/stdio
 
   # --- FFI ---
 
@@ -111,6 +112,10 @@ when defined(windows):
   proc convertStringSidToSidW(str: WideCString; sid: ptr winlean.PSID): WINBOOL
       {.stdcall, dynlib: "advapi32", importc: "ConvertStringSidToSidW".}
 
+  proc setHandleInformation(hObject: winlean.Handle; dwMask,
+      dwFlags: DWORD): WINBOOL {.stdcall, dynlib: "kernel32",
+      importc: "SetHandleInformation".}
+
   proc localFree(mem: pointer): pointer {.stdcall, dynlib: "kernel32",
       importc: "LocalFree".}
 
@@ -121,6 +126,10 @@ when defined(windows):
 
   var denyStamped: seq[string] = @[]
     ## Deny paths stamped this run; rolled back after the child exits.
+
+  var relayPipe: stdio.RelayPipe
+    ## The current run's stdout pipe for the CPLW child; closed by
+    ## spawnSandboxedAndWait after the child exits.
 
   proc sandboxUserSid*(): winlean.PSID =
     ## Resolve (and cache) the sandbox user's SID from its name.
@@ -168,6 +177,12 @@ when defined(windows):
       if n.len == 0 or n in seen: continue
       seen.add(n)
       for anc in ancestorsNeedGrant(n):
+        # Skip the stamp when the traverse ACE is already there: a
+        # redundant SetNamedSecurityInfoW on a profile dir costs
+        # seconds (NTFS walks the subtree reconciling inheritable
+        # ACEs), and after the first run the ACE is always there.
+        if acl.hasSidAce(anc, sid, DWORD(FILE_TRAVERSE), DWORD(0)):
+          continue
         acl.stampAce(anc, sid, acl.grantAccess, DWORD(FILE_TRAVERSE),
           inheritance = DWORD(0))
       acl.stampAce(n, sid, acl.grantAccess, acl.FILE_ALL_ACCESS)
@@ -181,6 +196,13 @@ when defined(windows):
       if not dirExists(n) and not fileExists(n): continue
       acl.stampAce(n, sid, acl.denyAccess, acl.FILE_ALL_ACCESS)
       denyStamped.add(n)
+
+  proc closeRunRelay*() =
+    ## Close the current run's stdout pipe; the pump thread hits EOF
+    ## and exits. The env var is cleared too (it pointed at the now
+    ## dead pipe). Best-effort.
+    stdio.closeRelay(relayPipe)
+    putenv("NIMBOX_OUT_PIPE", "")
 
   proc rollbackDenies*() =
     ## Remove the DENY ACEs stamped for this run. Best-effort.
@@ -224,36 +246,53 @@ when defined(windows):
     ## Run `cmd` as the sandbox user via CreateProcessWithLogonW inside
     ## a KILL_ON_JOB_CLOSE Job. Returns the process handle. The desktop
     ## string is mandatory (children fail 0xC0000142 without it).
+    ## CreateProcessWithLogonW cannot inherit pipe handles across the
+    ## logon boundary (and CreateProcessAsUserW needs privileges the
+    ## non-elevated caller lacks, error 1314), so the command line is
+    ## prefixed with `<self> wall stdio-relay`: two named pipes
+    ## (everyone DACL) are handed over via the environment, the relay
+    ## opens them by name, installs them as its stdio, and spawns the
+    ## real CMD with ordinary handle inheritance. The parent pumps the
+    ## pipes into its own stdio from a background thread.
     ## `internetAccess` is unused: the WFP fence (keyed on the sandbox
-    ## user) is installed by `3code wall setup-windows` and confines
-    ## the child to loopback automatically; the caller points the child
-    ## at the wall proxy via env when the policy has host rules.
+    ## user) is installed by `3code setup` and confines the child to
+    ## loopback automatically; the caller points the child at the wall
+    ## proxy via env when the policy has host rules.
     if cmd.len == 0:
       raise newException(ValueError, "sandwall.spawnSandboxed: empty command")
     let (ok, password) = winuser.loadSandwallCred()
     if not ok:
       raise newException(OSError,
         "sandwall windows-user: no stored credentials; " &
-        "run `3code wall setup-windows` once (elevated)")
+        "run `3code setup` once (elevated)")
     discard sandboxUserSid()  # fail fast when setup never ran
     let job = ensureJob()
     # The Job handle must outlive the child for KILL_ON_JOB_CLOSE; we
     # leak it into this process (one Job per run, freed at exit).
     discard job
-    let cmdW = newWideCString(quoteCmdLine(cmd))
+    let tag = $epochTime() & "-" & $getCurrentProcessId()
+    relayPipe = stdio.createRelayPipe(tag)
+    putenv("NIMBOX_OUT_PIPE", relayPipe.childName)
+    let relay = when defined(swNoRelay): ""
+                else: getAppFilename() & " wall stdio-relay --"
+    let cmdW = newWideCString(relay & " " & quoteCmdLine(cmd))
     let userW = newWideCString(winuser.sandwallUserName)
     let domW = newWideCString(".")
     let pwW = newWideCString(password)
-    let cwdW = newWideCString(getCurrentDir())
+    let cwdW: WideCString = when defined(swNullCwd): nil
+                            else: newWideCString(getCurrentDir())
     var ph: Handle = 0
     let rc = swSpawnWithLogon(userW, domW, pwW, cmdW, cwdW, addr ph)
     if rc != 0:
       raise newException(OSError,
         "sandwall windows-user: CreateProcessWithLogonW failed (error " &
         $rc & ")")
-    if assignProcessToJobObject(job, ph) == 0:
-      discard closeHandle(ph)
-      fail("AssignProcessToJobObject")
+    when not defined(swNoJob):
+      if assignProcessToJobObject(job, ph) == 0:
+        discard closeHandle(ph)
+        fail("AssignProcessToJobObject")
+    when defined(swNoPump): discard
+    else: stdio.pumpRelay(relayPipe)
     ph
 
 

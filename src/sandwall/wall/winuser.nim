@@ -23,6 +23,7 @@
 
 when defined(windows):
   import std/[winlean, widestrs, os, syncio, strutils]
+  import ../acl
   import ./winffi
 
   {.passL: "-lnetapi32 -lbcrypt -lcrypt32".}
@@ -82,7 +83,15 @@ when defined(windows):
       cbData: DWORD
       pbData: ptr byte
 
+    LOCALGROUP_MEMBERS_INFO_3 {.bycopy.} = object
+      lgrpi3DomainAndName: WideCString
+
   # --- FFI ---
+
+  proc netLocalGroupAddMembers(serverName: WideCString;
+      groupName: WideCString; level: DWORD; buf: pointer;
+      totalEntries: DWORD): DWORD {.stdcall, dynlib: "netapi32",
+      importc: "NetLocalGroupAddMembers".}
 
   proc netUserAdd(serverName: WideCString; level: DWORD;
       buf: pointer; parmErr: ptr DWORD): DWORD {.stdcall,
@@ -113,11 +122,11 @@ when defined(windows):
       pDataOut: ptr DATA_BLOB): WINBOOL {.stdcall, dynlib: "crypt32",
       importc: "CryptUnprotectData".}
 
-  proc logonUserW(lpszUsername: WideCString; lpszDomain: WideCString;
+  proc logonUserW*(lpszUsername: WideCString; lpszDomain: WideCString;
       lpszPassword: WideCString; dwLogonType: DWORD;
       dwLogonProvider: DWORD; phToken: ptr Handle): WINBOOL {.stdcall,
       dynlib: "advapi32", importc: "LogonUserW".}
-  proc createProcessAsUserW(hToken: Handle;
+  proc createProcessAsUserW*(hToken: Handle;
       lpApplicationName: WideCString; lpCommandLine: WideCString;
       lpProcessAttributes: ptr SECURITY_ATTRIBUTES;
       lpThreadAttributes: ptr SECURITY_ATTRIBUTES;
@@ -133,7 +142,7 @@ when defined(windows):
       lpExitCode: ptr DWORD): WINBOOL {.stdcall, dynlib: "kernel32",
       importc: "GetExitCodeProcess".}
 
-  proc fail(what: string) {.noinline.} =
+  proc fail*(what: string) {.noinline.} =
     raise newException(OSError, "sandwall winuser: " & what &
       " failed (win32 error " & $getLastError() & ")")
 
@@ -212,6 +221,57 @@ when defined(windows):
     defer: localFree(str)
     $str
 
+
+  {.compile: "../csrc/desktop_shim.c".}
+  proc swGrantDesktop*(user: WideCString): DWORD {.stdcall,
+      importc: "sw_grant_desktop".}
+
+  proc netLocalGroupAddMems(group, user: string) =
+    ## Add `user` to local `group` (level 3 = names). Best-effort: a
+    ## missing group or an existing membership is not a setup failure.
+    var entries: array[1, LOCALGROUP_MEMBERS_INFO_3]
+    entries[0] = LOCALGROUP_MEMBERS_INFO_3(lgrpi3DomainAndName:
+      newWideCString(user))
+    discard netLocalGroupAddMembers(nil, newWideCString(group), 3,
+      addr entries[0], 1)
+
+  proc grantExecute*(path: string): bool =
+    ## Grant the sandbox user read+execute on `path` (a file: this ACE
+    ## only; a dir: inherited by the tree) plus traverse-only ACEs on
+    ## the profile ancestors, so sandboxed children can run the tools
+    ## that live under the invoking user's private profile. False when
+    ## the path does not exist; raises on ACL failure.
+    if not fileExists(path) and not dirExists(path): return false
+    let name = newWideCString(sandwallUserName)
+    var cbSid, cchDomain: DWORD
+    var use: SID_NAME_USE
+    discard lookupAccountNameW(nil, name, nil, addr cbSid, nil,
+      addr cchDomain, addr use)
+    if cbSid == 0: return false
+    var sid = alloc0(cbSid.int)
+    defer: dealloc(sid)
+    var domain = newWideCString("", cchDomain.int)
+    if lookupAccountNameW(nil, name, sid, addr cbSid, domain,
+        addr cchDomain, addr use) == 0:
+      return false
+    let sidP = cast[winffi.PSID](sid)
+    if dirExists(path):
+      acl.stampAce(path, sidP, acl.grantAccess,
+        acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE,
+        inheritance = DWORD(3))  # OI|CI
+    else:
+      acl.stampAce(path, sidP, acl.grantAccess,
+        acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE,
+        inheritance = DWORD(0))
+    # ancestors of a private profile need traverse for the child to
+    # even reach the file
+    var dir = splitFile(path).dir
+    while dir.len > 3 and dir.contains(r"\Users\"):
+      acl.stampAce(dir, sidP, acl.grantAccess, DWORD(0x20),
+        inheritance = DWORD(0))  # FILE_TRAVERSE, this dir only
+      dir = splitFile(dir).dir
+    true
+
   proc setupSandwallUser*(): string =
     ## Elevated, idempotent: create the sandwall user (or reset its
     ## password), store the password DPAPI-protected, return the SID
@@ -239,6 +299,28 @@ when defined(windows):
       raise newException(OSError,
         "sandwall winuser: user created but SID lookup failed")
     storePassword(password)
+    # NetUserAdd alone leaves the account in NO groups (verified on
+    # Win11: a groupless account's console-subsystem children die at
+    # loader init). "Users" is the standard non-admin membership; the
+    # ACL sandbox still denies everything not explicitly granted.
+    netLocalGroupAddMems("Users", sandwallUserName)
+    # Window station + desktop access: without it a cross-session CPLW
+    # child of a console-subsystem exe hangs at loader init or dies
+    # 0xC0000142 (verified on Win11; see csrc/desktop_shim.c).
+    let drc = swGrantDesktop(newWideCString(sandwallUserName))
+    if drc != 0:
+      raise newException(OSError,
+        "sandwall winuser: desktop grant failed (error " & $drc & ")")
+    # The sandbox user must be able to execute the tools the sandboxed
+    # children run: the calling binary (it re-execs as the stdio relay)
+    # and, when present, the bundled MSYS2 tree 3code's bash tool uses.
+    # These live under the invoking user's private profile, whose ACLs
+    # deny every other account; grant read+execute (and traverse on the
+    # ancestors) once here instead of on every run.
+    discard grantExecute(getAppFilename())
+    let msys = getEnv("LOCALAPPDATA", "") & r"\3code\msys64"
+    if dirExists(msys):
+      discard grantExecute(msys)
 
   proc buildCommandLine(cmd: openArray[string]): WideCString =
     ## Minimal quoting: wrap args containing whitespace in quotes.

@@ -368,6 +368,41 @@ when defined(windows):
         "sandwall windows-acl: SetNamedSecurityInfo(label-clear) failed on " & path &
         " (error " & $rc & ")")
 
+
+  proc hasSidAce*(path: string; sid: PSID; rights: DWORD;
+      inheritance: DWORD): bool =
+    ## True when `path`'s DACL already carries an ALLOW ACE for `sid`
+    ## covering `rights` with matching `inheritance`. Lets callers skip
+    ## a redundant SetNamedSecurityInfoW, which on profile directories
+    ## costs seconds (NTFS walks the subtree reconciling inheritable
+    ## ACEs even when nothing changes).
+    var oldDacl: PACL = nil
+    var sd: pointer = nil
+    let wpathObj = newWideCString(path)
+    let wpath: WideCString = wpathObj
+    let rc0 = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
+      DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
+    if rc0 != 0:
+      raise newException(OSError,
+        "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
+        " (error " & $rc0 & ")")
+    defer: localFree(sd)
+    if oldDacl.isNil: return false
+    let aceCount = int(cast[ptr uint16](cast[uint](oldDacl) + 2)[])
+    for i in 0 ..< aceCount:
+      var ace: pointer = nil
+      if getAce(oldDacl, DWORD(i), addr ace) == 0: continue
+      # AceType at +1: 0 = ACCESS_ALLOWED_ACE_TYPE
+      if cast[ptr uint8](cast[uint](ace) + 1)[] != 0: continue
+      let aceMask = cast[ptr DWORD](cast[uint](ace) + 4)[]
+      let aceFlags = cast[ptr uint8](cast[uint](ace) + 3)[]
+      let aceSid = cast[PSID](cast[pointer](cast[uint](ace) + 8))
+      if not sameSid(aceSid, sid): continue
+      if (aceMask and rights) != rights: continue
+      if (DWORD(aceFlags) and DWORD(0x0F)) != inheritance: continue
+      return true
+    false
+
   proc removeSidAces*(path: string; sid: PSID) =
     ## Strip every ACE whose trustee SID equals `sid` from `path`'s DACL.
     ## SetEntriesInAcl/REVOKE_ACCESS is NOT usable here: on this Windows 11

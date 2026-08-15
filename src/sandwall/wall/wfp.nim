@@ -606,9 +606,16 @@ when defined(windows):
       fail("DeriveAppContainerSidFromAppContainerName", DWORD(getLastError()))
 
   proc installAcFence*() =
+    ## Idempotent like installFence: delete our previous filters by
+    ## key first so a re-run over an existing install does not fail
+    ## with FwpmFilterAdd0 ALREADY_EXISTS.
     let engine = openEngine(allocWide("sandwall-ac-setup"))
     defer: discard fwpmEngineClose0(engine)
     ensureProviderAndSublayer(engine)
+    for keyText in [acPermitV4GuidText, acBlockV4GuidText,
+                    acPermitV6GuidText, acBlockV6GuidText]:
+      let key = parseGuid(keyText)
+      discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
     let acSid = getAcSidRaw()
 
     # Same loopback permits as the user fence, but keyed on the

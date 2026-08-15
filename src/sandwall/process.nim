@@ -77,6 +77,7 @@ when defined(windows):
     # The child inherited our std handles, so its stdout/stderr are
     # already ours; there is nothing to relay - just wait.
     let w = waitForSingleObject(ph, INFINITE)
+    rtoken.closeRunRelay()
     if w == WAIT_FAILED:
       raise newException(OSError,
         "sandwall: WaitForSingleObject failed: " & $getLastError())
