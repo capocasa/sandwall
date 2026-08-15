@@ -34,18 +34,25 @@ proc expectFile(path: string): bool = fileExists(path)
 # On Windows the dedicated-user backend needs the one-time elevated
 # `sandwall setup` (sandbox user + credentials). CI runners have no
 # sandbox user; every spawn-through-backend test would fail with
-# "user does not exist". The backend itself is validated on a real
-# machine (see CHANGELOG 0.4.0).
+# "user does not exist". Gate the bodies on backend presence (skip()
+# alone does not stop the body from running). The backend itself is
+# validated on a real machine (see CHANGELOG 0.4.0).
 when defined(windows):
   import sandwall
-  var winBackendReady = sandwall.backendSupported()
+  # Runtime probe, not const: backendSupported calls CryptUnprotectData
+  # (FFI), which cannot run at compile time.
+  let winBackendReady = sandwall.backendSupported()
 else:
   const winBackendReady = true
 
-template skipIfNoBackend() =
+template backendGuard*(body: untyped): untyped =
   when defined(windows):
-    if not winBackendReady:
+    if winBackendReady:
+      body
+    else:
       skip()
+  else:
+    body
 
 proc systemReadDirs(): seq[string] =
   ## Read-only system dirs used by library tests that call restrict()
@@ -85,17 +92,17 @@ proc sw(rules: string; cmd: string): string =
 
 suite "sandwall CLI (sandboxed exec)":
   test "allow allowed, write denied":
-    skipIfNoBackend()
-    let a = tempDir("cli-a")
-    let d = tempDir("cli-d")
-    let rules = rulesFile("a", "allow " & a & "\n")
-    # the allowed write runs in one invocation, the denied in another,
-    # because a failing redirect makes the shell exit nonzero.
-    discard execCmd(sw(rules, redirectCmd(a / "x.txt")))
-    let rcDenied = execCmd(sw(rules, redirectCmd(d / "y.txt")))
-    check: expectFile(a / "x.txt")
-    check: rcDenied != 0
-    check: not expectFile(d / "y.txt")
+    backendGuard:
+      let a = tempDir("cli-a")
+      let d = tempDir("cli-d")
+      let rules = rulesFile("a", "allow " & a & "\n")
+      # the allowed write runs in one invocation, the denied in another,
+      # because a failing redirect makes the shell exit nonzero.
+      discard execCmd(sw(rules, redirectCmd(a / "x.txt")))
+      let rcDenied = execCmd(sw(rules, redirectCmd(d / "y.txt")))
+      check: expectFile(a / "x.txt")
+      check: rcDenied != 0
+      check: not expectFile(d / "y.txt")
 
   # posix-only: targets /usr/bin, which has no Windows analogue.
   when not defined(windows):
@@ -143,58 +150,60 @@ suite "sandwall CLI (sandboxed exec)":
         removeFile(marker)
 
   test "readonly path is readable but not writable":
-    skipIfNoBackend()
-    let rw = tempDir("ro-rw")
-    let ro = tempDir("ro-ro")
-    writeFile(ro / "secret.txt", "topsecret")
-    let rules = rulesFile("ro", "allow " & rw & "\nreadonly " & ro & "\n")
-    # read from the read-only path succeeds
-    let rcRead = execCmd(sw(rules, catCmd(ro / "secret.txt")))
-    check: rcRead == 0
-    # write to the read-only path fails
-    let rcWrite = execCmd(sw(rules, redirectCmd(ro / "new.txt")))
-    check: rcWrite != 0
-    check: not fileExists(ro / "new.txt")
+    backendGuard:
+      let rw = tempDir("ro-rw")
+      let ro = tempDir("ro-ro")
+      writeFile(ro / "secret.txt", "topsecret")
+      let rules = rulesFile("ro", "allow " & rw & "\nreadonly " & ro & "\n")
+      # read from the read-only path succeeds
+      let rcRead = execCmd(sw(rules, catCmd(ro / "secret.txt")))
+      check: rcRead == 0
+      # write to the read-only path fails
+      let rcWrite = execCmd(sw(rules, redirectCmd(ro / "new.txt")))
+      check: rcWrite != 0
+      check: not fileExists(ro / "new.txt")
 
   test "missing rules file errors":
-    let rc = execCmd(sandwallExe().quoteShell & " /nonexistent-rules -- true")
-    check: rc == 2
+    backendGuard:
+      let rc = execCmd(sandwallExe().quoteShell & " /nonexistent-rules -- true")
+      check: rc == 2
 
   test "no command given errors":
-    let rules = rulesFile("nocmd", "allow /tmp\n")
-    let rc = execCmd(sandwallExe().quoteShell & " " & rules.quoteShell)
-    check: rc == 2
+    backendGuard:
+      let rules = rulesFile("nocmd", "allow /tmp\n")
+      let rc = execCmd(sandwallExe().quoteShell & " " & rules.quoteShell)
+      check: rc == 2
 
   test "deny narrows a writable root (sub-path deny)":
-    skipIfNoBackend()
-    # The grammar's last-wins narrowing, compiled to the backend: a
-    # denied subpath under a writable root is unreachable while the
-    # rest of the root stays writable. On Linux this exercises the
-    # userns+bind-mask path; on Seatbelt the ordered profile.
-    let rw = tempDir("deny-rw")
-    let sub = rw / "locked"
-    createDir(sub)
-    writeFile(sub / "secret.txt", "x")
-    let rules = rulesFile("deny", "allow " & rw & "\ndeny " & sub & "\n")
-    # The probe reads the denied secret and reports DENIED on failure.
-    # sh/cmd both exit nonzero on a failed read; wrap so the CLI rc is 0
-    # and we assert on the marker instead.
-    when defined(windows):
-      let probe = "cmd /c \"type " & (sub / "secret.txt") &
-        " 2>NUL || echo DENIED\""
-    else:
-      let probe = "sh -c " & ("cat " & (sub / "secret.txt").quoteShell &
-        " 2>/dev/null || echo DENIED").quoteShell
-    let (outp, rc) = execCmdEx(sw(rules, probe))
-    check: rc == 0
-    check: "DENIED" in outp
-    # Sibling writes still work.
-    let wrc = execCmd(sw(rules, redirectCmd(rw / "fine.txt")))
-    check: wrc == 0
-    check: fileExists(rw / "fine.txt")
-    # The host's view is untouched (POSIX: the mask lives in the child's
-    # mount namespace; Windows: the deny ACE is rolled back after the run).
-    check: readFile(sub / "secret.txt") == "x"
+    backendGuard:
+      # The grammar's last-wins narrowing, compiled to the backend: a
+      # denied subpath under a writable root is unreachable while the
+      # rest of the root stays writable. On Linux this exercises the
+      # userns+bind-mask path; on Seatbelt the ordered profile.
+      let rw = tempDir("deny-rw")
+      let sub = rw / "locked"
+      createDir(sub)
+      writeFile(sub / "secret.txt", "x")
+      let rules = rulesFile("deny", "allow " & rw & "\ndeny " & sub & "\n")
+      # The probe reads the denied secret and reports DENIED on failure.
+      # sh/cmd both exit nonzero on a failed read; wrap so the CLI rc is 0
+      # and we assert on the marker instead.
+      when defined(windows):
+        let probe = "cmd /c \"type " & (sub / "secret.txt") &
+          " 2>NUL || echo DENIED\""
+      else:
+        let probe = "sh -c " & ("cat " & (sub / "secret.txt").quoteShell &
+          " 2>/dev/null || echo DENIED").quoteShell
+      let (outp, rc) = execCmdEx(sw(rules, probe))
+      check: rc == 0
+      check: "DENIED" in outp
+      # Sibling writes still work.
+      let wrc = execCmd(sw(rules, redirectCmd(rw / "fine.txt")))
+      check: wrc == 0
+      check: fileExists(rw / "fine.txt")
+      # The host's view is untouched (POSIX: the mask lives in the child's
+      # mount namespace; Windows: the deny ACE is rolled back after the run).
+      check: readFile(sub / "secret.txt") == "x"
 
   when defined(windows):
     test "host rules are accepted and fence egress (airgap)":
