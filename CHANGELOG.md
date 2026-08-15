@@ -3,6 +3,38 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] - 2026-08-15
+
+### Changed
+
+- Windows backend replaced: the filesystem sandbox now runs commands
+  as a dedicated local user (`sandwall`, created by the one-time
+  elevated `setup`) via CreateProcessWithLogonW with
+  lpDesktop="winsta0\default", inside a KILL_ON_JOB_CLOSE Job.
+  Writable roots get an ALLOW ACE for that user (plus traverse-only
+  ACEs on profile ancestors); deny-narrowing stamps a DENY ACE that is
+  rolled back after the run. This replaces both the AppContainer
+  backend (killed msys2/cygwin at DLL init) and the same-user
+  write-restricted-token backend: the restricted-token model needs the
+  token user SID in the restricting list for msys2's owner-ACL'd
+  signal pipe, which makes every user-writable path writable and the
+  sandbox a no-op (verified on Windows 11; the same wall as
+  openai/codex#17459). The dedicated user also lets the existing WFP
+  fence confine sandboxed network egress at the kernel (verified:
+  off-loopback connect blocked) and keeps schannel https working for
+  tools that use it.
+- CreateProcessWithLogonW is called through a C shim
+  (csrc/spawn_shim.c): the real prototype takes 11 arguments (no
+  process/thread attribute params, no inherit flag); a hand-written
+  Nim import with the CreateProcessAsUserW shape misaligns the stack
+  and SIGSEGVs.
+
+### Fixed
+
+- ACCESS_MODE enum order in acl.nim: DENY_ACCESS=3 and REVOKE_ACCESS=4
+  were swapped, so a policy `deny` stamp silently REVOKEd (a no-op
+  strip) and deny-narrowing under a writable root never took.
+
 ## [0.2.7] - 2026-08-13
 
 ### Added
