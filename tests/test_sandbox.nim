@@ -31,6 +31,22 @@ proc tempDir(name: string): string =
 
 proc expectFile(path: string): bool = fileExists(path)
 
+# On Windows the dedicated-user backend needs the one-time elevated
+# `sandwall setup` (sandbox user + credentials). CI runners have no
+# sandbox user; every spawn-through-backend test would fail with
+# "user does not exist". The backend itself is validated on a real
+# machine (see CHANGELOG 0.4.0).
+when defined(windows):
+  import sandwall
+  var winBackendReady = sandwall.backendSupported()
+else:
+  const winBackendReady = true
+
+template skipIfNoBackend() =
+  when defined(windows):
+    if not winBackendReady:
+      skip()
+
 proc systemReadDirs(): seq[string] =
   ## Read-only system dirs used by library tests that call restrict()
   ## directly. The CLI path and the backends auto-add OS-specific baselines,
@@ -69,6 +85,7 @@ proc sw(rules: string; cmd: string): string =
 
 suite "sandwall CLI (sandboxed exec)":
   test "allow allowed, write denied":
+    skipIfNoBackend()
     let a = tempDir("cli-a")
     let d = tempDir("cli-d")
     let rules = rulesFile("a", "allow " & a & "\n")
@@ -126,6 +143,7 @@ suite "sandwall CLI (sandboxed exec)":
         removeFile(marker)
 
   test "readonly path is readable but not writable":
+    skipIfNoBackend()
     let rw = tempDir("ro-rw")
     let ro = tempDir("ro-ro")
     writeFile(ro / "secret.txt", "topsecret")
@@ -148,6 +166,7 @@ suite "sandwall CLI (sandboxed exec)":
     check: rc == 2
 
   test "deny narrows a writable root (sub-path deny)":
+    skipIfNoBackend()
     # The grammar's last-wins narrowing, compiled to the backend: a
     # denied subpath under a writable root is unreachable while the
     # rest of the root stays writable. On Linux this exercises the
