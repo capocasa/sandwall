@@ -209,17 +209,17 @@ suite "sandwall CLI (sandboxed exec)":
     test "host rules are accepted and fence egress (airgap)":
       # Loopback-hermetic: a rules file with a host rule must run the
       # child (the CLI must NOT reject host rules), hand it the proxy
-      # env, and leave it with no network at all (the no-capability
-      # AppContainer blocks even loopback, so the wall proxy/allowlist
-      # cannot pass traffic - the airgap posture).
-      let a = tempDir("net-a")
-      let rules = rulesFile("netw", "allow " & a & "\nallow example.com\n")
-      let probe = "cmd /c \"echo p=%http_proxy% & curl -s --noproxy * " &
-        "--max-time 3 http://example.com/ 2>NUL || echo OFFLINE\""
-      let (outp, rc) = execCmdEx(sw(rules, probe))
-      check: rc == 0
-      check: "p=http://127.0.0.1:" in outp   # proxy env inherited
-      check: "OFFLINE" in outp               # direct egress fenced
+      # env, and leave it with no network at all (the fence blocks
+      # non-loopback egress at the kernel - the airgap posture).
+      backendGuard:
+        let a = tempDir("net-a")
+        let rules = rulesFile("netw", "allow " & a & "\nallow example.com\n")
+        let probe = "cmd /c \"echo p=%http_proxy% & curl -s --noproxy * " &
+          "--max-time 3 http://example.com/ 2>NUL || echo OFFLINE\""
+        let (outp, rc) = execCmdEx(sw(rules, probe))
+        check: rc == 0
+        check: "p=http://127.0.0.1:" in outp   # proxy env inherited
+        check: "OFFLINE" in outp               # direct egress fenced
 
   when defined(linux):
     test "host rules fence the network (allowed via proxy, direct blocked)":
