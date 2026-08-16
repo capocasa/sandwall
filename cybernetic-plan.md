@@ -116,12 +116,18 @@ this context; steps needing it are marked and gated.
    rules' own copy deleted. rtoken's FILE_TRAVERSE/inherit consts ->
    acl.nim exports (done in step 3). winuser's userSid helper (done in
    step 5). internetAccess/inetOk dropped (step 2). Committed 91dd932.
-10. [ ] Full verify: nimble test, mingw compile of the whole tree
-    (every module in src/sandwall/wall + sandwall.nim), grep for
-    leftovers (SwCondDesc, sw_provider_add, quoteCmdLine copies,
-    swNoRelay, stampAcls). Update CHANGELOG (Unreleased section:
-    shims removed, AC backend deleted, quoting unified, lifecycle
-    block). Review full diff, commit.
+10. [x] Full verify DONE: nimble test (only the 3 pre-existing
+    userns-blocked failures; all other suites green), whole-tree
+    mingw compile clean per-module, release build clean, live CLI
+    smoke test (read ok, write to writable root ok, /etc/shadow
+    denied by Landlock). Leftover greps silent (SwCondDesc, shims,
+    debug defines, stampAcls, closeRunRelay, quote copies: all gone).
+    CHANGELOG Unreleased section written. NOTE: an UNCOMMITTED
+    concurrent edit appeared in rtoken.nim during this session
+    (CREATE_NO_WINDOW + STARTF_USESHOWWINDOW/SW_HIDE for the CPLW
+    child, mtime 12:51, after my last commit at 12:43) - not mine,
+    compiles clean, LEFT UNCOMMITTED for the owner to review.
+    Committed 08f7084.
 11. [ ] Windows live verification: needs the beck VM (tests/wincli.sh
     + sandwall setup + a fenced spawn). If unavailable, record
     exactly what remains unverified in Current state and STOP there;
@@ -140,4 +146,4 @@ NOTE for all later steps: `nimble test` fails in test_sandbox with
 (this box's sandbox blocks the userns write). Green bar = the other
 7 test files pass + whole-tree mingw compile:
   nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src -o:/tmp/sw_win.o src/sandwall.nim
-Next: step 10 (full verify + changelog).
+Next: step 11 (Windows live verify - likely blocked here).
