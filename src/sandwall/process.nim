@@ -27,7 +27,7 @@ proc `$`*(e: ExitCode): string = $(int(e))
 
 when defined(windows):
   import std/[winlean, widestrs, strutils]
-  import ./rtoken  # spawnSandboxed, rollbackDenies
+  import ./rtoken  # spawnSandboxed
 
   proc findExeInPath*(name: string): string =
     ## Resolve a bare command name against PATH/PATHEXT like cmd does:
@@ -60,32 +60,15 @@ when defined(windows):
       if hit.len > 0: return hit
     name
 
-  proc spawnSandboxedAndWait*(cmd: openArray[string];
-                               internetAccess = false): ExitCode =
-    ## Spawn `cmd` as the sandbox user (see rtoken.spawnSandboxed),
-    ## wait for it, and roll back the per-run DENY narrowing in a
-    ## `defer`. The ALLOW grants for the sandbox user persist (only
-    ## sandboxed children run as that user). Raises if the spawn fails.
-    ## `internetAccess` is unused: the WFP fence installed by
-    ## `3code wall setup-windows` confines the sandbox user to loopback
-    ## either way; the caller routes traffic through the wall proxy via
-    ## env when the policy has host rules.
-    defer: rtoken.rollbackDenies()
-    let ph = rtoken.spawnSandboxed(cmd)
-    defer: discard closeHandle(ph)
-
-    # The child inherited our std handles, so its stdout/stderr are
-    # already ours; there is nothing to relay - just wait.
-    let w = waitForSingleObject(ph, INFINITE)
-    rtoken.closeRunRelay()
-    if w == WAIT_FAILED:
-      raise newException(OSError,
-        "sandwall: WaitForSingleObject failed: " & $getLastError())
-    var code: int32 = 0
-    if getExitCodeProcess(ph, code) == 0:
-      raise newException(OSError,
-        "sandwall: GetExitCodeProcess failed: " & $getLastError())
-    result = ExitCode(int(code))
+  proc spawnSandboxedAndWait*(cmd: openArray[string]): ExitCode =
+    ## Spawn `cmd` as the sandbox user, wait for it, and unwind the
+    ## per-run state (stdout pipe, DENY narrowing) inside the library
+    ## (rtoken.runAsSandboxUser owns it). Raises if the spawn
+    ## fails. The WFP fence installed by `3code wall setup-windows`
+    ## confines the sandbox user to loopback either way; the caller
+    ## routes traffic through the wall proxy via env when the policy
+    ## has host rules.
+    ExitCode(rtoken.runAsSandboxUser(cmd))
 else:
   import std/[posix, strutils]
 
@@ -127,8 +110,7 @@ else:
 
 template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
                         read: openArray[string] = [];
-                        denied: openArray[string] = [];
-                        inetOk: bool = false): ExitCode =
+                        denied: openArray[string] = []): ExitCode =
   ## One-shot helper. Restricts to `writable` (full access) plus `read`
   ## (read+execute only) and runs `cmd`, returning its exit code.
   ##
@@ -142,7 +124,7 @@ template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
   block:
     when defined(windows):
       restrict(writable, read, denied)
-      spawnSandboxedAndWait(cmd, internetAccess = inetOk)
+      spawnSandboxedAndWait(cmd)
     else:
       let pid = forkNimbox()
       if pid == 0:

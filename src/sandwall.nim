@@ -159,14 +159,13 @@ filesystem policy are enforced with no setup step.
             "the WFP fence is not installed. The child will have OPEN " &
             "network access. Run 'sandwall setup' (elevated) to install " &
             "the fence and enforce the host allowlist.")
-      # With host rules: always grant internetClient. The WFP fence
-      # (if installed via setup) blocks non-loopback egress at the kernel;
-      # loopback reaches the wall proxy which enforces the allowlist. If
-      # the fence is absent, the child has open network (accepted degrade).
+      # With host rules: the WFP fence (if installed via setup)
+      # blocks non-loopback egress at the kernel; loopback reaches the
+      # wall proxy which enforces the allowlist. If the fence is
+      # absent, the child has open network (accepted degrade).
       try:
         return int(runSandboxed(r.writable, cmd, read = r.readonly,
-                                denied = r.denied,
-                                inetOk = true))
+                                denied = r.denied))
       except CatchableError as e:
         stderr.writeLine("sandwall: " & e.msg)
         return 127

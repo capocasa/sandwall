@@ -100,10 +100,6 @@ when defined(windows):
       importc: "SetInformationJobObject".}
   proc assignProcessToJobObject(job, process: Handle): WINBOOL {.stdcall,
       dynlib: "kernel32", importc: "AssignProcessToJobObject".}
-  proc resumeThread(thread: Handle): DWORD {.stdcall, dynlib: "kernel32",
-      importc: "ResumeThread".}
-  proc suspendThread(thread: Handle): DWORD {.stdcall, dynlib: "kernel32",
-      importc: "SuspendThread".}
   proc fail(what: string) {.noinline.} =
     raise newException(OSError,
       "sandwall windows-user: " & what & " failed (error " & $getLastError() & ")")
@@ -146,7 +142,7 @@ when defined(windows):
 
   var relayPipe: stdio.RelayPipe
     ## The current run's stdout pipe for the CPLW child; closed by
-    ## spawnSandboxedAndWait after the child exits.
+    ## endRun after the child exits.
 
   proc sandboxUserSid*(): winlean.PSID =
     ## Resolve (and cache) the sandbox user's SID from its name.
@@ -214,15 +210,13 @@ when defined(windows):
       acl.stampAce(n, sid, acl.denyAccess, acl.FILE_ALL_ACCESS)
       denyStamped.add(n)
 
-  proc closeRunRelay*() =
-    ## Close the current run's stdout pipe; the pump thread hits EOF
-    ## and exits. The env var is cleared too (it pointed at the now
-    ## dead pipe). Best-effort.
+  proc endRun() =
+    ## Unwind one run's side effects: close the stdout pipe (the pump
+    ## thread sees EOF and exits, the env var pointed at a dead pipe)
+    ## and remove the DENY ACEs stamped for this run. Both best-effort
+    ## - cleanup of the rest must not abort on one failure.
     stdio.closeRelay(relayPipe)
     putenv("NIMBOX_OUT_PIPE", "")
-
-  proc rollbackDenies*() =
-    ## Remove the DENY ACEs stamped for this run. Best-effort.
     if denyStamped.len == 0: return
     let sid = sandboxUserSid()
     let paths = denyStamped
@@ -248,23 +242,21 @@ when defined(windows):
       fail("SetInformationJobObject")
     job
 
-  proc spawnSandboxed*(cmd: openArray[string];
-                       internetAccess = false): Handle =
+  proc spawnSandboxed*(cmd: openArray[string]): Handle =
     ## Run `cmd` as the sandbox user via CreateProcessWithLogonW inside
-    ## a KILL_ON_JOB_CLOSE Job. Returns the process handle. The desktop
-    ## string is mandatory (children fail 0xC0000142 without it).
+    ## a KILL_ON_JOB_CLOSE Job. Returns the process handle.
     ## CreateProcessWithLogonW cannot inherit pipe handles across the
     ## logon boundary (and CreateProcessAsUserW needs privileges the
     ## non-elevated caller lacks, error 1314), so the command line is
-    ## prefixed with `<self> stdio-relay`: two named pipes
-    ## (everyone DACL) are handed over via the environment, the relay
-    ## opens them by name, installs them as its stdio, and spawns the
+    ## prefixed with `<self> stdio-relay`: a named pipe
+    ## (everyone DACL) is handed over via the environment, the relay
+    ## opens it by name, installs it as its stdio, and spawns the
     ## real CMD with ordinary handle inheritance. The parent pumps the
-    ## pipes into its own stdio from a background thread.
-    ## `internetAccess` is unused: the WFP fence (keyed on the sandbox
-    ## user) is installed by `3code setup` and confines the child to
-    ## loopback automatically; the caller points the child at the wall
-    ## proxy via env when the policy has host rules.
+    ## pipe into its own stdio from a background thread.
+    ## The WFP fence (keyed on the sandbox user) confines the child to
+    ## loopback; the caller points the child at the wall proxy via env
+    ## when the policy has host rules. On any failure after the relay
+    ## pipe exists, endRun() unwinds it.
     if cmd.len == 0:
       raise newException(ValueError, "sandwall.spawnSandboxed: empty command")
     let (ok, password) = winuser.loadSandwallCred()
@@ -279,29 +271,56 @@ when defined(windows):
     discard job
     let tag = $epochTime() & "-" & $getCurrentProcessId()
     relayPipe = stdio.createRelayPipe(tag)
-    putenv("NIMBOX_OUT_PIPE", relayPipe.childName)
-    let relay = when defined(swNoRelay): ""
-                else: getAppFilename() & " stdio-relay --"
-    let cmdW = newWideCString(relay & " " & quoteCmdLine(cmd))
-    let userW = newWideCString(winuser.sandwallUserName)
-    let domW = newWideCString(".")
-    let pwW = newWideCString(password)
-    let cwdW: WideCString = when defined(swNullCwd): nil
-                            else: newWideCString(getCurrentDir())
-    var ph: Handle = 0
-    let envW = buildEnvBlockW()
-    let rc = swSpawnWithLogon(userW, domW, pwW, cmdW, envW, cwdW, addr ph)
-    if rc != 0:
-      raise newException(OSError,
-        "sandwall windows-user: CreateProcessWithLogonW failed (error " &
-        $rc & ")")
-    when not defined(swNoJob):
+    try:
+      putenv("NIMBOX_OUT_PIPE", relayPipe.childName)
+      let relay = getAppFilename() & " stdio-relay --"
+      let cmdW = newWideCString(relay & " " & quoteCmdLine(cmd))
+      let userW = newWideCString(winuser.sandwallUserName)
+      let domW = newWideCString(".")
+      let pwW = newWideCString(password)
+      let cwdW = newWideCString(getCurrentDir())
+      var ph: Handle = 0
+      let envW = buildEnvBlockW()
+      let rc = swSpawnWithLogon(userW, domW, pwW, cmdW, envW, cwdW, addr ph)
+      if rc != 0:
+        raise newException(OSError,
+          "sandwall windows-user: CreateProcessWithLogonW failed (error " &
+          $rc & ")")
       if assignProcessToJobObject(job, ph) == 0:
         discard closeHandle(ph)
         fail("AssignProcessToJobObject")
-    when defined(swNoPump): discard
-    else: stdio.pumpRelay(relayPipe)
-    ph
+      stdio.pumpRelay(relayPipe)
+      ph
+    except CatchableError:
+      endRun()
+      raise
+
+  proc waitForExit*(ph: Handle): int =
+    ## Block until `ph` exits and return its exit code. Raises on
+    ## WaitForSingleObject/GetExitCodeProcess failure. The caller owns
+    ## unwinding via endRun (runAsSandboxUser does).
+    let w = waitForSingleObject(ph, INFINITE)
+    if w == WAIT_FAILED:
+      raise newException(OSError,
+        "sandwall: WaitForSingleObject failed: " & $getLastError())
+    var code: int32 = 0
+    if getExitCodeProcess(ph, code) == 0:
+      raise newException(OSError,
+        "sandwall: GetExitCodeProcess failed: " & $getLastError())
+    int(code)
+
+  proc runAsSandboxUser*(cmd: openArray[string]): int =
+    ## The whole run in one block: spawn as the sandbox user, wait,
+    ## then unwind (pipe close + deny rollback) even when the wait
+    ## raises. The ALLOW grants persist (only sandboxed children run as
+    ## that user); a lingering DENY would break the next run, so the
+    ## rollback is the one thing that must not be skipped.
+    let ph = spawnSandboxed(cmd)
+    defer: discard closeHandle(ph)
+    try:
+      waitForExit(ph)
+    finally:
+      endRun()
 
 
 proc backendSupported*(): bool =
