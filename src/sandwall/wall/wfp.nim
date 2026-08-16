@@ -12,7 +12,7 @@
 ## Filter table, checked against srt's srt-win-src/src/wfp.rs:
 ##
 ##   layers  FWPM_LAYER_ALE_AUTH_CONNECT_V4 and _V6 (same shape twice)
-##   PERMIT  weight 0x0F80_0000_0000_0000
+##   PERMIT  (BFE auto-weight: outranks the block via condition count)
 ##           v4: IP_REMOTE_ADDRESS in 127.0.0.0/8  AND
 ##               IP_REMOTE_PORT in range (FWP_MATCH_RANGE)
 ##           v6: IP_REMOTE_ADDRESS == ::1          AND
@@ -20,7 +20,7 @@
 ##           (srt keys the permit on the user SID too; we leave it
 ##           unconditional - the only listener on the port range is
 ##           our proxy, so a non-sandwall user reaching it is fine)
-##   BLOCK   weight 0x0F40_0000_0000_0000 (below the permit)
+##   BLOCK   (fewer conditions than the permit: lower auto-weight)
 ##           ALE_USER_ID matches the SD built from SDDL
 ##           `O:LSG:LSD:(A;;CC;;;<sid>)` for the sandwall user
 ##           action types: FWP_ACTION_BLOCK 0x00002001,
@@ -105,31 +105,7 @@ when defined(windows):
   export winffi.PSID
 
   {.passL: "-lfwpuclnt -ladvapi32".}
-  {.compile: "csrc/wfp_shim.c".}
 
-  # C shim wrappers (see csrc/wfp_shim.c) — avoid Nim ORC GC issues
-  # with WFP RPC when passing structs containing GC-managed pointers.
-  proc swProviderAdd(engine: Handle; rawGuid: ptr byte;
-      name: ptr UncheckedArray[Utf16Char]): DWORD {.stdcall,
-      importc: "sw_provider_add".}
-  proc swSublayerAdd(engine: Handle; rawGuid: ptr byte;
-      name: ptr UncheckedArray[Utf16Char];
-      weight: uint16): DWORD {.stdcall,
-      importc: "sw_sublayer_add".}
-  type
-    SwCondDesc* {.bycopy.} = object
-      fieldKey: array[16, byte]
-      matchType: uint32
-      kind: uint32
-      pad: uint32
-      value: uint64
-
-  proc swFilterAdd(engine: Handle; providerGuid: ptr byte;
-      filterKey: ptr byte; sublayerGuid: ptr byte; layerGuid: ptr byte;
-      weight: uint64; name: ptr UncheckedArray[Utf16Char];
-      actionType: uint32; conds: ptr SwCondDesc; numConds: uint32;
-      outId: ptr uint64): DWORD {.stdcall,
-      importc: "sw_filter_add".}
 
   # --- types (fwpmu.h / fwptypes.h) ---
 
@@ -394,13 +370,22 @@ when defined(windows):
 
   proc ensureProviderAndSublayer(engine: Handle) =
     let name = allocWide("sandwall")
-    var rc = swProviderAdd(engine, cast[ptr byte](unsafeAddr providerKey),
-      name)
-    if rc != 0'i32 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
+    var prov: FWPM_PROVIDER0
+    zeroMem(addr prov, sizeof(prov))
+    prov.providerKey = providerKey
+    prov.displayData.name = name
+    prov.displayData.description = name
+    var rc = fwpmProviderAdd0(engine, addr prov, nil)
+    if rc != 0 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
       fail("FwpmProviderAdd0", rc)
-    rc = swSublayerAdd(engine, cast[ptr byte](unsafeAddr sublayerKey),
-      name, 0xFFFF)
-    if rc != 0'i32 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
+    var sub: FWPM_SUBLAYER0
+    zeroMem(addr sub, sizeof(sub))
+    sub.subLayerKey = sublayerKey
+    sub.displayData.name = name
+    sub.displayData.description = name
+    sub.weight = 0xFFFF
+    rc = fwpmSubLayerAdd0(engine, addr sub, nil)
+    if rc != 0 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
       fail("FwpmSubLayerAdd0", rc)
 
   proc enumOurFilters(engine: Handle): seq[uint64] =
@@ -462,43 +447,37 @@ when defined(windows):
     result.conditionValue.data.sid = sid
 
   proc addFilter(engine: Handle; key: GUID; name: ptr UncheckedArray[Utf16Char];
-      layer: GUID; weight: uint64; actionType: uint32;
+      layer: GUID; actionType: uint32;
       conditions: openArray[FWPM_FILTER_CONDITION0]) =
-    # Build SwCondDesc array from the Nim-built conditions, then delegate
-    # to the C shim which constructs FWPM_FILTER0 in C (avoiding Nim GC
-    # issues with the WFP RPC stack).
-    var descs: array[4, SwCondDesc]
-    let n = min(conditions.len, 4)
-    for i in 0 ..< n:
-      let c = conditions[i]
-      descs[i].fieldKey = guidToBytes(c.fieldKey)
-      descs[i].matchType = c.matchType
-      descs[i].kind = c.conditionValue.kind
-      descs[i].pad = 0
-      # Extract the value based on kind
-      case c.conditionValue.kind
-      of FWP_V4_ADDR_MASK:
-        let v4 = c.conditionValue.data.v4AddrMask
-        if v4 != nil:
-          descs[i].value = uint64(v4[].addr4) or (uint64(v4[].mask) shl 32)
-      of FWP_V6_ADDR_MASK:
-        descs[i].value = cast[uint64](c.conditionValue.data.v6AddrMask)
-      of FWP_BYTE_ARRAY16_TYPE:
-        descs[i].value = cast[uint64](c.conditionValue.data.v6Addr)
-      of FWP_SECURITY_DESCRIPTOR:
-        descs[i].value = cast[uint64](c.conditionValue.data.sd)
-      of FWP_SID:
-        descs[i].value = cast[uint64](c.conditionValue.data.sid)
-      of FWP_RANGE:
-        descs[i].value = cast[uint64](c.conditionValue.data.rangeValue)
-      else:
-        descs[i].value = 0
+    ## Build FWPM_FILTER0 in Nim and call FwpmFilterAdd0 directly.
+    ## Every string embedded in the struct comes from allocWide (raw
+    ## alloc, not GC) and every condition value's storage is a caller
+    ## stack local that outlives this call - the two invariants that
+    ## keep the RPC marshaler away from GC-managed memory. The filter
+    ## weight is left FWP_EMPTY: BFE auto-assigns by condition count,
+    ## and the permit pair (2 conditions: address + port) outranks the
+    ## block (1 condition: user), which is the required ordering.
+    var filt: FWPM_FILTER0
+    zeroMem(addr filt, sizeof(filt))
+    filt.filterKey = key
+    var provKey = providerKey
+    filt.providerKey = addr provKey
+    filt.layerKey = layer
+    filt.subLayerKey = sublayerKey
+    filt.displayData.name = name
+    filt.displayData.description = name
+    filt.weight.kind = FWP_EMPTY  # let BFE auto-assign
+    filt.numFilterConditions = uint32(conditions.len)
+    var conds: array[4, FWPM_FILTER_CONDITION0]
+    for i in 0 ..< min(conditions.len, 4):
+      conds[i] = conditions[i]
+    filt.filterCondition =
+      if conditions.len > 0:
+        cast[ptr UncheckedArray[FWPM_FILTER_CONDITION0]](addr conds[0])
+      else: nil
+    filt.action.actionType = actionType
     var id: uint64
-    var keyBytes = guidToBytes(key)
-    let rc = swFilterAdd(engine, cast[ptr byte](unsafeAddr providerKey),
-      addr keyBytes[0], cast[ptr byte](unsafeAddr sublayerKey),
-      cast[ptr byte](unsafeAddr layer), weight, name, actionType,
-      addr descs[0], n.uint32, addr id)
+    let rc = fwpmFilterAdd0(engine, addr filt, nil, addr id)
     if rc != 0: fail("FwpmFilterAdd0", rc)
 
   proc installFence*(userSid: string; firstPort, lastPort: uint16) =
@@ -543,19 +522,15 @@ when defined(windows):
     let permitV4 = [condV4Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v4am),
                     portCond]
     addFilter(engine, permitV4Key, allocWide("sandwall-permit-v4"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64,
-      FWP_ACTION_PERMIT, permitV4)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_PERMIT, permitV4)
     addFilter(engine, blockV4Key, allocWide("sandwall-block-v4"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64,
-      FWP_ACTION_BLOCK, blockCond)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_BLOCK, blockCond)
     let permitV6 = [condV6Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr loopback6),
                     portCond]
     addFilter(engine, permitV6Key, allocWide("sandwall-permit-v6"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64,
-      FWP_ACTION_PERMIT, permitV6)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_PERMIT, permitV6)
     addFilter(engine, blockV6Key, allocWide("sandwall-block-v6"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64,
-      FWP_ACTION_BLOCK, blockCond)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallFence*() =
     ## Remove our filters, sublayer and provider. Missing objects are
@@ -641,15 +616,15 @@ when defined(windows):
 
     let permitV4 = [pkgSid, condV4Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v4am)]
     addFilter(engine, parseGuid(acPermitV4GuidText), allocWide("sandwall-ac-permit-v4"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV4)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_PERMIT, permitV4)
     let blockCond = [pkgSid]
     addFilter(engine, parseGuid(acBlockV4GuidText), allocWide("sandwall-ac-block-v4"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockCond)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_BLOCK, blockCond)
     let permitV6 = [pkgSid, condV6Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr loopback6)]
     addFilter(engine, parseGuid(acPermitV6GuidText), allocWide("sandwall-ac-permit-v6"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F80_0000_0000_0000'u64, FWP_ACTION_PERMIT, permitV6)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_PERMIT, permitV6)
     addFilter(engine, parseGuid(acBlockV6GuidText), allocWide("sandwall-ac-block-v6"),
-      FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockCond)
+      FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallAcFence*() =
     let engine = openEngine("sandwall-ac-setup")

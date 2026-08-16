@@ -6,7 +6,7 @@ author        = "Carlo Capocasa"
 description   = "A process-level filesystem sandbox backed by OS-native primitives (Landlock, Seatbelt, Windows ACLs)"
 license       = "MIT"
 srcDir        = "src"
-installExt    = @["nim", "c", "h"]  # c/h: csrc/wfp_shim.c compiled by wall/wfp.nim on Windows
+installExt    = @["nim"]
 
 bin           = @["sandwall"]
 
