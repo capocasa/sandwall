@@ -87,6 +87,9 @@ when defined(windows):
 
     # CreateProcessWithLogonW flags (winbase.h)
     CREATE_UNICODE_ENVIRONMENT = 0x00000400'i32
+    CREATE_NO_WINDOW = 0x08000000'i32
+    STARTF_USESHOWWINDOW = 0x00000001'i32
+    SW_HIDE = 0'i32
 
   proc createJobObjectW(attr: pointer; name: WideCString): Handle {.stdcall,
       dynlib: "kernel32", importc: "CreateJobObjectW".}
@@ -282,6 +285,12 @@ when defined(windows):
       var si: STARTUPINFO
       zeroMem(addr si, sizeof(si))
       si.cb = DWORD(sizeof(si))
+      # Belt and suspenders with CREATE_NO_WINDOW below: wShowWindow is
+      # what the console host reads when it does create a window. CPLW
+      # is documented to default to CREATE_NEW_CONSOLE and older builds
+      # ignore CREATE_NO_WINDOW there.
+      si.dwFlags = STARTF_USESHOWWINDOW
+      si.wShowWindow = int16(SW_HIDE)
       # lpDesktop stays NULL: with the winsta0 + default-desktop ACL
       # grants from setup in place, NULL lets the child init in the
       # caller's desktop. An explicit "winsta0\default" instead made
@@ -292,9 +301,13 @@ when defined(windows):
       let envW = buildEnvBlockW()
       # A NULL env would hand the child a fresh (nearly empty) block;
       # the live block needs CREATE_UNICODE_ENVIRONMENT or CPLW
-      # rejects it with 87.
-      let flags = if not envW.isNil:
-        DWORD(CREATE_UNICODE_ENVIRONMENT) else: 0'i32
+      # rejects it with 87. CPLW also defaults to CREATE_NEW_CONSOLE and
+      # a cross-logon child cannot inherit ours: without CREATE_NO_WINDOW
+      # every sandboxed command flashes its own console window on the
+      # desktop. The invisible console is inherited by descendants.
+      let flags = (if not envW.isNil:
+        DWORD(CREATE_UNICODE_ENVIRONMENT) else: 0'i32) or
+        DWORD(CREATE_NO_WINDOW)
       if createProcessWithLogonW(userW, domW, pwW, 0, nil, cmdW, flags,
           cast[pointer](envW), cwdW, addr si, addr pi) == 0:
         raise newException(OSError,
