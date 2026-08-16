@@ -205,7 +205,11 @@ when defined(windows):
       acl.stampAce(n, sid, acl.grantAccess, acl.FILE_ALL_ACCESS)
     for p in read:
       let n = norm(p)
+      # A readonly rule for a path that does not exist (a policy guard
+      # on a repo .sandbox that was never created) must be a no-op:
+      # readDacl on a missing file raises error 2 and kills the run.
       if n.len == 0 or n in seen: continue
+      if not dirExists(n) and not fileExists(n): continue
       seen.add(n)
       for anc in ancestorsNeedGrant(n):
         if acl.hasSidAce(anc, sid, DWORD(FILE_TRAVERSE), DWORD(0)):

@@ -5,6 +5,14 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: a readonly rule for a path that does not exist (a policy
+  guard on a repo `.sandbox` that was never created) no longer kills
+  the run with `GetNamedSecurityInfo failed (error 2)`;
+  restrictImpl now skips missing readonly paths, the same posture as
+  the denied-path loop.
+
 ## [0.5.1] - 2026-08-16
 
 ### Fixed
