@@ -25,6 +25,7 @@ when defined(windows):
   import std/[winlean, widestrs, os, syncio, strutils]
   import ../acl
   import ./winffi
+  import ./quotecmd
 
   {.passL: "-lnetapi32 -lbcrypt -lcrypt32".}
 
@@ -322,16 +323,6 @@ when defined(windows):
     if dirExists(msys):
       discard grantExecute(msys)
 
-  proc buildCommandLine(cmd: openArray[string]): WideCString =
-    ## Minimal quoting: wrap args containing whitespace in quotes.
-    var parts: seq[string]
-    for a in cmd:
-      if a.find(Whitespace) >= 0 and not a.startsWith('"'):
-        parts.add '"' & a & '"'
-      else:
-        parts.add a
-    newWideCString(parts.join(" "))
-
   proc spawnAsSandwall*(cmd: openArray[string]): Handle =
     ## Log on as the sandwall user and spawn `cmd` via
     ## CreateProcessAsUserW. Returns the process handle; the caller
@@ -347,7 +338,7 @@ when defined(windows):
         DWORD(LOGON32_PROVIDER_WINNT50), addr token) == 0:
       fail("LogonUserW")
     defer: discard closeHandle(token)
-    let cmdline = buildCommandLine(cmd)
+    let cmdline = newWideCString(quoteCmdLine(cmd))
     var si: STARTUPINFO
     zeroMem(addr si, sizeof(si))
     si.cb = DWORD(sizeof(si))

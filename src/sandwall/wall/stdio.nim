@@ -20,6 +20,7 @@
 when defined(windows):
   import std/[os, strutils, syncio]
   import std/winlean except Socket
+  import ./quotecmd
 
   const pipeBuf = 64 * 1024
 
@@ -179,31 +180,10 @@ when defined(windows):
       si.hStdError = h
     var pi: PROCESS_INFORMATION
     zeroMem(addr pi, sizeof(pi))
-    # Windows argv quoting (same rules as rtoken.quoteCmdLine): args
-    # with whitespace or embedded quotes get escaped, not just wrapped.
-    proc quoteArg(a: string): string =
-      if a.len > 0 and a.find(Whitespace) < 0 and a.find('"') < 0:
-        return a
-      result = "\""
-      var bs = 0
-      for ch in a:
-        if ch == '\\': inc(bs)
-        elif ch == '"':
-          result.add repeat('\\', bs * 2 + 1)
-          result.add '"'
-          bs = 0
-        else:
-          if bs > 0: result.add repeat('\\', bs); bs = 0
-          result.add ch
-      if bs > 0: result.add repeat('\\', bs * 2)
-      result.add '"'
-    var quoted: seq[string]
-    for a in cmd:
-      quoted.add(quoteArg(a))
     # inherit the pipe handle into the real child
     var sa = SECURITY_ATTRIBUTES(nLength: DWORD(sizeof(SECURITY_ATTRIBUTES)),
       lpSecurityDescriptor: nil, bInheritHandle: 1)
-    let cmdw: WideCString = newWideCString(quoted.join(" "))
+    let cmdw: WideCString = newWideCString(quoteCmdLine(cmd))
     let nilw: WideCString = nil
     if createProcessW(nilw, cmdw, addr sa, addr sa, 1, 0, nilw, nilw,
         si, pi) == 0:
