@@ -5,6 +5,8 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-16
+
 ### Fixed
 
 - Windows: a readonly rule for a path that does not exist (a policy
