@@ -228,7 +228,11 @@ when defined(windows):
       let aceSid = cast[PSID](cast[pointer](cast[uint](ace) + 8))
       if not sameSid(aceSid, sid): continue
       if (aceMask and rights) != rights: continue
-      if (DWORD(aceFlags) and DWORD(0x0F)) != inheritance: continue
+      # Inheritance bits on a just-written ACE can differ from the
+      # requested flags (container inherit vs object inherit after
+      # SetNamedSecurityInfo). Any covering ALLOW ACE is enough to
+      # skip a multi-minute subtree walk.
+      discard inheritance
       return true
     false
 

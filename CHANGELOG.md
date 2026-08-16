@@ -5,6 +5,27 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-08-17
+
+### Fixed
+
+- Windows: `FwpmProviderAdd0` failed with `FWP_E_INVALID_PARAMETER`
+  (`-2144206795`) on every `setup` after the C shim was dropped.
+  `FWPM_PROVIDER0` was missing `serviceName` (WFP read a garbage
+  pointer past the struct) and `FWPM_ACTION0.filterType` was a
+  pointer instead of an inline GUID (would have shifted every field
+  after `action` on `FwpmFilterAdd0`). Compile-time size asserts pin
+  the x64 layouts against the SDK headers.
+- Windows: `sandwall setup` over SSH (session 0) hung in
+  `OpenDesktopW("default")`. Prefer WinSta0 when it opens, otherwise
+  stamp the process's own station/desktop via GetThreadDesktop.
+- Windows: re-running setup no longer re-walks the ~30k-file MSYS2
+  tree; `grantExecute` skips `stampAce` when an ALLOW ACE for the
+  sandbox user is already on the path. `hasSidAce` no longer requires
+  an exact inheritance-flag match (SetNamedSecurityInfo rewrites those).
+- Windows: re-running setup no longer rotates the sandwall password
+  via `NetUserSetInfo`; keep the stored DPAPI blob when it is present.
+
 ## [0.5.2] - 2026-08-16
 
 ### Fixed

@@ -163,11 +163,12 @@ when defined(windows):
       displayData: FWPM_DISPLAY_DATA0
       flags: uint32
       providerData: FWP_BYTE_BLOB
+      serviceName: ptr UncheckedArray[Utf16Char]
 
     FWPM_SUBLAYER0* {.bycopy.} = object
       subLayerKey: GUID
       displayData: FWPM_DISPLAY_DATA0
-      flags: uint32
+      flags: uint16
       providerKey: ptr GUID
       providerData: FWP_BYTE_BLOB
       weight: uint16
@@ -193,9 +194,11 @@ when defined(windows):
       filterId: uint64
       effectiveWeight: FWP_VALUE0
 
+    # filterType/calloutKey is an inline GUID (not a pointer). A ptr here
+    # shrinks FWPM_FILTER0 by 8 bytes and shifts every field after action.
     FWPM_ACTION0* {.bycopy.} = object
       actionType: uint32
-      filterType: ptr GUID
+      filterType: GUID
 
     FWPM_SESSION0* {.bycopy.} = object
       sessionKey: GUID
@@ -259,6 +262,18 @@ when defined(windows):
     ERROR_ACCESS_DENIED = 5'u32
     FWP_E_ALREADY_EXISTS = 0x80320009'u32
     FWP_E_FILTER_NOT_FOUND = 0x80320003'u32
+    FWP_E_INVALID_PARAMETER = 0x80320035'u32
+
+  # Pin the x64 layouts against fwpmu.h / fwptypes.h. A missing field
+  # (serviceName) or a pointer where the SDK has an inline GUID is
+  # FWP_E_INVALID_PARAMETER at FwpmProviderAdd0 / FwpmFilterAdd0.
+  when sizeof(pointer) == 8:
+    static:
+      doAssert sizeof(FWP_VALUE0) == 16
+      doAssert sizeof(FWPM_PROVIDER0) == 64
+      doAssert sizeof(FWPM_SUBLAYER0) == 72
+      doAssert sizeof(FWPM_ACTION0) == 20
+      doAssert sizeof(FWPM_FILTER0) == 200
 
   let
     providerKey* = parseGuid(providerGuidText)
@@ -331,8 +346,15 @@ when defined(windows):
     copyMem(result, unsafeAddr w[0], n)
 
   proc fail(what: string; code: DWORD) {.noinline.} =
+    let u = cast[uint32](code)
+    let named =
+      if u == FWP_E_ALREADY_EXISTS: "FWP_E_ALREADY_EXISTS"
+      elif u == FWP_E_FILTER_NOT_FOUND: "FWP_E_FILTER_NOT_FOUND"
+      elif u == FWP_E_INVALID_PARAMETER: "FWP_E_INVALID_PARAMETER"
+      elif u == ERROR_ACCESS_DENIED: "ERROR_ACCESS_DENIED"
+      else: $code
     raise newException(OSError, "sandwall wfp: " & what &
-      " failed (win32 error " & $code & ")")
+      " failed (" & named & ")")
 
   proc openEngine*(name: string; denied: var bool): Handle =
     ## Open the BFE engine with a display name. `denied` is set (and

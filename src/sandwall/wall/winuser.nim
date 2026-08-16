@@ -100,6 +100,15 @@ when defined(windows):
 
   proc getProcessWindowStation(): Handle {.stdcall, dynlib: "user32",
       importc: "GetProcessWindowStation".}
+  proc getThreadDesktop(threadId: DWORD): Handle {.stdcall, dynlib: "user32",
+      importc: "GetThreadDesktop".}
+  proc getCurrentThreadId(): DWORD {.stdcall, dynlib: "kernel32",
+      importc: "GetCurrentThreadId".}
+  proc openWindowStationW(name: WideCString; inherit: WINBOOL;
+      desiredAccess: DWORD): Handle {.stdcall, dynlib: "user32",
+      importc: "OpenWindowStationW".}
+  proc closeWindowStation(h: Handle): WINBOOL {.stdcall, dynlib: "user32",
+      importc: "CloseWindowStation".}
   proc openDesktopW(name: WideCString; flags: DWORD; inherit: WINBOOL;
       desiredAccess: DWORD): Handle {.stdcall, dynlib: "user32",
       importc: "OpenDesktopW".}
@@ -292,15 +301,36 @@ when defined(windows):
       result = setSecurityInfo(obj, SE_WINDOW_OBJECT,
         acl.DACL_SECURITY_INFORMATION, nil, nil, newDacl, nil)
 
-    let ws = getProcessWindowStation()
-    result = mergeInto(ws, DWORD(acl.SUB_CONTAINERS_AND_OBJECTS_INHERIT))
-    if result != 0: return result
-    let desk = openDesktopW(newWideCString("default"), 0, 0,
+    # Prefer the interactive WinSta0 so a later CreateProcessWithLogonW
+    # child on the console session can init. Fall back to this process's
+    # station/desktop: OpenWindowStationW("WinSta0") from session-0 sshd
+    # returns 0 immediately; OpenDesktopW("default") from session 0 hangs,
+    # so never call that unless we already opened WinSta0.
+    var ws = openWindowStationW(newWideCString("WinSta0"), 0,
       DWORD(READ_CONTROL or WRITE_DAC))
-    if desk == 0: return DWORD(getLastError())
-    defer: discard closeDesktop(desk)
-    # desktops have no children
+    var openedWs = ws != 0
+    if not openedWs:
+      ws = getProcessWindowStation()
+    if ws == 0: return DWORD(getLastError())
+    result = mergeInto(ws, DWORD(acl.SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+    if result != 0:
+      if openedWs: discard closeWindowStation(ws)
+      return result
+    var desk: Handle
+    var openedDesk = false
+    if openedWs:
+      desk = openDesktopW(newWideCString("default"), 0, 0,
+        DWORD(READ_CONTROL or WRITE_DAC))
+      openedDesk = desk != 0
+    if desk == 0:
+      desk = getThreadDesktop(getCurrentThreadId())
+    if desk == 0:
+      result = DWORD(getLastError())
+      if openedWs: discard closeWindowStation(ws)
+      return result
     result = mergeInto(desk, 0)
+    if openedDesk: discard closeDesktop(desk)
+    if openedWs: discard closeWindowStation(ws)
 
   proc netLocalGroupAddMems(group, user: string) =
     ## Add `user` to local `group` (level 3 = names). Best-effort: a
@@ -321,20 +351,26 @@ when defined(windows):
     let sidP = userSid()
     if sidP == nil: return false
     defer: dealloc(sidP)
+    # SetNamedSecurityInfo with an inheritable ACE walks the whole
+    # subtree. The bundled MSYS2 tree is ~30k files; a second setup
+    # over SSH looks hung for minutes. Skip when the ACE is already
+    # there (hasSidAce is a DACL read, no walk).
+    let rights = acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE
     if dirExists(path):
-      acl.stampAce(path, sidP, acl.grantAccess,
-        acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE,
-        inheritance = DWORD(3))  # OI|CI
+      if not acl.hasSidAce(path, sidP, rights, DWORD(3)):
+        acl.stampAce(path, sidP, acl.grantAccess, rights,
+          inheritance = DWORD(3))  # OI|CI
     else:
-      acl.stampAce(path, sidP, acl.grantAccess,
-        acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE,
-        inheritance = DWORD(0))
+      if not acl.hasSidAce(path, sidP, rights, DWORD(0)):
+        acl.stampAce(path, sidP, acl.grantAccess, rights,
+          inheritance = DWORD(0))
     # ancestors of a private profile need traverse for the child to
     # even reach the file
     var dir = splitFile(path).dir
     while dir.len > 3 and dir.contains(r"\Users\"):
-      acl.stampAce(dir, sidP, acl.grantAccess, DWORD(0x20),
-        inheritance = DWORD(0))  # FILE_TRAVERSE, this dir only
+      if not acl.hasSidAce(dir, sidP, DWORD(0x20), DWORD(0)):
+        acl.stampAce(dir, sidP, acl.grantAccess, DWORD(0x20),
+          inheritance = DWORD(0))  # FILE_TRAVERSE, this dir only
       dir = splitFile(dir).dir
     true
 
@@ -342,29 +378,40 @@ when defined(windows):
     ## Elevated, idempotent: create the sandwall user (or reset its
     ## password), store the password DPAPI-protected, return the SID
     ## string for wfp.installFence.
-    let password = randomPassword()
     let name = newWideCString(sandwallUserName)
-    let pw = newWideCString(password)
-    var info: USER_INFO_1
-    zeroMem(addr info, sizeof(info))
-    info.name = name
-    info.password = pw
-    info.priv = DWORD(USER_PRIV_USER)
-    info.flags = DWORD(UF_SCRIPT or UF_NORMAL_ACCOUNT or UF_DONT_EXPIRE_PASSWD)
-    var parmErr: DWORD
-    var rc = netUserAdd(nil, 1'i32, addr info, addr parmErr)
-    if rc == DWORD(NERR_USER_EXISTS):
-      # Idempotent re-run: rotate the password on the existing user.
-      var pwInfo = USER_INFO_1003(password: pw)
-      rc = netUserSetInfo(nil, name, 1003'i32, addr pwInfo, addr parmErr)
-    if rc != 0:
-      raise newException(OSError, "sandwall winuser: user setup failed " &
-        "(netapi error " & $rc & ")")
+    # Re-runs must not rotate the password: NetUserSetInfo(1003) from a
+    # session-0 sshd child hangs on this Win11 (lsass waits on a UI/GPO
+    # path that never completes). Keep the stored password when it still
+    # unlocks the account; only mint+set when the user is new or the
+    # stored blob is missing/stale.
+    let existing = loadSandwallCred()
+    var password = existing.password
+    var needSet = not existing.ok
+    if not needSet:
+      result = sidString()
+      if result.len == 0: needSet = true
+    if needSet:
+      password = randomPassword()
+      let pw = newWideCString(password)
+      var info: USER_INFO_1
+      zeroMem(addr info, sizeof(info))
+      info.name = name
+      info.password = pw
+      info.priv = DWORD(USER_PRIV_USER)
+      info.flags = DWORD(UF_SCRIPT or UF_NORMAL_ACCOUNT or UF_DONT_EXPIRE_PASSWD)
+      var parmErr: DWORD
+      var rc = netUserAdd(nil, 1'i32, addr info, addr parmErr)
+      if rc == DWORD(NERR_USER_EXISTS):
+        var pwInfo = USER_INFO_1003(password: pw)
+        rc = netUserSetInfo(nil, name, 1003'i32, addr pwInfo, addr parmErr)
+      if rc != 0:
+        raise newException(OSError, "sandwall winuser: user setup failed " &
+          "(netapi error " & $rc & ")")
+      storePassword(password)
     result = sidString()
     if result.len == 0:
       raise newException(OSError,
         "sandwall winuser: user created but SID lookup failed")
-    storePassword(password)
     # NetUserAdd alone leaves the account in NO groups (verified on
     # Win11: a groupless account's console-subsystem children die at
     # loader init). "Users" is the standard non-admin membership; the
