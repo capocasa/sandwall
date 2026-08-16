@@ -9,6 +9,7 @@
 /tests/test_connect
 /tests/test_wall
 tests/test_winwall
+tests/test_winpath
 nimble.develop
 nimble.paths
 nimbledeps

@@ -5,6 +5,8 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-16
+
 ### Fixed
 
 - Windows: the sandboxed child no longer flashes a console window per
@@ -29,8 +31,9 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
     filter weight arg was dead even in the shim (it always set
     FWP_EMPTY) and is now dropped - BFE auto-assigns and the permit
     pair outranks the block on condition count.
-  Windows: these paths are compile-verified (mingw) but need one live
-  `sandwall setup` + fenced-spawn run on a Windows host to confirm.
+  All three replacements are verified live on Windows 11 26100
+  (setup fence read, e2e policy run, deny-narrowing with rollback,
+  exit-code propagation, PATH resolution).
 - Windows argv quoting exists once (`wall/quotecmd.nim`). This also
   fixes `spawnAsSandwall` (the fence behavioral probe), whose
   wrap-only quoter mangled arguments containing quotes.
