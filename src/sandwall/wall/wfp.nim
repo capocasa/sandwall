@@ -358,14 +358,39 @@ when defined(windows):
     raise newException(OSError, "sandwall wfp: " & what &
       " failed (win32 error " & $code & ")")
 
-  proc openEngine(name: ptr UncheckedArray[Utf16Char]): Handle =
+  proc openEngine*(name: string; denied: var bool): Handle =
+    ## Open the BFE engine with a display name. `denied` is set (and
+    ## 0 returned) on ERROR_ACCESS_DENIED: status probes report it as
+    ## a hint instead of raising, every other caller lets it raise.
     var session: FWPM_SESSION0
     zeroMem(addr session, sizeof(session))
-    session.displayData.name = name
-    session.displayData.description = name
+    let w = allocWide(name)
+    session.displayData.name = w
+    session.displayData.description = w
     let rc = fwpmEngineOpen0(nil, RPC_C_AUTHN_DEFAULT, nil,
       addr session, addr result)
-    if rc != 0: fail("FwpmEngineOpen0", rc)
+    denied = rc == DWORD(ERROR_ACCESS_DENIED)
+    if rc != 0 and not denied: fail("FwpmEngineOpen0", rc)
+
+  proc openEngine(name: string): Handle =
+    var denied: bool
+    result = openEngine(name, denied)
+    if denied: fail("FwpmEngineOpen0", DWORD(ERROR_ACCESS_DENIED))
+
+  # The four filter keys of each fence, as text; parsed per use so the
+  # GUID literals stay in one place.
+  const userFenceKeyText = [permitV4GuidText, blockV4GuidText,
+                            permitV6GuidText, blockV6GuidText]
+  const acFenceKeyText = [acPermitV4GuidText, acBlockV4GuidText,
+                          acPermitV6GuidText, acBlockV6GuidText]
+
+  proc deleteFiltersByKeys(engine: Handle; keysText: openArray[string]) =
+    ## Delete our previous filters by key so a re-install over an
+    ## existing install does not fail with ALREADY_EXISTS. Tolerates
+    ## missing filters.
+    for keyText in keysText:
+      let key = parseGuid(keyText)
+      discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
 
   proc ensureProviderAndSublayer(engine: Handle) =
     let name = allocWide("sandwall")
@@ -480,13 +505,12 @@ when defined(windows):
     ## Idempotent install: provider + sublayer (tolerate existing),
     ## delete any previous filters of ours, then the 4 filters.
     doAssert validPortRange(firstPort, lastPort)
-    let engine = openEngine(allocWide("sandwall-setup"))
+    let engine = openEngine("sandwall-setup")
     defer: discard fwpmEngineClose0(engine)
     ensureProviderAndSublayer(engine)
     for id in enumOurFilters(engine):
       discard fwpmFilterDeleteById0(engine, id)
-    for key in [permitV4Key, blockV4Key, permitV6Key, blockV6Key]:
-      discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
+    deleteFiltersByKeys(engine, userFenceKeyText)
 
     # Shared condition value storage (referenced by pointer; stack
     # locals here outlive each addFilter call). Addrs are network
@@ -536,32 +560,24 @@ when defined(windows):
   proc uninstallFence*() =
     ## Remove our filters, sublayer and provider. Missing objects are
     ## tolerated so uninstall is safe to run repeatedly.
-    let engine = openEngine(allocWide("sandwall-setup"))
+    let engine = openEngine("sandwall-setup")
     defer: discard fwpmEngineClose0(engine)
     for id in enumOurFilters(engine):
       discard fwpmFilterDeleteById0(engine, id)
     # Also delete by key (covers filters enum may miss on busy systems)
-    for key in [permitV4Key, blockV4Key, permitV6Key, blockV6Key]:
-      discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
+    deleteFiltersByKeys(engine, userFenceKeyText)
     discard fwpmSubLayerDeleteByKey0(engine, unsafeAddr sublayerKey)
     discard fwpmProviderDeleteByKey0(engine, unsafeAddr providerKey)
 
   proc fenceStatus*(): tuple[installed: bool; filters: int; hint: string] =
     ## Enum-based status. Access denied (non-admin) is not an error:
     ## report it with a hint pointing at the behavioral check.
-    var engine: Handle
-    var session: FWPM_SESSION0
-    zeroMem(addr session, sizeof(session))
-    let name = allocWide("sandwall-status")
-    session.displayData.name = name
-    session.displayData.description = name
-    let rc = fwpmEngineOpen0(nil, RPC_C_AUTHN_DEFAULT, nil,
-      addr session, addr engine)
-    if rc == DWORD(ERROR_ACCESS_DENIED):
+    var denied: bool
+    let engine = openEngine("sandwall-status", denied)
+    if denied:
       return (false, 0,
         "WFP status needs admin; run the sandwall-user behavioral " &
         "verify (verifyFenceBehavioral) for a non-elevated check")
-    if rc != 0: fail("FwpmEngineOpen0", rc)
     defer: discard fwpmEngineClose0(engine)
     let ids = enumOurFilters(engine)
     (ids.len > 0, ids.len, "")
@@ -609,13 +625,10 @@ when defined(windows):
     ## Idempotent like installFence: delete our previous filters by
     ## key first so a re-run over an existing install does not fail
     ## with FwpmFilterAdd0 ALREADY_EXISTS.
-    let engine = openEngine(allocWide("sandwall-ac-setup"))
+    let engine = openEngine("sandwall-ac-setup")
     defer: discard fwpmEngineClose0(engine)
     ensureProviderAndSublayer(engine)
-    for keyText in [acPermitV4GuidText, acBlockV4GuidText,
-                    acPermitV6GuidText, acBlockV6GuidText]:
-      let key = parseGuid(keyText)
-      discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
+    deleteFiltersByKeys(engine, acFenceKeyText)
     let acSid = getAcSidRaw()
 
     # Same loopback permits as the user fence, but keyed on the
@@ -639,11 +652,9 @@ when defined(windows):
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, 0x0F40_0000_0000_0000'u64, FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallAcFence*() =
-    let engine = openEngine(allocWide("sandwall-ac-setup"))
+    let engine = openEngine("sandwall-ac-setup")
     defer: discard fwpmEngineClose0(engine)
-    for keyText in [acPermitV4GuidText, acBlockV4GuidText, acPermitV6GuidText, acBlockV6GuidText]:
-      let key = parseGuid(keyText)
-      discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
+    deleteFiltersByKeys(engine, acFenceKeyText)
 
   proc exemptAcLoopback*() =
     ## Add the `sandwall.fs` AppContainer to the loopback exemption
@@ -665,20 +676,14 @@ when defined(windows):
     discard execCmd("CheckNetIsolation LoopbackExempt -d -n=sandwall.fs")
 
   proc acFenceStatus*(): tuple[installed: bool; filters: int; hint: string] =
-    var engine: Handle
-    var session: FWPM_SESSION0
-    zeroMem(addr session, sizeof(session))
-    let name = allocWide("sandwall-ac-status")
-    session.displayData.name = name
-    session.displayData.description = name
-    let rc = fwpmEngineOpen0(nil, RPC_C_AUTHN_DEFAULT, nil, addr session, addr engine)
-    if rc == DWORD(ERROR_ACCESS_DENIED):
+    var denied: bool
+    let engine = openEngine("sandwall-ac-status", denied)
+    if denied:
       return (false, 0, "WFP status needs admin; run 'sandwall setup' elevated")
-    if rc != 0: fail("FwpmEngineOpen0", rc)
     defer: discard fwpmEngineClose0(engine)
 
     var found = 0
-    for keyText in [acPermitV4GuidText, acBlockV4GuidText, acPermitV6GuidText, acBlockV6GuidText]:
+    for keyText in acFenceKeyText:
       let key = parseGuid(keyText)
       var fptr: ptr FWPM_FILTER0
       let grc = fwpmFilterGetByKey0(engine, unsafeAddr key, addr fptr)

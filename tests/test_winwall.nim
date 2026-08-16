@@ -13,13 +13,8 @@ suite "wfp pure logic":
     check validPortRange(FirstProxyPort, LastProxyPort)
     check not validPortRange(0'u16, 60089'u16)
     check not validPortRange(60089'u16, 60080'u16)
-    # proxy.nim mirrors these as firstProxyPort/lastProxyPort (an
-    # import would drag wfp's winlean into the proxy's own winsock
-    # shim); if the fence range ever moves, the mirror must move too.
-    when defined(windows):
-      const body = staticRead("../src/sandwall/wall/proxy.nim")
-      check "firstProxyPort = " & $FirstProxyPort in body
-      check "lastProxyPort = " & $LastProxyPort in body
+    # proxy.nim imports these constants (single source); the srt range
+    # values are pinned here so an accidental change is caught.
 
   test "sddl for user sid":
     let sddl = sddlForUserSid("S-1-5-21-1234567890-1234567891-1234567892-1001")

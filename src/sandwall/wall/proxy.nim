@@ -25,6 +25,7 @@ else:
 
 import ../rules
 import ./hosts
+from ./wfp import FirstProxyPort, LastProxyPort
 
 type
   ClientArg = ref object
@@ -666,22 +667,19 @@ proc startWallProxy*(policyPath: string; projectDir: string;
   ## back `proxy.port`; consumers that need a fixed port range (the
   ## Windows fence story) pass explicit ports instead.
   when defined(windows):
-    # The AC fence permits loopback egress only to remote ports
-    # 60080-60089 (FirstProxyPort..LastProxyPort in wfp.nim, mirrored
-    # here to keep the import graph acyclic: wfp must not see this
-    # module's winlean-portability layer). An ephemeral port is
-    # unreachable through the fence: try each port in the permitted
-    # range until one binds.
-    const firstProxyPort = 60080'u16
-    const lastProxyPort = 60089'u16
-    for p in firstProxyPort .. lastProxyPort:
+    # The fence permits loopback egress only to remote ports
+    # FirstProxyPort..LastProxyPort (wfp.nim, the single source: the
+    # WFP permit filters and this bind loop must agree or the fenced
+    # child cannot reach the proxy). An ephemeral port is unreachable
+    # through the fence: try each port in the range until one binds.
+    for p in FirstProxyPort .. LastProxyPort:
       try:
         return startProxyListeners(policyPath, projectDir, p, "", verbose)
       except CatchableError:
         continue
     raise newException(OSError,
       "sandwall proxy: no free port in the fence range " &
-      $firstProxyPort & "-" & $lastProxyPort)
+      $FirstProxyPort & "-" & $LastProxyPort)
   else:
     startProxyListeners(policyPath, projectDir, port, "", verbose)
 
