@@ -1,43 +1,28 @@
-## Windows AppContainer + ACL backend for sandwall.
+## Windows ACL primitives for the dedicated-user sandbox backend.
 ##
-## Windows has no single syscall-interception hook, and hand-rolled
-## restricted tokens (CreateRestrictedToken + CreateProcessAsUserW) cannot
-## spawn a child on Windows 11 - every variant fails with access denied
-## (verified by probes; see cybernetic-plan.md step 1). The supported
-## mechanism is an AppContainer: a process launched with
-## PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES runs under a lowbox token
-## that denies filesystem and network access by default; only DACL grants
-## for the AppContainer SID let the child touch a path.
+## The retired AppContainer backend used to live here (create the
+## `sandwall.fs` profile, stamp its SID, roll back after the run); it
+## was replaced by rtoken.nim's dedicated-user model in 0.4.0. What
+## remains is the shared low-level layer both it and winuser.nim build
+## on: the ACCESS_MODE/TRUSTEE/EXPLICIT_ACCESS Win32 types, the
+## SetEntriesInAcl/SetNamedSecurityInfo/GetNamedSecurityInfo FFI, and
+## the three DACL operations the backends need - stamp an ACE, test
+## for an existing ACE, strip a SID's ACEs.
 ##
-## So this backend: derives (or creates) the `sandwall.fs` AppContainer
-## profile once, stamps ALLOW ACEs for its SID on the writable/read-only
-## paths, and lets process.nim spawn the child with the security-capabilities
-## attribute. No volume-root DENY stamps are needed (the AppContainer denies
-## by default), which removes the dangerous system-wide mutation and its
-## rollback risk. The ALLOW stamps on user paths are still rolled back
-## after the child exits.
-
-import ./paths
+## The ACCESS_MODE order matters: DENY_ACCESS=3, REVOKE_ACCESS=4
+## (winnt.h); an earlier version swapped them, so a "deny" stamp
+## silently REVOKEd (a no-op strip) and deny narrowing under a
+## writable root never took (verified on Win11).
 
 when defined(windows):
   import std/winlean except PSID
-  import std/[widestrs, sets, syncio]
+  import std/[widestrs, syncio]
   import ./wall/winffi
   export winffi.PSID
-
-  # AppContainer profile FFI lives in wall/winffi.nim (shared with
-  # wfp.nim and winuser.nim). CreateAppContainerProfile returns
-  # ERROR_ALREADY_EXISTS (0x800700b7) when the profile exists from a
-  # previous run; the SID then comes from deriveAppContainerSidFromAppContainerName.
 
   # --- ACL stamping FFI (accctrl.h / aclapi.h / winnt.h) ---
 
   type
-    # ACCESS_MODE (accctrl.h): GRANT_ACCESS for stamps, DENY_ACCESS for
-    # policy narrowing. Sized to int32 to match the Win32 enum. The order
-    # matters: DENY_ACCESS=3, REVOKE_ACCESS=4 (winnt.h); an earlier version
-    # swapped them, so a "deny" stamp silently REVOKEd (a no-op strip) and
-    # deny narrowing under a writable root never took (verified on Win11).
     ACCESS_MODE* {.size: sizeof(int32).} = enum
       notUsedAccess = 0
       grantAccess   ## allow
@@ -67,7 +52,7 @@ when defined(windows):
 
     # {CONTAINER|OBJECT}_INHERIT_ACE (winnt.h).
     # SUB_CONTAINERS_AND_OBJECTS_INHERIT = both bits set.
-    Inheritance = enum
+    Inheritance* = enum
       noInherit = 0x0
       subContainersAndObjectsInherit = 0x3  # CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
 
@@ -96,30 +81,18 @@ when defined(windows):
   const
     # SECURITY_INFORMATION flags (winnt.h)
     DACL_SECURITY_INFORMATION* = 0x00000004
-    LABEL_SECURITY_INFORMATION = 0x00000010'i32
 
     # File access masks (winnt.h)
     FILE_GENERIC_READ*    = 0x00120089'i32
     FILE_GENERIC_EXECUTE* = 0x001200A0'i32
     FILE_ALL_ACCESS*      = 0x001F01FF'i32
+    FILE_TRAVERSE*        = 0x20'i32
 
-    # Token rights needed to write an integrity label into an object's SACL
-    # (SetNamedSecurityInfo with LABEL_SECURITY_INFORMATION).
-    TOKEN_QUERY_PRIV       = 0x0008'i32
-    TOKEN_ADJUST_PRIVILEGES = 0x0020'i32
-    SE_PRIVILEGE_ENABLED   = 0x00000002'i32
-
-  type
-    LUID = object
-      lowPart: DWORD
-      highPart: LONG
-    LUID_AND_ATTRIBUTES = object
-      luid: LUID
-      attributes: DWORD
-    # TOKEN_PRIVILEGES with a one-element privilege array.
-    TOKEN_PRIVILEGES_1 = object
-      privilegeCount: DWORD
-      privileges: array[1, LUID_AND_ATTRIBUTES]
+    # ACL inheritance flags (winnt.h), shared by the stamping callers
+    # that do not use the Inheritance enum.
+    OBJECT_INHERIT_ACE* = 0x1'i32
+    CONTAINER_INHERIT_ACE* = 0x2'i32
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT* = 0x3'i32
 
   # SetEntriesInAcl merges one or more EXPLICIT_ACCESS into a new ACL. We pass
   # the old ACL as nil so it builds a fresh one from our entries.
@@ -134,27 +107,20 @@ when defined(windows):
       pDacl: PACL; pSacl: PACL): DWORD {.stdcall, dynlib: "advapi32",
       importc: "SetNamedSecurityInfoW".}
 
-  # GetNamedSecurityInfo reads an existing security descriptor by name. Used by
-  # rollbackAcls to fetch the live DACL before stripping our SID's ACEs.
+  # GetNamedSecurityInfo reads an existing security descriptor by name. Used
+  # to fetch the live DACL before merging into or stripping from it.
   proc getNamedSecurityInfoW*(pObjectName: pointer;
       objectType: SE_OBJECT_TYPE; securityInfo: DWORD;
       psidOwner: ptr PSID; psidGroup: ptr PSID; pDacl: ptr PACL;
       pSacl: ptr PACL; psd: ptr pointer): DWORD {.stdcall, dynlib: "advapi32",
       importc: "GetNamedSecurityInfoW"}
 
-  # --- integrity label FFI (advapi32) ---
-
-  # SDDL <-> security descriptor conversion, and SACL extraction from a
-  # descriptor. The integrity label is applied via an SDDL SACL because
-  # building a SYSTEM_MANDATORY_LABEL ACE by hand (SetEntriesInAcl rewrites
-  # the ACE type) does not survive SetNamedSecurityInfo - verified by probes.
-  # convertStringSecurityDescriptorToSecurityDescriptorW comes from winffi.
-  proc getSecurityDescriptorSacl(sd: pointer; present: ptr WINBOOL;
-      sacl: ptr PACL; defaulted: ptr WINBOOL): WINBOOL {.stdcall,
-      dynlib: "advapi32", importc: "GetSecurityDescriptorSacl".}
-
   proc getAce(acl: PACL; idx: DWORD; ace: ptr pointer): WINBOOL {.stdcall,
       dynlib: "advapi32", importc: "GetAce".}
+
+  proc addAce(acl: PACL; aceRevision, startingAceIndex: DWORD; aceList: pointer;
+      aceListLength: DWORD): WINBOOL {.stdcall, dynlib: "advapi32",
+      importc: "AddAce".}
 
   # IsEqualSid/EqualSid/RtlEqualMemory are all compiler intrinsics on Windows
   # (none exported from any dll - "could not import"), so compare SIDs in pure
@@ -165,85 +131,12 @@ when defined(windows):
     if la != getLengthSid(b): return false
     return equalMem(a, b, int(la))
 
-  proc addAce(acl: PACL; aceRevision, startingAceIndex: DWORD; aceList: pointer;
-      aceListLength: DWORD): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "AddAce".}
-
-  proc openProcessToken(processHandle: Handle; desiredAccess: DWORD;
-      tokenHandle: ptr Handle): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "OpenProcessToken".}
-
-  proc lookupPrivilegeValueW(systemName, name: WideCString;
-      luid: ptr LUID): WINBOOL {.stdcall, dynlib: "advapi32",
-      importc: "LookupPrivilegeValueW".}
-
-  proc adjustTokenPrivileges(tokenHandle: Handle; disableAllPrivileges: WINBOOL;
-      newState: ptr TOKEN_PRIVILEGES_1; bufferLength: DWORD;
-      previousState: pointer; returnLength: ptr DWORD): WINBOOL {.stdcall,
-      dynlib: "advapi32", importc: "AdjustTokenPrivileges".}
-
-  # --- module state ---
-
-  # AppContainer SID prepared by restrictImpl, applied at spawn time by
-  # process.nim. nil = no sandbox set. The SID is allocated by userenv and
-  # kept alive for the whole sandbox lifetime; the attribute-list buffer
-  # process.nim builds references it.
-  var currentAppContainerSid*: PSID = nil
-
-  # Every filesystem path whose DACL we mutated. The spawn walks this in a
-  # defer to remove our ACEs. Mutating security descriptors is the one
-  # dangerous operation in this backend: a crash between stamp and rollback
-  # leaves stray allow ACEs for the AppContainer SID on user paths (deny
-  # stamps no longer exist - the AppContainer denies by default).
-  var stampedPaths*: seq[string] = @[]
-
-  # Writable paths we labelled Low integrity; rolled back in rollbackAcls.
-  var labelledPaths*: seq[string] = @[]
-
   # --- helpers ---
 
   proc fail*(what: string) {.noinline.} =
     ## Raise OSError carrying the Win32 error code for the last failed call.
     raise newException(OSError,
       "sandwall windows-acl: " & what & " failed (error " & $getLastError() & ")")
-
-  proc enablePrivilege(name: string) =
-    ## Enable `name` (e.g. SeSecurityPrivilege) on the current process token.
-    ## Needed to write integrity labels into an object's SACL. Best-effort:
-    ## a caller already holding the privilege is unaffected, and a caller that
-    ## cannot get it will simply fail the label write (handled by caller).
-    var token: Handle
-    if openProcessToken(getCurrentProcess(),
-        DWORD(TOKEN_QUERY_PRIV or TOKEN_ADJUST_PRIVILEGES), addr token) == 0:
-      return
-    defer: discard closeHandle(token)
-    var luid: LUID
-    if lookupPrivilegeValueW(nil, newWideCString(name), addr luid) == 0:
-      return
-    var tp: TOKEN_PRIVILEGES_1
-    tp.privilegeCount = 1
-    tp.privileges[0].luid = luid
-    tp.privileges[0].attributes = DWORD(SE_PRIVILEGE_ENABLED)
-    discard adjustTokenPrivileges(token, 0, addr tp, 0, nil, nil)
-
-  proc buildAppContainerSid*(): PSID =
-    ## Return the SID of the `sandwall.fs` AppContainer profile, creating
-    ## the profile on first use. The profile persists across runs, so after
-    ## creation we take the derive path. Raises OSError if neither call
-    ## succeeds. The returned SID stays valid until freed by userenv; we
-    ## keep it for the process lifetime.
-    if currentAppContainerSid != nil:
-      return currentAppContainerSid
-    let name = newWideCString("sandwall.fs")
-    var sid: PSID = nil
-    if createAppContainerProfile(name, newWideCString("sandwall fs"),
-        newWideCString("sandwall filesystem sandbox"), nil, 0,
-        addr sid) != 0:
-      # Exists from a previous run (or any failure) - derive by name.
-      if deriveAppContainerSidFromAppContainerName(name, addr sid) != 0:
-        fail("CreateAppContainerProfile/DeriveAppContainerSidFromAppContainerName")
-    currentAppContainerSid = sid
-    return sid
 
   proc buildExplicitAccess*(sid: PSID; mode: ACCESS_MODE; rights: DWORD;
       inheritance: DWORD): EXPLICIT_ACCESS_W =
@@ -259,13 +152,21 @@ when defined(windows):
     result.trustee.trusteeType = trusteeIsUser
     result.trustee.ptstrName = sid
 
-  proc buildDefaultDaclEntry*(sid: PSID): EXPLICIT_ACCESS_W =
-    ## EXPLICIT_ACCESS granting GENERIC_ALL (no inheritance) for a token
-    ## default DACL, with TRUSTEE_IS_UNKNOWN (not TRUSTEE_IS_USER): the SIDs
-    ## are a mix of well-known and session SIDs, and UNKNOWN avoids the name
-    ## lookup a typed trustee can trigger. Matches Codex's token default DACL.
-    result = buildExplicitAccess(sid, grantAccess, DWORD(0x10000000'i32), 0)
-    result.trustee.trusteeType = trusteeIsUnknown
+  proc readDacl(path: string; oldDacl: ptr PACL): pointer =
+    ## Fetch `path`'s live DACL and security descriptor. The returned
+    ## descriptor is LocalAlloc'd by the API; the caller LocalFrees it.
+    ## Raises OSError on failure.
+    var sd: pointer = nil
+    oldDacl[] = nil
+    let wpathObj = newWideCString(path)
+    let wpath: WideCString = wpathObj
+    let rc = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
+      DACL_SECURITY_INFORMATION, nil, nil, oldDacl, nil, addr sd)
+    if rc != 0:
+      raise newException(OSError,
+        "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
+        " (error " & $rc & ")")
+    sd
 
   proc writeDacl(path: string; acl: PACL) =
     ## Write `acl` as the new DACL for `path`. Raises OSError on failure.
@@ -284,15 +185,7 @@ when defined(windows):
     ## Reads the DACL, applies SetEntriesInAcl against it (preserving every
     ## other ACE), writes the result back. Raises OSError on any failed step.
     var oldDacl: PACL = nil
-    var sd: pointer = nil
-    let wpathObj = newWideCString(path)
-    let wpath: WideCString = wpathObj
-    let rc0 = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
-      DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
-    if rc0 != 0:
-      raise newException(OSError,
-        "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
-        " (error " & $rc0 & ")")
+    let sd = readDacl(path, addr oldDacl)
     defer: localFree(sd)
     var ea = buildExplicitAccess(sid, mode, rights, inheritance)
     var newAcl: PACL = nil
@@ -308,66 +201,10 @@ when defined(windows):
   proc stampAce*(path: string; sid: PSID; mode: ACCESS_MODE;
       rights: DWORD; inheritance = DWORD(subContainersAndObjectsInherit)) =
     ## Add an ACE for `sid` to `path`'s DACL, MERGING into the existing DACL
-    ## (preserving the inherited SYSTEM/Administrators grants). Records `path`
-    ## in stampedPaths for rollback. Raises OSError on any failed step.
+    ## (preserving the inherited SYSTEM/Administrators grants). Idempotent:
+    ## re-stamping the same grant is safe (SetEntriesInAcl merges).
+    ## Raises OSError on any failed step.
     mergeDaclEntry(path, sid, mode, rights, inheritance)
-    stampedPaths.add(path)
-
-  # SDDL for the Low-integrity mandatory label. `ML` =
-  # SYSTEM_MANDATORY_LABEL_ACE_TYPE (a SetEntriesInAcl-built ACE gets its type
-  # rewritten and is silently dropped by SetNamedSecurityInfo, so the label
-  # must come from an SDDL-parsed descriptor - verified by probes). OICI makes
-  # the label inherit to children, NW is the No-Write-Up policy, LW = the Low
-  # integrity SID (S-1-16-4096). AI keeps the SACL auto-inherit flag, matching
-  # what `icacls /setintegritylevel (OI)(CI)L` produces.
-  const lowLabelSddl = "S:AI(ML;OICI;NW;;;LW)"
-
-  proc stampIntegrityLabel(path: string) =
-    ## Mark `path` Low integrity via a mandatory-label ACE in the SACL. An
-    ## AppContainer child runs at Low integrity, and Windows Mandatory
-    ## Integrity Control denies a Low process write access to any object not
-    ## itself labelled Low (the default No-Write-Up policy) - regardless of
-    ## the DACL. So every writable path needs this label in addition to the
-    ## DACL grant, or the child sees "Access is denied" on writes even though
-    ## the DACL ACE is present. Requires SeSecurityPrivilege (SACL write),
-    ## enabled in stampAcls.
-    var sd: pointer = nil
-    if convertStringSecurityDescriptorToSecurityDescriptorW(
-        newWideCString(lowLabelSddl), 1, addr sd, nil) == 0:
-      raise newException(OSError,
-        "sandwall windows-acl: SDDL parse of label failed (error " &
-        $getLastError() & ")")
-    defer: localFree(sd)
-    var present: WINBOOL = 0
-    var sacl: PACL = nil
-    var defaulted: WINBOOL = 0
-    if getSecurityDescriptorSacl(sd, addr present, addr sacl, addr defaulted) == 0 or
-        present == 0 or sacl == nil:
-      raise newException(OSError,
-        "sandwall windows-acl: no SACL in parsed label descriptor")
-    let wpathObj = newWideCString(path)
-    let wpath: WideCString = wpathObj
-    let rc = setNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
-      DWORD(LABEL_SECURITY_INFORMATION), nil, nil, nil, sacl)
-    if rc != 0:
-      raise newException(OSError,
-        "sandwall windows-acl: SetNamedSecurityInfo(label) failed on " & path &
-        " (error " & $rc & ")")
-    labelledPaths.add(path)
-
-  proc removeIntegrityLabel(path: string) =
-    ## Clear the integrity label from `path` (rollback of stampIntegrityLabel).
-    ## Writes a NULL SACL for the LABEL portion, which removes the mandatory
-    ## label ACE. Requires SeSecurityPrivilege.
-    let wpathObj = newWideCString(path)
-    let wpath: WideCString = wpathObj
-    let rc = setNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
-      DWORD(LABEL_SECURITY_INFORMATION), nil, nil, nil, nil)
-    if rc != 0:
-      raise newException(OSError,
-        "sandwall windows-acl: SetNamedSecurityInfo(label-clear) failed on " & path &
-        " (error " & $rc & ")")
-
 
   proc hasSidAce*(path: string; sid: PSID; rights: DWORD;
       inheritance: DWORD): bool =
@@ -377,15 +214,7 @@ when defined(windows):
     ## costs seconds (NTFS walks the subtree reconciling inheritable
     ## ACEs even when nothing changes).
     var oldDacl: PACL = nil
-    var sd: pointer = nil
-    let wpathObj = newWideCString(path)
-    let wpath: WideCString = wpathObj
-    let rc0 = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
-      DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
-    if rc0 != 0:
-      raise newException(OSError,
-        "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
-        " (error " & $rc0 & ")")
+    let sd = readDacl(path, addr oldDacl)
     defer: localFree(sd)
     if oldDacl.isNil: return false
     let aceCount = int(cast[ptr uint16](cast[uint](oldDacl) + 2)[])
@@ -412,15 +241,7 @@ when defined(windows):
     ## fresh ACL with AddAce, preserving order (deny-before-allow semantics)
     ## and every other trustee. Raises OSError on failure.
     var oldDacl: PACL = nil
-    var sd: pointer = nil
-    let wpathObj = newWideCString(path)
-    let wpath: WideCString = wpathObj
-    let rc0 = getNamedSecurityInfoW(cast[pointer](wpath), seFileObject,
-      DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
-    if rc0 != 0:
-      raise newException(OSError,
-        "sandwall windows-acl: GetNamedSecurityInfo failed on " & path &
-        " (error " & $rc0 & ")")
+    let sd = readDacl(path, addr oldDacl)
     defer: localFree(sd)
 
     # Compute the surviving size and count, skipping our SID's ACEs.
@@ -463,67 +284,4 @@ when defined(windows):
 proc backendSupported*(): bool =
   when defined(windows): true else: false
 
-proc backendName*(): string = "windows-appcontainer"
-
-when defined(windows):
-  proc stampAcls*(writable, read: seq[string]; sid: PSID) =
-    ## Stamp the full ACL policy for the AppContainer SID:
-    ##   1. ALLOW FILE_ALL_ACCESS + a Low integrity label on each writable
-    ##      path (the label is required: the Low-integrity child is blocked
-    ##      from writing Medium/High objects by MIC even when the DACL allows).
-    ##   2. ALLOW FILE_GENERIC_READ | FILE_GENERIC_EXECUTE on each read path
-    ##      (read is allowed across integrity levels, so no label needed).
-    ## No DENY stamps: the AppContainer denies everything it is not granted,
-    ## so volume roots need no touching. Each mutated path is recorded in
-    ## stampedPaths for rollback.
-    enablePrivilege("SeSecurityPrivilege")
-    for p in writable:
-      stampAce(p, sid, grantAccess, FILE_ALL_ACCESS)
-      stampIntegrityLabel(p)
-
-    for p in read:
-      stampAce(p, sid, grantAccess,
-        FILE_GENERIC_READ or FILE_GENERIC_EXECUTE)
-
-  proc rollbackAcls*(sid: PSID) =
-    ## Best-effort removal of our SID's ACEs from every stamped path, and the
-    ## Low integrity label from every labelled path. Called in a defer by the
-    ## spawn. Errors are logged to stderr and skipped: a missing path (deleted
-    ## during the run) must not abort cleanup of the rest.
-    let paths = stampedPaths
-    stampedPaths = @[]
-    for path in paths:
-      try:
-        removeSidAces(path, sid)
-      except CatchableError as e:
-        stderr.writeLine("sandwall windows-acl: rollback failed on " & path &
-          ": " & e.msg)
-    let labelled = labelledPaths
-    labelledPaths = @[]
-    for path in labelled:
-      try:
-        removeIntegrityLabel(path)
-      except CatchableError as e:
-        stderr.writeLine("sandwall windows-acl: label rollback failed on " & path &
-          ": " & e.msg)
-
-  proc restrictImpl*(writable, read: openArray[string];
-                     denied: openArray[string] = []) =
-    ## Prepare the AppContainer SID and stamp the filesystem ACLs in one
-    ## pass. Stores the SID for the spawn path (process.nim) and records
-    ## every mutated path so the spawn can roll back via rollbackAcls.
-    let sid = buildAppContainerSid()
-
-    var seen = initHashSet[string]()
-    var writablePaths: seq[string] = @[]
-    var readOnlyPaths: seq[string] = @[]
-    for p in writable:
-      let n = normalize(p)
-      if n.len == 0 or seen.containsOrIncl(n): continue
-      writablePaths.add(n)
-    for p in read:
-      let n = normalize(p)
-      if n.len == 0 or seen.containsOrIncl(n): continue
-      readOnlyPaths.add(n)
-
-    stampAcls(writablePaths, readOnlyPaths, sid)
+proc backendName*(): string = "windows-acl"

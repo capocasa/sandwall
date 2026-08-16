@@ -85,14 +85,6 @@ when defined(windows):
     jobObjectExtendedLimitInformation = 9'i32
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000'i32
 
-    # ACL/ACL inheritance (winnt.h)
-    CONTAINER_INHERIT_ACE = 0x2'i32
-    OBJECT_INHERIT_ACE = 0x1'i32
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT = 0x3'i32
-
-    # Traverse-only rights for ancestor ACEs
-    FILE_TRAVERSE = 0x20'i32
-
   proc createJobObjectW(attr: pointer; name: WideCString): Handle {.stdcall,
       dynlib: "kernel32", importc: "CreateJobObjectW".}
   proc setInformationJobObject(job: Handle; infoClass: int32; info: pointer;
