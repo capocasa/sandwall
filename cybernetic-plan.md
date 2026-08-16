@@ -128,22 +128,40 @@ this context; steps needing it are marked and gated.
     child, mtime 12:51, after my last commit at 12:43) - not mine,
     compiles clean, LEFT UNCOMMITTED for the owner to review.
     Committed 08f7084.
-11. [ ] Windows live verification: needs the beck VM (tests/wincli.sh
-    + sandwall setup + a fenced spawn). If unavailable, record
-    exactly what remains unverified in Current state and STOP there;
-    do not claim the Windows half works.
+11. [x] LIVE Windows verification DONE on beck (build: mingw via
+    src/sandwall.nims cross config, committed; scp + Start-Process
+    probes since ssh-through-cmd quoting eats exit codes):
+    - binary runs; `setup --status` reads the real fence (user 8,
+      ac 4 filters) - Nim WFP enum path works.
+    - full e2e: policy sandwallrc curl 1.1.1.1 -> 301 (allow through
+      fence+proxy+relay), curl 9.9.9.9 -> 403 (deny enforced),
+      nosuchexe -> 127 fast, cmd /c exit 5 -> exit code 5 propagates
+      through relay+CPLW+job+wait, xcopy via PATH runs sandboxed.
+    - sub-path deny: allow profile + deny file -> copy fails, no
+      leak; NEXT run writes fine (DENY rollback in runAsSandboxUser
+      verified).
+    - found + explained two non-regressions: quickemu Temp has a
+      stale full-access sandwall ACE from an OLD-backend run (manual
+      cleanup TODO for owner: icacls /remove), and C:\ root children
+      grant Authenticated Users modify by Windows default - both are
+      the documented user-boundary model, pre-existing.
+    All three shim replacements verified live. Nothing left
+    unverified except: `sandwall setup` itself (re-install path) was
+    NOT re-run on beck (existing install left in place).
 
 ## Current state
 
-Step 1 done (commit 4358ba7). Step 2 done (0e324b2 + 3code
-588e8a0). Windows lifecycle now: process.runSandboxed ->
-process.spawnSandboxedAndWait -> rtoken.runAsSandboxUser (owns
-spawn/wait/cleanup). closeRunRelay/rollbackDenies are GONE (merged
-into private rtoken.endRun). 3code verified compiling against new
-API (nim c --path:../sandwall/src src/threecode.nim).
+Complete. 11 commits on main (4358ba7..plan), plus the cross-compile
+nims config. 3code side has 1 commit (box.nim inetOk drop). The
+uncommitted rtoken.nim CREATE_NO_WINDOW edit (owner's concurrent
+change) is still uncommitted by design. Known follow-ups for the
+owner: (1) review/commit the concurrent rtoken.nim edit, (2) icacls
+/remove the stale sandwall ACE on quickemu Temp, (3) reinstall-check
+via `sandwall setup` on beck when convenient.
+
 NOTE for all later steps: `nimble test` fails in test_sandbox with
 "cannot open: /proc/self/setgroups" - PRE-EXISTING on clean HEAD
 (this box's sandbox blocks the userns write). Green bar = the other
 7 test files pass + whole-tree mingw compile:
   nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src -o:/tmp/sw_win.o src/sandwall.nim
-Next: step 11 (Windows live verify - likely blocked here).
+ALL STEPS DONE.
