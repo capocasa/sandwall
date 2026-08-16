@@ -31,6 +31,7 @@
 when defined(linux):
   import std/[net, nativesockets, os, posix]
   import ../mask
+  import ../wall/sockshim
 
   const
     SIOCGIFFLAGS = 0x8913.culong
@@ -83,56 +84,6 @@ when defined(linux):
                      SockLen(sizeof(sa))) != 0:
       discard posix.close(result)
       return osInvalidSocket
-
-  proc splice(a, b: SocketHandle) =
-    ## Forward bytes between `a` and `b` until both directions hit EOF.
-    ## Same loop shape as the proxy's splice.
-    var buf = newString(64 * 1024)
-    var aDead = false
-    var bDead = false
-    while not (aDead and bDead):
-      var fds: array[2, TPollfd]
-      # A dead direction's fd is removed from the poll set (fd < 0
-      # makes poll ignore the entry): events=0 does NOT suffice,
-      # error conditions (POLLERR|POLLHUP) are reported
-      # unconditionally and the loop would busy-spin on the corpse.
-      fds[0] = TPollfd(fd: if aDead: -1.cint else: a.cint,
-                       events: POLLIN)
-      fds[1] = TPollfd(fd: if bDead: -1.cint else: b.cint,
-                       events: POLLIN)
-      let r = poll(addr fds[0], 2, -1)
-      if r < 0:
-        if osLastError().cint == EINTR: continue
-        break
-      for i in 0 .. 1:
-        let rev = fds[i].revents
-        if rev == 0: continue
-        let (src, dst) = if i == 0: (a, b) else: (b, a)
-        let dead = if i == 0: addr aDead else: addr bDead
-        if (rev and (POLLERR or POLLNVAL)) != 0:
-          if not dead[]:
-            discard posix.shutdown(dst, SHUT_WR)
-            dead[] = true
-          continue
-        if (rev and (POLLIN or POLLHUP)) != 0:
-          let n = posix.recv(src, addr buf[0], buf.len.cint, 0'i32)
-          if n > 0:
-            var off = 0
-            while off < n:
-              let flags = when defined(linux): MSG_NOSIGNAL else: 0'i32
-              let s = posix.send(dst, addr buf[off], (n - off).cint, flags)
-              if s <= 0:
-                if s < 0 and osLastError().cint == EINTR: continue
-                break
-              off.inc s
-            if off < n:
-              if not dead[]:
-                discard posix.shutdown(dst, SHUT_WR)
-                dead[] = true
-          else:
-            if not dead[]:
-              discard posix.shutdown(dst, SHUT_WR)
-              dead[] = true
 
   proc serveBridgeConn(cfd: SocketHandle; sockPath: string) {.thread.} =
     let up = dialUnix(sockPath)
