@@ -54,6 +54,10 @@ when defined(windows):
     CREATE_NO_WINDOW = 0x08000000'u32
     INFINITE_MS = 0xFFFFFFFF'u32
 
+    # OpenDesktopW access for rewriting the DACL (winnt.h)
+    READ_CONTROL = 0x00020000'u32
+    WRITE_DAC = 0x00040000'u32
+
   type
     USER_INFO_1 {.bycopy.} = object
       name: WideCString
@@ -88,6 +92,26 @@ when defined(windows):
       lgrpi3DomainAndName: WideCString
 
   # --- FFI ---
+
+  # Window station / desktop DACLs (user32 + advapi32). The enum value
+  # SE_WINDOW_OBJECT = 7 in accctrl.h's SE_OBJECT_TYPE (acl.nim defines
+  # the enum but only uses seFileObject, so the constant is local).
+  const SE_WINDOW_OBJECT = 7'i32
+
+  proc getProcessWindowStation(): Handle {.stdcall, dynlib: "user32",
+      importc: "GetProcessWindowStation".}
+  proc openDesktopW(name: WideCString; flags: DWORD; inherit: WINBOOL;
+      desiredAccess: DWORD): Handle {.stdcall, dynlib: "user32",
+      importc: "OpenDesktopW".}
+  proc closeDesktop(h: Handle): WINBOOL {.stdcall, dynlib: "user32",
+      importc: "CloseDesktop".}
+  proc getSecurityInfo(handle: Handle; objType: int32;
+      secInfo: DWORD; sidOwner, sidGroup: ptr winffi.PSID; dacl, sacl: ptr acl.PACL;
+      sd: ptr pointer): DWORD {.stdcall, dynlib: "advapi32",
+      importc: "GetSecurityInfo".}
+  proc setSecurityInfo(handle: Handle; objType: int32;
+      secInfo: DWORD; sidOwner, sidGroup: winffi.PSID; dacl, sacl: acl.PACL): DWORD
+      {.stdcall, dynlib: "advapi32", importc: "SetSecurityInfo".}
 
   proc netLocalGroupAddMembers(serverName: WideCString;
       groupName: WideCString; level: DWORD; buf: pointer;
@@ -200,32 +224,83 @@ when defined(windows):
     except IOError:
       (false, "")
 
-  proc sidString*(): string =
-    ## SID string of the sandwall user, "" when the user does not
-    ## exist (LookupAccountName two-call sizing dance).
-    let name = newWideCString(sandwallUserName)
+  proc userSid(user = sandwallUserName): winffi.PSID =
+    ## Resolve `user`'s account SID (LookupAccountNameW two-call
+    ## sizing dance) into a fresh heap buffer the caller deallocs.
+    ## nil when the account does not exist.
+    let name = newWideCString(user)
     var cbSid, cchDomain: DWORD
     var use: SID_NAME_USE
     discard lookupAccountNameW(nil, name, nil, addr cbSid, nil,
       addr cchDomain, addr use)
-    if cbSid == 0:
-      return ""
-    var sid = alloc0(cbSid.int)
-    defer: dealloc(sid)
-    var domain = newWideCString("", cchDomain.int)
+    if cbSid == 0: return nil
+    let sid = alloc0(cbSid.int)
+    # +1: the second LookupAccountNameW call writes cchDomain chars
+    # plus a terminator (the sizing call reports chars incl. null).
+    var domain = newWideCString("", cchDomain.int + 1)
     if lookupAccountNameW(nil, name, sid, addr cbSid, domain,
         addr cchDomain, addr use) == 0:
-      return ""
+      dealloc(sid)
+      return nil
+    cast[winffi.PSID](sid)
+
+  proc sidString*(): string =
+    ## SID string of the sandwall user, "" when the user does not
+    ## exist.
+    let sid = userSid()
+    if sid == nil: return ""
+    defer: dealloc(sid)
     var str: WideCString
-    if convertSidToStringSidW(cast[winffi.PSID](sid), addr str) == 0:
+    if convertSidToStringSidW(sid, addr str) == 0:
       fail("ConvertSidToStringSidW")
     defer: localFree(str)
     $str
 
+  proc grantDesktopAccess*(user: string): DWORD =
+    ## Grant `user` access to the interactive window station (winsta0)
+    ## and its default desktop so a cross-session
+    ## CreateProcessWithLogonW child can initialize there. Without
+    ## this, console-subsystem children die with 0xC0000142 (verified
+    ## on Win11). Returns 0 on success, else the Win32 error. Pure Nim:
+    ## the same Get/SetSecurityInfo + SetEntriesInAclW calls the C shim
+    ## made, via acl.nim's EXPLICIT_ACCESS machinery.
+    let sid = userSid(user)
+    if sid == nil: return DWORD(getLastError())
+    defer: dealloc(sid)
 
-  {.compile: "../csrc/desktop_shim.c".}
-  proc swGrantDesktop*(user: WideCString): DWORD {.stdcall,
-      importc: "sw_grant_desktop".}
+    # One grant ACE for the user SID, inherited by sub-objects (the
+    # winsta0 case; the desktop pass below clears the inherit flag).
+    var ea = acl.buildExplicitAccess(sid, acl.grantAccess,
+      DWORD(0x10000000'i32),   # GENERIC_ALL
+      DWORD(acl.SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+
+    proc mergeInto(obj: Handle; inherit: DWORD): DWORD =
+      var oldDacl: acl.PACL
+      var sd: pointer
+      result = getSecurityInfo(obj, SE_WINDOW_OBJECT,
+        acl.DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
+      if result != 0: return result
+      # The old DACL from GetSecurityInfo is deliberately NOT freed:
+      # LocalFree on it heap-corrupted in session-0 callers on Win11
+      # 26100 (setup died 0xC0000374 before reaching the fence
+      # install). It is ~200 bytes, once per setup.
+      ea.grfInheritance = inherit
+      var newDacl: acl.PACL
+      result = acl.setEntriesInAcl(1, addr ea, oldDacl, addr newDacl)
+      if result != 0: return result
+      defer: localFree(newDacl)
+      result = setSecurityInfo(obj, SE_WINDOW_OBJECT,
+        acl.DACL_SECURITY_INFORMATION, nil, nil, newDacl, nil)
+
+    let ws = getProcessWindowStation()
+    result = mergeInto(ws, DWORD(acl.SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+    if result != 0: return result
+    let desk = openDesktopW(newWideCString("default"), 0, 0,
+      DWORD(READ_CONTROL or WRITE_DAC))
+    if desk == 0: return DWORD(getLastError())
+    defer: discard closeDesktop(desk)
+    # desktops have no children
+    result = mergeInto(desk, 0)
 
   proc netLocalGroupAddMems(group, user: string) =
     ## Add `user` to local `group` (level 3 = names). Best-effort: a
@@ -243,19 +318,9 @@ when defined(windows):
     ## that live under the invoking user's private profile. False when
     ## the path does not exist; raises on ACL failure.
     if not fileExists(path) and not dirExists(path): return false
-    let name = newWideCString(sandwallUserName)
-    var cbSid, cchDomain: DWORD
-    var use: SID_NAME_USE
-    discard lookupAccountNameW(nil, name, nil, addr cbSid, nil,
-      addr cchDomain, addr use)
-    if cbSid == 0: return false
-    var sid = alloc0(cbSid.int)
-    defer: dealloc(sid)
-    var domain = newWideCString("", cchDomain.int)
-    if lookupAccountNameW(nil, name, sid, addr cbSid, domain,
-        addr cchDomain, addr use) == 0:
-      return false
-    let sidP = cast[winffi.PSID](sid)
+    let sidP = userSid()
+    if sidP == nil: return false
+    defer: dealloc(sidP)
     if dirExists(path):
       acl.stampAce(path, sidP, acl.grantAccess,
         acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE,
@@ -307,8 +372,8 @@ when defined(windows):
     netLocalGroupAddMems("Users", sandwallUserName)
     # Window station + desktop access: without it a cross-session CPLW
     # child of a console-subsystem exe hangs at loader init or dies
-    # 0xC0000142 (verified on Win11; see csrc/desktop_shim.c).
-    let drc = swGrantDesktop(newWideCString(sandwallUserName))
+    # 0xC0000142 (verified on Win11; see grantDesktopAccess).
+    let drc = grantDesktopAccess(sandwallUserName)
     if drc != 0:
       raise newException(OSError,
         "sandwall winuser: desktop grant failed (error " & $drc & ")")

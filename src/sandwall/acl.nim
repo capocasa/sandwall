@@ -71,10 +71,10 @@ when defined(windows):
 
     # Win32 EXPLICIT_ACCESS_W. Layout verified amd64: 48 bytes, trustee at 16.
     EXPLICIT_ACCESS_W* {.bycopy.} = object
-      grfAccessPermissions: DWORD
-      grfAccessMode: ACCESS_MODE
-      grfInheritance: DWORD
-      trustee: TRUSTEE_W
+      grfAccessPermissions*: DWORD
+      grfAccessMode*: ACCESS_MODE
+      grfInheritance*: DWORD
+      trustee*: TRUSTEE_W
 
     PACL* = pointer
 
