@@ -3,6 +3,46 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- No embedded C left: all three shims are gone.
+  - `desktop_shim.c` -> `winuser.grantDesktopAccess` (same
+    Get/SetSecurityInfo + SetEntriesInAclW calls via acl.nim, the
+    do-not-free-the-old-DACL comment kept).
+  - `spawn_shim.c` -> a direct 11-argument `CreateProcessWithLogonW`
+    import (the shim existed because the first attempt used
+    CreateProcessAsUserW's argument shape and misaligned the stack).
+  - `wfp_shim.c` -> FWPM provider/sublayer/filter structs built in
+    Nim with `allocWide` strings; direct `Fwpm*Add0` calls. The
+    filter weight arg was dead even in the shim (it always set
+    FWP_EMPTY) and is now dropped - BFE auto-assigns and the permit
+    pair outranks the block on condition count.
+  Windows: these paths are compile-verified (mingw) but need one live
+  `sandwall setup` + fenced-spawn run on a Windows host to confirm.
+- Windows argv quoting exists once (`wall/quotecmd.nim`). This also
+  fixes `spawnAsSandwall` (the fence behavioral probe), whose
+  wrap-only quoter mangled arguments containing quotes.
+- The Windows run lifecycle is owned by the library:
+  `rtoken.runAsSandboxUser` spawns, waits, and unwinds (pipe close +
+  DENY-ACE rollback) in a try/finally, and a failed spawn cleans up
+  after itself. `closeRunRelay`/`rollbackDenies` are gone from the
+  public API; callers cannot forget them anymore.
+- The retired AppContainer filesystem backend (superseded by the
+  dedicated-user backend in 0.4.0) is deleted from acl.nim, which
+  shrinks to the shared AC primitives: types, FFI, stampAce,
+  hasSidAce, removeSidAces.
+- Dedupe: `wall/sockshim.nim` holds the winsock portability layer,
+  the two-socket splice loop, sendAll and closeSock (proxy.nim and
+  netns.nim drop their copies); `isPathUnder` lives in paths.nim;
+  wfp's openEngine/deny-hint and delete-filters-by-key loops are one
+  proc each; the proxy fence-port range is imported from wfp.nim
+  instead of mirrored (the staticRead mirror-check test is gone).
+- The debug cross-compile defines (swNoRelay, swNoJob, swNoPump,
+  swNullCwd) and the never-used `internetAccess`/`inetOk` parameters
+  are removed.
+
 ## [0.5.0] - 2026-08-16
 
 ### Fixed
