@@ -85,6 +85,9 @@ when defined(windows):
     jobObjectExtendedLimitInformation = 9'i32
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000'i32
 
+    # CreateProcessWithLogonW flags (winbase.h)
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400'i32
+
   proc createJobObjectW(attr: pointer; name: WideCString): Handle {.stdcall,
       dynlib: "kernel32", importc: "CreateJobObjectW".}
   proc setInformationJobObject(job: Handle; infoClass: int32; info: pointer;
@@ -96,10 +99,15 @@ when defined(windows):
     raise newException(OSError,
       "sandwall windows-user: " & what & " failed (error " & $getLastError() & ")")
 
-  {.compile: "csrc/spawn_shim.c".}
-  proc swSpawnWithLogon(user, domain, password, cmdline, env, cwd: WideCString;
-      outProcess: ptr Handle): DWORD {.stdcall, importc: "sw_spawn_with_logon",
-      sideEffect.}
+  # The real 11-argument prototype (no process/thread attribute
+  # params, no inherit flag - a hand-written import with
+  # CreateProcessAsUserW's shape misaligns the stack and SIGSEGVs, so
+  # the signature below matches winbase.h exactly).
+  proc createProcessWithLogonW(user, domain, password: WideCString;
+      logonFlags: DWORD; appName: WideCString; cmdline: WideCString;
+      creationFlags: DWORD; env: pointer; cwd: WideCString;
+      si: ptr STARTUPINFO; pi: ptr PROCESS_INFORMATION): WINBOOL {.
+      stdcall, dynlib: "advapi32", importc: "CreateProcessWithLogonW".}
 
   proc getEnvironmentStringsW(): WideCString {.stdcall,
       dynlib: "kernel32", importc: "GetEnvironmentStringsW".}
@@ -271,18 +279,33 @@ when defined(windows):
       let domW = newWideCString(".")
       let pwW = newWideCString(password)
       let cwdW = newWideCString(getCurrentDir())
-      var ph: Handle = 0
+      var si: STARTUPINFO
+      zeroMem(addr si, sizeof(si))
+      si.cb = DWORD(sizeof(si))
+      # lpDesktop stays NULL: with the winsta0 + default-desktop ACL
+      # grants from setup in place, NULL lets the child init in the
+      # caller's desktop. An explicit "winsta0\default" instead made
+      # console-subsystem children die at loader init with 0xC0000142
+      # (verified on Win11 26100).
+      var pi: PROCESS_INFORMATION
+      zeroMem(addr pi, sizeof(pi))
       let envW = buildEnvBlockW()
-      let rc = swSpawnWithLogon(userW, domW, pwW, cmdW, envW, cwdW, addr ph)
-      if rc != 0:
+      # A NULL env would hand the child a fresh (nearly empty) block;
+      # the live block needs CREATE_UNICODE_ENVIRONMENT or CPLW
+      # rejects it with 87.
+      let flags = if not envW.isNil:
+        DWORD(CREATE_UNICODE_ENVIRONMENT) else: 0'i32
+      if createProcessWithLogonW(userW, domW, pwW, 0, nil, cmdW, flags,
+          cast[pointer](envW), cwdW, addr si, addr pi) == 0:
         raise newException(OSError,
           "sandwall windows-user: CreateProcessWithLogonW failed (error " &
-          $rc & ")")
-      if assignProcessToJobObject(job, ph) == 0:
-        discard closeHandle(ph)
+          $getLastError() & ")")
+      discard closeHandle(pi.hThread)
+      if assignProcessToJobObject(job, pi.hProcess) == 0:
+        discard closeHandle(pi.hProcess)
         fail("AssignProcessToJobObject")
       stdio.pumpRelay(relayPipe)
-      ph
+      pi.hProcess
     except CatchableError:
       endRun()
       raise
