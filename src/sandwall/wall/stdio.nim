@@ -179,12 +179,27 @@ when defined(windows):
       si.hStdError = h
     var pi: PROCESS_INFORMATION
     zeroMem(addr pi, sizeof(pi))
+    # Windows argv quoting (same rules as rtoken.quoteCmdLine): args
+    # with whitespace or embedded quotes get escaped, not just wrapped.
+    proc quoteArg(a: string): string =
+      if a.len > 0 and a.find(Whitespace) < 0 and a.find('"') < 0:
+        return a
+      result = "\""
+      var bs = 0
+      for ch in a:
+        if ch == '\\': inc(bs)
+        elif ch == '"':
+          result.add repeat('\\', bs * 2 + 1)
+          result.add '"'
+          bs = 0
+        else:
+          if bs > 0: result.add repeat('\\', bs); bs = 0
+          result.add ch
+      if bs > 0: result.add repeat('\\', bs * 2)
+      result.add '"'
     var quoted: seq[string]
     for a in cmd:
-      if a.find(Whitespace) >= 0 and not a.startsWith('"'):
-        quoted.add('"' & a & '"')
-      else:
-        quoted.add(a)
+      quoted.add(quoteArg(a))
     # inherit the pipe handle into the real child
     var sa = SECURITY_ATTRIBUTES(nLength: DWORD(sizeof(SECURITY_ATTRIBUTES)),
       lpSecurityDescriptor: nil, bInheritHandle: 1)

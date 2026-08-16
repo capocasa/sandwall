@@ -248,14 +248,33 @@ when defined(windows):
     job
 
   proc quoteCmdLine(cmd: openArray[string]): string =
-    ## cmd.exe-compatible quoting for the child command line.
+    ## Windows argv-to-command-line quoting per the CreateProcessW
+    ## conventions: an argument is quoted when it has whitespace or a
+    ## quote; backslashes preceding a quote are doubled; trailing
+    ## backslashes inside quotes are doubled. (The naive wrap-only
+    ## version mangled args that themselves contain quotes - the
+    ## bash -c script string - turning `source "..." <"..."` into
+    ## garbage.)
+    proc quoteArg(a: string): string =
+      if a.len > 0 and a.find(Whitespace) < 0 and a.find('"') < 0:
+        return a
+      result = "\""
+      var bs = 0
+      for ch in a:
+        if ch == '\\': inc(bs)
+        elif ch == '"':
+          result.add repeat('\\', bs * 2 + 1)
+          result.add '"'
+          bs = 0
+        else:
+          if bs > 0: result.add repeat('\\', bs); bs = 0
+          result.add ch
+      if bs > 0: result.add repeat('\\', bs * 2)
+      result.add '"'
     result = ""
     for i, a in cmd:
       if i > 0: result.add(' ')
-      if a.find(Whitespace) >= 0 and not a.startsWith('"'):
-        result.add('"' & a & '"')
-      else:
-        result.add(a)
+      result.add quoteArg(a)
 
   proc spawnSandboxed*(cmd: openArray[string];
                        internetAccess = false): Handle =
