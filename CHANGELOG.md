@@ -5,6 +5,16 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: the sandboxed child no longer flashes a console window per
+  command. CreateProcessWithLogonW defaults to CREATE_NEW_CONSOLE and a
+  cross-logon child cannot inherit the caller's console, so every
+  sandboxed run opened its own window (delegated to Windows Terminal on
+  default Win11, i.e. a visible terminal per bash command). The spawn
+  now passes CREATE_NO_WINDOW plus STARTF_USESHOWWINDOW/SW_HIDE; the
+  relay's CreateProcessW child inherits that invisible console.
+
 ### Changed
 
 - No embedded C left: all three shims are gone.
