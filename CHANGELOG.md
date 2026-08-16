@@ -3,6 +3,41 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-08-16
+
+### Fixed
+
+- Windows: CreateProcessWithLogonW children no longer die at loader
+  init (0xC0000142) or stall on a CSRSS ALPC reply. Two causes, both
+  verified on Windows 11 26100:
+  - the explicit lpDesktop="winsta0\default" string made
+    console-subsystem children fail their cross-session desktop
+    connect even with the setup-time winsta0 + default-desktop ACL
+    grants in place. lpDesktop is now NULL: the child initializes in
+    the caller's desktop. (The old "the desktop string is REQUIRED"
+    finding was an artifact of the grants never being applied - see
+    the next bullet.)
+  - the setup-time desktop grant helper (csrc/desktop_shim.c)
+    heap-corrupted (0xC0000374) before applying the default-desktop
+    ACE: the old DACL returned by GetSecurityInfo was LocalFree'd
+    (fatal in session-0 callers on this build) and the domain buffer
+    for the second LookupAccountNameW call was one terminator short.
+    The old DACL is now leaked (~200 bytes, once per setup) and the
+    buffer is sized with +1.
+- Windows: the child environment is passed explicitly
+  (GetEnvironmentStringsW + CREATE_UNICODE_ENVIRONMENT). With a NULL
+  env CreateProcessWithLogonW gives the child a fresh block: the
+  stdio-relay pipe name, the wall-proxy vars, and TEMP/TMP never
+  arrived, and the relay silently produced nothing.
+- Windows: the stdio relay hop works. The pipe client handle is now
+  inheritable (the real command inherits it as stdio), the pump
+  thread's Thread object is heap-allocated (a stack-allocated Thread
+  died with its scope before pumping), the relay command is
+  `<self> stdio-relay --` with a matching CLI dispatch in the
+  sandwall binary, and argv-to-command-line quoting follows the
+  CreateProcessW escaping rules (embedded quotes in `bash -c` script
+  strings were mangled by the wrap-only version).
+
 ## [0.4.0] - 2026-08-15
 
 ### Changed
