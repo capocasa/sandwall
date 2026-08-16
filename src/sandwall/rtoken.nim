@@ -181,9 +181,10 @@ when defined(windows):
                      denied: openArray[string] = []) =
     ## Stamp ALLOW ACEs for the sandbox user SID on each writable root
     ## (full access, inherited) and traverse-only ACEs on profile
-    ## ancestors so the child can reach the root. `read` paths need no
-    ## stamp: the sandbox user already reads system dirs, and readable
-    ## user files live under ancestors we just stamped. DENY ACEs for
+    ## ancestors so the child can reach the root. `read` paths get an
+    ## explicit read+execute stamp: system dirs already grant Users
+    ## read, but a readonly path inside a private profile (Temp, home)
+    ## is closed to the sandbox user without one. DENY ACEs for
     ## deny-narrowing are stamped for rollback after the run.
     let norm = paths.normalize
     var seen: seq[string] = @[]
@@ -202,6 +203,23 @@ when defined(windows):
         acl.stampAce(anc, sid, acl.grantAccess, DWORD(FILE_TRAVERSE),
           inheritance = DWORD(0))
       acl.stampAce(n, sid, acl.grantAccess, acl.FILE_ALL_ACCESS)
+    for p in read:
+      let n = norm(p)
+      if n.len == 0 or n in seen: continue
+      seen.add(n)
+      for anc in ancestorsNeedGrant(n):
+        if acl.hasSidAce(anc, sid, DWORD(FILE_TRAVERSE), DWORD(0)):
+          continue
+        acl.stampAce(anc, sid, acl.grantAccess, DWORD(FILE_TRAVERSE),
+          inheritance = DWORD(0))
+      # Skip the stamp when the read+execute ACE is already there (the
+      # same seconds-long NTFS walk as the ancestor check above).
+      if acl.hasSidAce(n, sid,
+          DWORD(acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE),
+          DWORD(acl.SUB_CONTAINERS_AND_OBJECTS_INHERIT)):
+        continue
+      acl.stampAce(n, sid, acl.grantAccess,
+        DWORD(acl.FILE_GENERIC_READ or acl.FILE_GENERIC_EXECUTE))
     for d in denied:
       let n = norm(d)
       if n.len == 0: continue

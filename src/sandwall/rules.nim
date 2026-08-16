@@ -202,14 +202,18 @@ proc contractPath*(path, projectDir: string): string =
   let proj = projectDir.normalizedPath
   let pathC = canonicalForDisplay(path)
   let projC = canonicalForDisplay(proj)
+  # The policy file is portable text: the separator in the emitted
+  # form is always '/', on every OS (normalizePolicyPath accepts both
+  # when parsing back).
   if pathC == projC: return ""
   if pathC.len > projC.len and pathC.startsWith(projC & DirSep):
-    return "." & DirSep & pathC[projC.len + 1 .. ^1]
+    return "./" & (pathC[projC.len + 1 .. ^1]).replace(DirSep, '/')
   let home = getHomeDir().normalizedPath
   if home.len > 1 or (home.len == 1 and home != $DirSep):
     if path == home: return "~"
     if path.len > home.len and
-        path.startsWith(home & DirSep): return "~" & path[home.len .. ^1]
+        path.startsWith(home & DirSep):
+      return "~/" & (path[home.len + 1 .. ^1]).replace(DirSep, '/')
   path
 
 proc normalizePolicyPath*(p: string; projectDir: string): string =
