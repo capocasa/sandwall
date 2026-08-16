@@ -16,12 +16,6 @@ when defined(linux):
   import ./paths
   import ./baseline
 
-  proc isPathUnder(path, root: string): bool =
-    ## Local copy of rules.isPathUnder (importing rules would cycle:
-    ## rules imports baseline, restrict imports both).
-    path == root or
-      (path.len > root.len and path.startsWith(root) and
-       (root.endsWith(DirSep) or path[root.len] == DirSep))
   type AccessFds = distinct uint64
 
   # Syscall numbers are stable on every Linux/Arch combination (UAPI).

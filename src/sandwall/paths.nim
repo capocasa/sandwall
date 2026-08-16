@@ -5,7 +5,7 @@
 ## `/private/tmp/foo` (the macOS symlink target). `normalize` resolves those
 ## so the backend sees one canonical form.
 
-import std/os
+import std/[os, strutils]
 
 proc normalize*(p: string): string =
   ## Absolute, symlink-resolved path. Falls back to the cleaned absolute
@@ -19,3 +19,13 @@ proc normalize*(p: string): string =
     if r.len > 0: result = r
   except CatchableError:
     discard
+
+proc isPathUnder*(path, root: string): bool =
+  ## True when `path` equals or is nested under `root` (both cleaned
+  ## absolute). Trailing separators are normalised so `/a/b` covers
+  ## `/a/b/sub`. An empty `root` matches nothing. Lives here (not in
+  ## rules) so the OS backends can use it without the rules cycle.
+  if root.len == 0: return false
+  if path == root: return true
+  path.len > root.len and path.startsWith(root) and
+    (root.endsWith(DirSep) or path[root.len] == DirSep)

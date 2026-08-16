@@ -51,6 +51,8 @@
 
 import std/[os, strutils, tables]
 import ./baseline
+import ./paths
+export paths.isPathUnder
 
 type
   AccessKind* = enum
@@ -264,16 +266,6 @@ proc loadPolicy*(path: string; projectDir: string): seq[Rule] =
   parsePolicy(readFile(path), projectDir)
 
 # ---------------------------------------------------------------- queries
-
-proc isPathUnder*(path, root: string): bool =
-  ## True when `path` equals or is nested under `root` (both cleaned
-  ## absolute). Trailing separators are normalised so `/a/b` covers
-  ## `/a/b/sub`. An empty `root` matches nothing.
-  if root.len == 0: return false
-  if path == root: return true
-  let sep = when defined(windows): "\\" else: "/"
-  let r = if root.endsWith(sep): root else: root & sep
-  path.startsWith(r)
 
 proc checkPath*(rules: openArray[Rule]; path: string): AccessKind =
   ## Effective access for a concrete absolute `path`: the last path rule
