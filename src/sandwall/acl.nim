@@ -115,7 +115,7 @@ when defined(windows):
       pSacl: ptr PACL; psd: ptr pointer): DWORD {.stdcall, dynlib: "advapi32",
       importc: "GetNamedSecurityInfoW"}
 
-  proc getAce(acl: PACL; idx: DWORD; ace: ptr pointer): WINBOOL {.stdcall,
+  proc getAce*(acl: PACL; idx: DWORD; ace: ptr pointer): WINBOOL {.stdcall,
       dynlib: "advapi32", importc: "GetAce".}
 
   proc addAce(acl: PACL; aceRevision, startingAceIndex: DWORD; aceList: pointer;
@@ -126,7 +126,7 @@ when defined(windows):
   # (none exported from any dll - "could not import"), so compare SIDs in pure
   # Nim: equal length plus a raw byte compare via equalMem.
   # getLengthSid comes from winffi.
-  proc sameSid(a, b: PSID): bool =
+  proc sameSid*(a, b: PSID): bool =
     let la = getLengthSid(a)
     if la != getLengthSid(b): return false
     return equalMem(a, b, int(la))

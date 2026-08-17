@@ -298,6 +298,13 @@ when defined(windows):
         "sandwall windows-user: no stored credentials; " &
         "run `3code setup` once (elevated)")
     discard sandboxUserSid()  # fail fast when setup never ran
+    # Stamp THIS process's winsta/desktop so user32 children of CPLW
+    # can init. Setup may have granted a different session's objects.
+    let deskRc = winuser.grantCurrentDesktop(winuser.sandwallUserName)
+    if deskRc != 0:
+      raise newException(OSError,
+        "sandwall windows-user: grantCurrentDesktop failed (error " &
+        $deskRc & ")")
     let job = ensureJob()
     # The Job handle must outlive the child for KILL_ON_JOB_CLOSE; we
     # leak it into this process (one Job per run, freed at exit).

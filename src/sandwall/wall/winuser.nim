@@ -279,8 +279,12 @@ when defined(windows):
 
     # One grant ACE for the user SID, inherited by sub-objects (the
     # winsta0 case; the desktop pass below clears the inherit flag).
+    # GENERIC_ALL on a window object does not expand to WINSTA_ALL /
+    # DESKTOP_ALL the way it does for files. user32/imm32 need the
+    # documented masks or DllMain dies 0xC0000142.
+    const WINSTA_ALL = 0x000F037F'i32
     var ea = acl.buildExplicitAccess(sid, acl.grantAccess,
-      DWORD(0x10000000'i32),   # GENERIC_ALL
+      DWORD(WINSTA_ALL),
       DWORD(acl.SUB_CONTAINERS_AND_OBJECTS_INHERIT))
 
     proc mergeInto(obj: Handle; inherit: DWORD): DWORD =
@@ -331,6 +335,62 @@ when defined(windows):
     result = mergeInto(desk, 0)
     if openedDesk: discard closeDesktop(desk)
     if openedWs: discard closeWindowStation(ws)
+
+  var currentDesktopGranted = false
+
+  proc grantCurrentDesktop*(user: string): DWORD =
+    ## Grant `user` the documented WINSTA_ALL / DESKTOP_ALL masks on
+    ## THIS process's window station and desktop. Setup-time
+    ## grantDesktopAccess prefers WinSta0 and may stamp a different
+    ## session (sshd is session 0). user32/imm32 children of a later
+    ## CPLW then die 0xC0000142 (whoami, bash, powershell) while
+    ## console-only images (cmd, hostname) survive. Call this from the
+    ## spawn path so the grant matches the station the child inherits.
+    ## Cached after the first success: the objects do not change for
+    ## the life of this process, and SetSecurityInfo every run is
+    ## hundreds of ms.
+    if currentDesktopGranted: return 0
+    const
+      WINSTA_ALL = 0x000F037F'i32
+      DESKTOP_ALL = 0x000F01FF'i32
+    let sid = userSid(user)
+    if sid == nil: return DWORD(getLastError())
+    defer: dealloc(sid)
+    const SE_WINDOW_OBJECT = 7'i32
+    proc hasSid(oldDacl: acl.PACL; rights: DWORD): bool =
+      if oldDacl.isNil: return false
+      let aceCount = int(cast[ptr uint16](cast[uint](oldDacl) + 2)[])
+      for i in 0 ..< aceCount:
+        var ace: pointer = nil
+        if acl.getAce(oldDacl, DWORD(i), addr ace) == 0: continue
+        if cast[ptr uint8](cast[uint](ace) + 1)[] != 0: continue
+        let aceMask = cast[ptr DWORD](cast[uint](ace) + 4)[]
+        let aceSid = cast[winffi.PSID](cast[pointer](cast[uint](ace) + 8))
+        if not acl.sameSid(aceSid, sid): continue
+        if (aceMask and rights) == rights: return true
+      false
+    proc merge(obj: Handle; rights: DWORD): DWORD =
+      var ea = acl.buildExplicitAccess(sid, acl.grantAccess, rights, DWORD(0))
+      var oldDacl: acl.PACL
+      var sd: pointer
+      result = getSecurityInfo(obj, SE_WINDOW_OBJECT,
+        acl.DACL_SECURITY_INFORMATION, nil, nil, addr oldDacl, nil, addr sd)
+      if result != 0: return result
+      if hasSid(oldDacl, rights): return 0
+      var newDacl: acl.PACL
+      result = acl.setEntriesInAcl(1, addr ea, oldDacl, addr newDacl)
+      if result != 0: return result
+      defer: localFree(newDacl)
+      result = setSecurityInfo(obj, SE_WINDOW_OBJECT,
+        acl.DACL_SECURITY_INFORMATION, nil, nil, newDacl, nil)
+    let ws = getProcessWindowStation()
+    if ws == 0: return DWORD(getLastError())
+    result = merge(ws, DWORD(WINSTA_ALL))
+    if result != 0: return result
+    let desk = getThreadDesktop(getCurrentThreadId())
+    if desk == 0: return DWORD(getLastError())
+    result = merge(desk, DWORD(DESKTOP_ALL))
+    if result == 0: currentDesktopGranted = true
 
   proc netLocalGroupAddMems(group, user: string) =
     ## Add `user` to local `group` (level 3 = names). Best-effort: a
