@@ -227,6 +227,9 @@ when defined(windows):
       let aceFlags = cast[ptr uint8](cast[uint](ace) + 3)[]
       let aceSid = cast[PSID](cast[pointer](cast[uint](ace) + 8))
       if not sameSid(aceSid, sid): continue
+      # GENERIC_ALL (0x10000000) from an (F) ACE covers FILE_ALL_ACCESS.
+      const genericAll = 0x10000000'i32
+      if (aceMask and genericAll) == DWORD(genericAll): return true
       if (aceMask and rights) != rights: continue
       # Inheritance bits on a just-written ACE can differ from the
       # requested flags (container inherit vs object inherit after

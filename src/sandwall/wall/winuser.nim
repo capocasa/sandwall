@@ -430,7 +430,13 @@ when defined(windows):
     # These live under the invoking user's private profile, whose ACLs
     # deny every other account; grant read+execute (and traverse on the
     # ancestors) once here instead of on every run.
-    discard grantExecute(getAppFilename())
+    let self = getAppFilename()
+    discard grantExecute(self)
+    # Sibling OpenSSL DLLs + cacert.pem sit next to 3code.exe. A file
+    # ACE on the exe does not cover them; without RX the sandwall-user
+    # re-exec dies at loader init ("could not load libssl") and the
+    # parent waits forever on the relay.
+    discard grantExecute(parentDir(self))
     let msys = getEnv("LOCALAPPDATA", "") & r"\3code\msys64"
     if dirExists(msys):
       discard grantExecute(msys)

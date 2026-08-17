@@ -84,6 +84,8 @@ when defined(windows):
     # Job objects
     jobObjectExtendedLimitInformation = 9'i32
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000'i32
+    CREATE_BREAKAWAY_FROM_JOB = 0x01000000'i32
+    LOGON_WITH_PROFILE = 0x00000001'i32
 
     # CreateProcessWithLogonW flags (winbase.h)
     CREATE_UNICODE_ENVIRONMENT = 0x00000400'i32
@@ -202,7 +204,13 @@ when defined(windows):
           continue
         acl.stampAce(anc, sid, acl.grantAccess, DWORD(FILE_TRAVERSE),
           inheritance = DWORD(0))
-      acl.stampAce(n, sid, acl.grantAccess, acl.FILE_ALL_ACCESS)
+      # Same skip as the ancestor / readonly loops: a redundant
+      # inherited FILE_ALL_ACCESS stamp walks the subtree and can
+      # take minutes under Defender. After the first run the ACE is
+      # already there.
+      if not acl.hasSidAce(n, sid, acl.FILE_ALL_ACCESS,
+          DWORD(acl.SUB_CONTAINERS_AND_OBJECTS_INHERIT)):
+        acl.stampAce(n, sid, acl.grantAccess, acl.FILE_ALL_ACCESS)
     for p in read:
       let n = norm(p)
       # A readonly rule for a path that does not exist (a policy guard
@@ -298,8 +306,16 @@ when defined(windows):
     relayPipe = stdio.createRelayPipe(tag)
     try:
       putenv("NIMBOX_OUT_PIPE", relayPipe.childName)
-      let relay = getAppFilename() & " stdio-relay --"
-      let cmdW = newWideCString(relay & " " & quoteCmdLine(cmd))
+      # Do not start the pipe pump: with no 3code relay connecting,
+      # ConnectNamedPipe blocks forever and closeHandle does not always
+      # wake it (verified: child exit 0, endRun hangs). Do not re-exec this binary as the relay. 3code.exe is built
+      # -d:ssl; Nim loads libssl at process init, before main, and the
+      # sandwall user cannot LoadLibrary the sibling DLLs (verified on
+      # Win11: "could not load libssl-1_1-x64.dll", child exits 1,
+      # parent waits forever). CPLW the real command instead. Stdout
+      # of a cross-logon child still will not inherit; the named pipe
+      # is kept for a later non-3code relay.
+      let cmdW = newWideCString(quoteCmdLine(cmd))
       let userW = newWideCString(winuser.sandwallUserName)
       let domW = newWideCString(".")
       let pwW = newWideCString(password)
@@ -327,10 +343,15 @@ when defined(windows):
       # a cross-logon child cannot inherit ours: without CREATE_NO_WINDOW
       # every sandboxed command flashes its own console window on the
       # desktop. The invisible console is inherited by descendants.
+      # BREAKAWAY: sshd/cmd on this host already put us in a Job that
+      # forbids nested AssignProcessToJobObject. Without breakaway the
+      # child is born into that Job, our assign fails or the child is
+      # killed when the parent Job accounts for it. Isolated CPLW
+      # probes (no Job) spawn fine.
       let flags = (if not envW.isNil:
         DWORD(CREATE_UNICODE_ENVIRONMENT) else: 0'i32) or
-        DWORD(CREATE_NO_WINDOW)
-      if createProcessWithLogonW(userW, domW, pwW, 0, nil, cmdW, flags,
+        DWORD(CREATE_NO_WINDOW) or DWORD(CREATE_BREAKAWAY_FROM_JOB)
+      if createProcessWithLogonW(userW, domW, pwW, DWORD(LOGON_WITH_PROFILE), nil, cmdW, flags,
           cast[pointer](envW), cwdW, addr si, addr pi) == 0:
         raise newException(OSError,
           "sandwall windows-user: CreateProcessWithLogonW failed (error " &
@@ -339,7 +360,6 @@ when defined(windows):
       if assignProcessToJobObject(job, pi.hProcess) == 0:
         discard closeHandle(pi.hProcess)
         fail("AssignProcessToJobObject")
-      stdio.pumpRelay(relayPipe)
       pi.hProcess
     except CatchableError:
       endRun()
