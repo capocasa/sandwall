@@ -306,16 +306,18 @@ when defined(windows):
     relayPipe = stdio.createRelayPipe(tag)
     try:
       putenv("NIMBOX_OUT_PIPE", relayPipe.childName)
-      # Do not start the pipe pump: with no 3code relay connecting,
-      # ConnectNamedPipe blocks forever and closeHandle does not always
-      # wake it (verified: child exit 0, endRun hangs). Do not re-exec this binary as the relay. 3code.exe is built
-      # -d:ssl; Nim loads libssl at process init, before main, and the
-      # sandwall user cannot LoadLibrary the sibling DLLs (verified on
-      # Win11: "could not load libssl-1_1-x64.dll", child exits 1,
-      # parent waits forever). CPLW the real command instead. Stdout
-      # of a cross-logon child still will not inherit; the named pipe
-      # is kept for a later non-3code relay.
-      let cmdW = newWideCString(quoteCmdLine(cmd))
+      # Do not re-exec 3code.exe as the relay: Nim -d:ssl loads libssl
+      # at process init, before main, and the sandwall user cannot
+      # LoadLibrary the sibling DLLs (verified: child exits 1, parent
+      # waits forever). cmd.exe as the CPLW image works (exit 0, writes
+      # as sandwall). Attach the named pipe by path so cmd opens it
+      # itself; handle inheritance does not cross the logon boundary.
+      # Start the pump after CPLW so a client will connect (a pump with
+      # no client hangs endRun: ConnectNamedPipe + closeHandle).
+      let inner = quoteCmdLine(cmd)
+      let wrapped = "cmd.exe /c " & inner & " >" &
+        relayPipe.childName & " 2>&1"
+      let cmdW = newWideCString(wrapped)
       let userW = newWideCString(winuser.sandwallUserName)
       let domW = newWideCString(".")
       let pwW = newWideCString(password)
@@ -360,6 +362,7 @@ when defined(windows):
       if assignProcessToJobObject(job, pi.hProcess) == 0:
         discard closeHandle(pi.hProcess)
         fail("AssignProcessToJobObject")
+      stdio.pumpRelay(relayPipe)
       pi.hProcess
     except CatchableError:
       endRun()
