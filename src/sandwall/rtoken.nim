@@ -149,6 +149,11 @@ when defined(windows):
     ## The current run's stdout pipe for the CPLW child; closed by
     ## endRun after the child exits.
 
+  var logonFlagsTried = false
+  var logonFlagsCache: DWORD = LOGON_WITH_PROFILE
+    ## First spawn tries logonFlags=0 (no profile load). If that
+    ## fails, fall back to LOGON_WITH_PROFILE and keep that choice.
+
   proc sandboxUserSid*(): winlean.PSID =
     ## Resolve (and cache) the sandbox user's SID from its name.
     if userSidCache == nil:
@@ -360,11 +365,27 @@ when defined(windows):
       let flags = (if not envW.isNil:
         DWORD(CREATE_UNICODE_ENVIRONMENT) else: 0'i32) or
         DWORD(CREATE_NO_WINDOW) or DWORD(CREATE_BREAKAWAY_FROM_JOB)
-      if createProcessWithLogonW(userW, domW, pwW, DWORD(LOGON_WITH_PROFILE), nil, cmdW, flags,
+      # Profile load is the usual multi-hundred-ms CPLW tax. The
+      # sandwall profile already exists after setup; try logonFlags=0
+      # first and keep LOGON_WITH_PROFILE only if that fails.
+      var logon = if logonFlagsTried: logonFlagsCache else: 0'i32
+      if createProcessWithLogonW(userW, domW, pwW, logon, nil, cmdW, flags,
           cast[pointer](envW), cwdW, addr si, addr pi) == 0:
-        raise newException(OSError,
-          "sandwall windows-user: CreateProcessWithLogonW failed (error " &
-          $getLastError() & ")")
+        if not logonFlagsTried and logon == 0:
+          if createProcessWithLogonW(userW, domW, pwW,
+              DWORD(LOGON_WITH_PROFILE), nil, cmdW, flags,
+              cast[pointer](envW), cwdW, addr si, addr pi) == 0:
+            raise newException(OSError,
+              "sandwall windows-user: CreateProcessWithLogonW failed (error " &
+              $getLastError() & ")")
+          logon = DWORD(LOGON_WITH_PROFILE)
+        else:
+          raise newException(OSError,
+            "sandwall windows-user: CreateProcessWithLogonW failed (error " &
+            $getLastError() & ")")
+      if not logonFlagsTried:
+        logonFlagsTried = true
+        logonFlagsCache = logon
       discard closeHandle(pi.hThread)
       if assignProcessToJobObject(job, pi.hProcess) == 0:
         discard closeHandle(pi.hProcess)

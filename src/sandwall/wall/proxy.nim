@@ -38,14 +38,6 @@ type
     sh: ptr ProxyShared
     fd: SocketHandle
 
-  WallProxy* = object
-    sock: Socket              ## listener on 127.0.0.1
-    acceptCtx: pointer        ## heap ProxyCtx for stopWallProxy
-    port*: uint16             ## actual bound port
-    policyPath*: string       ## file to reload on mtime change
-    projectDir*: string       ## for relative policy targets
-    verbose*: bool
-
   ProxyShared = object
     ## Everything the accept/client threads need, heap-allocated and
     ## shared. `list` holds the allowlist under `lock`; `listMtime` is
@@ -60,8 +52,20 @@ type
     running: bool
 
   ProxyCtx = ref object
+    ## Must stay a GC ref rooted from WallProxy.acceptCtx. Storing only
+    ## an untraced pointer (allocShared + cast) lets ORC collect the
+    ## strings/seqs inside `sh` while the accept thread still uses them:
+    ## that is the interactive SIGSEGV after a fenced curl on Windows.
     sh: ProxyShared
     acceptThread: Thread[ptr ProxyShared]
+
+  WallProxy* = object
+    sock: Socket              ## listener on 127.0.0.1
+    acceptCtx: ProxyCtx       ## GC-rooted accept/client state
+    port*: uint16             ## actual bound port
+    policyPath*: string       ## file to reload on mtime change
+    projectDir*: string       ## for relative policy targets
+    verbose*: bool
 
 const
   handshakeTimeout = 30_000   ## ms to read the initial request
@@ -501,11 +505,10 @@ proc startProxyListeners(policyPath, projectDir: string; port: uint16;
   sock.setSockOpt(OptReuseAddr, true)
   sock.bindAddr(Port(port), "127.0.0.1")
   sock.listen()
-  let p = cast[ptr ProxyCtx](allocShared0(sizeof(ProxyCtx)))
-  p[] = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
-                                 projectDir: projectDir,
-                                 verbose: verbose,
-                                 running: true))
+  let p = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
+                                   projectDir: projectDir,
+                                   verbose: verbose,
+                                   running: true))
   p.sh.listeners.add(sock.getFd())
   when defined(posix):
     if unixSockPath.len > 0:
@@ -564,11 +567,10 @@ when defined(posix):
     ## (the kernel keeps the bound sockets either way, this is for the
     ## unix listener path and cleanup symmetry).
     createDir(dir)
-    let ctx = cast[ptr ProxyCtx](allocShared0(sizeof(ProxyCtx)))
-    ctx[] = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
-                                     projectDir: projectDir,
-                                     verbose: verbose,
-                                     running: true))
+    let ctx = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
+                                       projectDir: projectDir,
+                                       verbose: verbose,
+                                       running: true))
     ctx.sh.listeners.add(sockFd)
     when defined(linux):
       ctx.sh.listeners.add(listenUnix(dir / "proxy.sock"))
@@ -606,7 +608,6 @@ when defined(posix):
     for l in ctx.sh.listeners:
       discard posix.close(l)
     deinitLock(ctx.sh.lock)
-    deallocShared(ctx)
     removeDir(dir)
 
 
@@ -680,16 +681,17 @@ proc stopWallProxy*(p: var WallProxy) =
   ## Close the listener, join the accept thread. Client threads are
   ## detached; closing their sockets on process exit is the OS's job.
   if p.sock == nil: return
-  let ctx = cast[ptr ProxyCtx](p.acceptCtx)
-  ctx.sh.running = false
-  joinThread(ctx.acceptThread)
+  let ctx = p.acceptCtx
+  if ctx != nil:
+    ctx.sh.running = false
+    joinThread(ctx.acceptThread)
   when defined(posix):
     p.sock.close()
   else:
     closeSock(p.sock.getFd())
   p.sock = nil
-  deinitLock(ctx.sh.lock)
-  deallocShared(ctx)
+  if ctx != nil:
+    deinitLock(ctx.sh.lock)
   p.acceptCtx = nil
 
 

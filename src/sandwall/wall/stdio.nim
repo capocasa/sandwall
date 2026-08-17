@@ -18,7 +18,7 @@
 ## ends at EOF (the relay closes its end when the command exits).
 
 when defined(windows):
-  import std/[os, strutils, syncio]
+  import std/[locks, os, strutils, syncio]
   import std/winlean except Socket
   import ./quotecmd
 
@@ -104,10 +104,28 @@ when defined(windows):
       inc(done, n)
 
 
+  var captureLock: Lock
+  var captureBuf: string = ""
+  var captureOn = false
+  var pumpThr: ptr Thread[ptr RelayPipe] = nil
+  initLock(captureLock)
+
+  proc beginCapture*() =
+    ## Next pump writes into captureBuf instead of stdout. Used by the
+    ## in-process Windows tool path so the parent can stream lines.
+    withLock captureLock:
+      captureBuf = ""
+      captureOn = true
+
+  proc endCapture*(): string =
+    withLock captureLock:
+      result = captureBuf
+      captureBuf = ""
+      captureOn = false
+
   proc pumpThread(p: ptr RelayPipe) {.thread.} =
     ## Connect the server end, then relay every byte into our stdout
-    ## until the relay child closes its end (EOF). Detached; dies at
-    ## EOF or when the caller closes the pipe (which reads as EOF).
+    ## (or the capture buffer) until the relay child closes its end.
     let connected = connectNamedPipe(p.handle, nil)
     if connected == 0 and getLastError().int32 != 535:   # PIPE_CONNECTED
       return
@@ -118,25 +136,32 @@ when defined(windows):
       let ok = readFile(p.handle, addr buf[0], int32(pipeBuf), addr n, nil)
       if ok == 0 or n <= 0:
         break
-      writeAll(dst, addr buf[0], n)
+      var intoCapture = false
+      {.gcsafe.}:
+        withLock captureLock:
+          intoCapture = captureOn
+          if intoCapture:
+            captureBuf.add buf[0 ..< n]
+      if not intoCapture:
+        writeAll(dst, addr buf[0], n)
 
   proc pumpRelay*(p: var RelayPipe) =
-    ## Start the detached pump thread for `p`.
+    ## Start the pump thread for `p`. closeRelay joins it.
     let pp = cast[ptr RelayPipe](allocShared0(sizeof(RelayPipe)))
     pp[] = p
-    var t = cast[ptr Thread[ptr RelayPipe]](allocShared0(sizeof(Thread[ptr RelayPipe])))
-    createThread(t[], pumpThread, pp)
-    # The thread object is heap-stashed by createThread's copy when the
-    # system thread registry is off; leaking the handle is fine - the
-    # thread ends at pipe EOF (closeRelay) and the process exit reaps.
-    when declared(nimthread_dont_use): discard
-    else: discard
+    pumpThr = cast[ptr Thread[ptr RelayPipe]](allocShared0(sizeof(Thread[ptr RelayPipe])))
+    createThread(pumpThr[], pumpThread, pp)
 
   proc closeRelay*(p: var RelayPipe) =
-    ## Close the server end; the pump thread sees EOF and exits.
+    ## Close the server end and join the pump so the last bytes land
+    ## in stdout or the capture buffer before the caller reads them.
     if p.handle != 0:
       discard closeHandle(p.handle)
       p.handle = 0
+    if pumpThr != nil:
+      joinThread(pumpThr[])
+      deallocShared(pumpThr)
+      pumpThr = nil
 
   proc waitNamedPipeW(lpNamedPipeName: WideCString;
       nTimeOut: DWORD): WINBOOL {.stdcall, dynlib: "kernel32",

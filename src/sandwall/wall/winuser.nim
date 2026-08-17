@@ -212,9 +212,15 @@ when defined(windows):
       copyMem(addr blob[0], output.pbData, blob.len)
     writeFile(dir / "credentials.dat", blob)
 
+  var credCacheOk = false
+  var credCachePw = ""
+
   proc loadSandwallCred*(): tuple[ok: bool; password: string] =
     ## Read + CryptUnprotectData the stored password. ok=false when
     ## the file is missing, corrupt, or protected for another user.
+    ## Cached after the first success: DPAPI every command is waste
+    ## once the parent stays alive across tool launches.
+    if credCacheOk: return (true, credCachePw)
     let path = credPath() / "credentials.dat"
     try:
       let raw = readFile(path)
@@ -229,6 +235,8 @@ when defined(windows):
       var pw = newString(output.cbData.int)
       if pw.len > 0:
         copyMem(addr pw[0], output.pbData, pw.len)
+      credCacheOk = true
+      credCachePw = pw
       (true, pw)
     except IOError:
       (false, "")
