@@ -367,11 +367,11 @@ when defined(windows):
     const SE_WINDOW_OBJECT = 7'i32
     proc hasSid(oldDacl: acl.PACL; rights: DWORD): bool =
       if oldDacl.isNil: return false
-      let aceCount = int(cast[ptr uint16](cast[uint](oldDacl) + 2)[])
+      let aceCount = int(cast[ptr uint16](cast[uint](oldDacl) + 4)[])
       for i in 0 ..< aceCount:
         var ace: pointer = nil
         if acl.getAce(oldDacl, DWORD(i), addr ace) == 0: continue
-        if cast[ptr uint8](cast[uint](ace) + 1)[] != 0: continue
+        if cast[ptr uint8](cast[uint](ace) + 0)[] != 0: continue
         let aceMask = cast[ptr DWORD](cast[uint](ace) + 4)[]
         let aceSid = cast[winffi.PSID](cast[pointer](cast[uint](ace) + 8))
         if not acl.sameSid(aceSid, sid): continue

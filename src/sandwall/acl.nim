@@ -217,14 +217,15 @@ when defined(windows):
     let sd = readDacl(path, addr oldDacl)
     defer: localFree(sd)
     if oldDacl.isNil: return false
-    let aceCount = int(cast[ptr uint16](cast[uint](oldDacl) + 2)[])
+    # ACL header: AclRevision(+0), Sbz1(+1), AclSize(+2), AceCount(+4).
+    # ACE header: AceType(+0), AceFlags(+1), AceSize(+2), Mask(+4), Sid(+8).
+    let aceCount = int(cast[ptr uint16](cast[uint](oldDacl) + 4)[])
     for i in 0 ..< aceCount:
       var ace: pointer = nil
       if getAce(oldDacl, DWORD(i), addr ace) == 0: continue
-      # AceType at +1: 0 = ACCESS_ALLOWED_ACE_TYPE
-      if cast[ptr uint8](cast[uint](ace) + 1)[] != 0: continue
+      # AceType at +0: 0 = ACCESS_ALLOWED_ACE_TYPE
+      if cast[ptr uint8](cast[uint](ace) + 0)[] != 0: continue
       let aceMask = cast[ptr DWORD](cast[uint](ace) + 4)[]
-      let aceFlags = cast[ptr uint8](cast[uint](ace) + 3)[]
       let aceSid = cast[PSID](cast[pointer](cast[uint](ace) + 8))
       if not sameSid(aceSid, sid): continue
       # GENERIC_ALL (0x10000000) from an (F) ACE covers FILE_ALL_ACCESS.
@@ -252,7 +253,7 @@ when defined(windows):
     defer: localFree(sd)
 
     # Compute the surviving size and count, skipping our SID's ACEs.
-    let aceCount = cast[ptr uint16](cast[uint](oldDacl) + 2)[]
+    let aceCount = cast[ptr uint16](cast[uint](oldDacl) + 4)[]
     var keepSize = 0
     var keepCount = 0
     for i in 0 ..< int(aceCount):
