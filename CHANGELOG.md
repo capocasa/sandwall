@@ -5,6 +5,31 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-08-18
+
+### Added
+
+- Windows: `sandwall/wall` exports `beginCapture`/`endCapture` so a
+  parent can run restrict + CreateProcessWithLogonW in-process and
+  collect the child's named-pipe stdout into a buffer, without a
+  second 3code.exe relay.
+
+### Fixed
+
+- Windows: ACL/ACE header offsets in `hasSidAce` were wrong after the
+  C shim drop, so the redundant-stamp skip never matched and setup
+  re-walked the MSYS2 tree every run.
+- Windows: the wall proxy's accept-thread state was an untraced
+  allocShared pointer; ORC collected it after a fenced curl and the
+  interactive parent SIGSEGV'd. It stays rooted from WallProxy now.
+- Windows: children spawned as the sandbox user (bash, whoami,
+  powershell) died 0xC0000142 because setup stamped WinSta0 with
+  GENERIC_ALL instead of this session's station with
+  WINSTA_ALL/DESKTOP_ALL. Those masks are granted at spawn.
+- Windows: `sandwall setup` caches the decrypted sandbox password and
+  tries logonFlags=0 before LOGON_WITH_PROFILE, saving hundreds of ms
+  per spawn.
+
 ## [0.5.3] - 2026-08-17
 
 ### Fixed
