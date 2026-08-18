@@ -5,6 +5,16 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: the endCapture buffer lived on the ORC thread heap - grown
+  by the pump thread, freed by the caller after the pump thread (and
+  its thread-local allocator, discarded at join) was gone. The
+  cross-thread dealloc landed in rawDealloc on freed TLS state and
+  SIGSEGV'd (seen as the 3code Windows `curl 1.1.1.1` deny crash in
+  endCapture). The capture buffer now lives on the Win32 process
+  heap, which any thread may grow and the caller reads safely.
+
 ## [0.5.4] - 2026-08-18
 
 ### Added

@@ -104,23 +104,68 @@ when defined(windows):
       inc(done, n)
 
 
+  type HeapSize = uint
+  proc getProcessHeap(): Handle {.stdcall, dynlib: "kernel32",
+      importc: "GetProcessHeap".}
+  proc heapAlloc(hHeap: Handle; dwFlags: DWORD; dwBytes: HeapSize):
+      pointer {.stdcall, dynlib: "kernel32", importc: "HeapAlloc".}
+  proc heapReAlloc(hHeap: Handle; dwFlags: DWORD; lpMem: pointer;
+      dwBytes: HeapSize): pointer {.stdcall, dynlib: "kernel32",
+      importc: "HeapReAlloc".}
+
+  # The capture buffer MUST live on the Win32 process heap, not the
+  # per-thread ORC heap: the pump thread grows it, the main thread
+  # frees it in endCapture - long after the pump thread (and its
+  # thread-local MemRegion, discarded at join) is gone. A string grown
+  # on the pump thread leaves cells owned by that dead allocator, and
+  # freeing them lands in rawDealloc -> addToSharedFreeList on freed
+  # TLS state (the Windows oneshot endCapture SIGSEGV).
   var captureLock: Lock
-  var captureBuf: string = ""
+  var capData: pointer = nil
+  var capLen: int = 0
+  var capCap: int = 0
   var captureOn = false
   var pumpThr: ptr Thread[ptr RelayPipe] = nil
   initLock(captureLock)
 
+  proc capReserve(n: int) =
+    ## Ensure room for `n` more bytes. Process heap; any thread may
+    ## grow or free it.
+    if capCap >= n: return
+    var newCap = if capCap == 0: pipeBuf else: capCap
+    while newCap < n: newCap = newCap * 2
+    let heap = getProcessHeap()
+    if capData == nil:
+      capData = heapAlloc(heap, 0, HeapSize(newCap))
+    else:
+      let p = heapReAlloc(heap, 0, capData, HeapSize(newCap))
+      if p != nil: capData = p
+    if capData != nil: capCap = newCap
+
+  proc capAppend(data: pointer; n: int) =
+    if n <= 0: return
+    capReserve(capLen + n)
+    if capCap < capLen + n: return
+    copyMem(cast[pointer](cast[uint](capData) + uint(capLen)), data, n)
+    inc(capLen, n)
+
   proc beginCapture*() =
-    ## Next pump writes into captureBuf instead of stdout. Used by the
-    ## in-process Windows tool path so the parent can stream lines.
+    ## Next pump writes into the capture buffer instead of stdout.
+    ## Used by the in-process Windows tool path so the parent can
+    ## stream lines.
     withLock captureLock:
-      captureBuf = ""
+      capLen = 0
       captureOn = true
 
   proc endCapture*(): string =
+    ## Copy the captured bytes into a main-thread string and reset. The
+    ## process-heap block is kept for reuse (freed only at process
+    ## exit by the heap itself).
     withLock captureLock:
-      result = captureBuf
-      captureBuf = ""
+      result = newString(capLen)
+      if capLen > 0 and capData != nil:
+        copyMem(addr result[0], capData, capLen)
+      capLen = 0
       captureOn = false
 
   proc pumpThread(p: ptr RelayPipe) {.thread.} =
@@ -141,7 +186,7 @@ when defined(windows):
         withLock captureLock:
           intoCapture = captureOn
           if intoCapture:
-            captureBuf.add buf[0 ..< n]
+            capAppend(addr buf[0], n)
       if not intoCapture:
         writeAll(dst, addr buf[0], n)
 
