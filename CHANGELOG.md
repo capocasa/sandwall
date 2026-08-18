@@ -5,6 +5,8 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-08-18
+
 ### Fixed
 
 - Windows: the endCapture buffer lived on the ORC thread heap - grown
