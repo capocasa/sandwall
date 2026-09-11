@@ -1,4 +1,4 @@
-import std/[nativesockets, net, os, posix, strutils, times, unittest]
+import std/[nativesockets, net, os, strutils, times, unittest]
 import sandwall/wall
 
 ## Live loopback tests for the wall proxy. Hermetic: everything binds
@@ -48,8 +48,8 @@ proc recvLine(c: Socket; timeoutMs: int): string =
   while true:
     let remain = int((deadline - epochTime()) * 1000)
     if remain <= 0: raise newException(ValueError, "recvLine timeout")
-    var pfd = TPollfd(fd: c.getFd().cint, events: POLLIN)
-    if poll(addr pfd, 1, remain.cint) <= 0:
+    var fds = @[c.getFd()]
+    if nativesockets.selectRead(fds, remain) <= 0:
       raise newException(ValueError, "recvLine timeout")
     let n = nativesockets.recv(c.getFd(), addr b[0], 1, 0'i32)
     if n == 0: raise newException(ValueError, "recvLine eof")
