@@ -4,9 +4,12 @@
 ## network-fenced children must run as a dedicated local user named
 ## `sandwall`. Setup is a one-time elevated, idempotent operation:
 ## create the user (or reset its password), mint a 32-char CSPRNG
-## password, store it DPAPI-protected (CurrentUser scope) at
-## %LOCALAPPDATA%\sandwall\credentials.dat, and hand the SID to
-## wfp.installFence.
+## password, store it DPAPI-protected (LOCAL_MACHINE scope) at the
+## machine-wide %ProgramData%\sandwall\credentials.dat, and hand the
+## SID to wfp.installFence. Machine scope is what lets the real user
+## (which may not be the elevated setup account) decrypt the blob; the
+## credential file carries a DENY for the sandwall account itself so a
+## sandboxed child cannot learn its own password.
 ##
 ## Launch: `spawnAsSandwall` logs the user on with
 ## LOGON32_LOGON_NETWORK_CLEARTEXT / LOGON32_PROVIDER_WINNT50 and
@@ -39,7 +42,12 @@ when defined(windows):
 
     # NetUserAdd / NetUserSetInfo (lmaccess.h)
     UF_SCRIPT = 0x0001'u32
-    UF_NORMAL_ACCOUNT = 0x0002'u32
+    # lmaccess.h: UF_NORMAL_ACCOUNT is 0x0200. 0x0002 is UF_ACCOUNTDISABLE,
+    # and NetUserAdd treats any flags value literally - setting the disable
+    # bit here created the sandwall account DISABLED, so every
+    # CreateProcessWithLogonW failed 1327 (ERROR_ACCOUNT_RESTRICTION) and
+    # the sandbox could never spawn.
+    UF_NORMAL_ACCOUNT = 0x0200'u32
     UF_DONT_EXPIRE_PASSWD = 0x10000'u32
     USER_PRIV_USER = 1'u32
     NERR_USER_EXISTS = 2224'u32
@@ -50,6 +58,14 @@ when defined(windows):
 
     # DPAPI (dpapi.h)
     CRYPTPROTECT_UI_FORBIDDEN = 0x01'u32
+    # Machine scope, not CurrentUser: the elevated setup may run as a
+    # different account than the one that later runs the sandbox (a
+    # standard user typing admin credentials into the UAC prompt), and a
+    # CurrentUser blob is undecryptable from that other account.
+    CRYPTPROTECT_LOCAL_MACHINE = 0x04'u32
+    # FILE_ALL_ACCESS (winnt.h) for the sandwall-account DENY on the
+    # credential file.
+    FILE_ALL_ACCESS = 0x001F01FF'u32
 
     CREATE_NO_WINDOW = 0x08000000'u32
     INFINITE_MS = 0xFFFFFFFF'u32
@@ -71,6 +87,9 @@ when defined(windows):
 
     USER_INFO_1003 {.bycopy.} = object
       password: WideCString
+
+    USER_INFO_1008 {.bycopy.} = object
+      flags: DWORD
 
     SID_NAME_USE {.size: sizeof(int32).} = enum
       sidTypeUser = 1
@@ -191,18 +210,26 @@ when defined(windows):
       result[i] = passwordAlphabet[bytes[i].int and 63]
 
   proc credPath(): string =
-    let base = getEnv("LOCALAPPDATA",
-      getEnv("USERPROFILE") / "AppData" / "Local")
+    ## Machine-wide store: %ProgramData%\sandwall. The credential must be
+    ## readable by whichever local user runs the sandbox, not just the
+    ## account that ran the elevated setup - a per-user path (%LOCALAPPDATA%
+    ## of the setup account) strands the blob when setup elevated into a
+    ## separate admin account, and every later run reports the sandbox as
+    ## unset up.
+    let base = getEnv("ProgramData", r"C:\ProgramData")
     base / "sandwall"
 
   proc storePassword(password: string) =
-    ## DPAPI-protect (CurrentUser scope, UI forbidden) and write the
-    ## blob to %LOCALAPPDATA%\sandwall\credentials.dat.
+    ## DPAPI-protect (LOCAL_MACHINE scope, UI forbidden) and write the
+    ## blob to %ProgramData%\sandwall\credentials.dat. Machine scope is
+    ## required: the decrypting process runs as the real user, which may
+    ## differ from the elevated setup account.
     var input = DATA_BLOB(cbData: DWORD(password.len),
       pbData: cast[ptr byte](password[0].unsafeAddr))
     var output: DATA_BLOB
     if cryptProtectData(addr input, nil, nil, nil, nil,
-        DWORD(CRYPTPROTECT_UI_FORBIDDEN), addr output) == 0:
+        DWORD(CRYPTPROTECT_UI_FORBIDDEN or CRYPTPROTECT_LOCAL_MACHINE),
+        addr output) == 0:
       fail("CryptProtectData")
     defer: localFree(output.pbData)
     let dir = credPath()
@@ -216,8 +243,8 @@ when defined(windows):
   var credCachePw = ""
 
   proc loadSandwallCred*(): tuple[ok: bool; password: string] =
-    ## Read + CryptUnprotectData the stored password. ok=false when
-    ## the file is missing, corrupt, or protected for another user.
+    ## Read + CryptUnprotectData the stored password from the machine-wide
+    ## store. ok=false when the file is missing or corrupt.
     ## Cached after the first success: DPAPI every command is waste
     ## once the parent stays alive across tool launches.
     if credCacheOk: return (true, credCachePw)
@@ -229,7 +256,8 @@ when defined(windows):
         pbData: cast[ptr byte](raw[0].unsafeAddr))
       var output: DATA_BLOB
       if cryptUnprotectData(addr input, nil, nil, nil, nil,
-          DWORD(CRYPTPROTECT_UI_FORBIDDEN), addr output) == 0:
+          DWORD(CRYPTPROTECT_UI_FORBIDDEN or CRYPTPROTECT_LOCAL_MACHINE),
+          addr output) == 0:
         return (false, "")
       defer: localFree(output.pbData)
       var pw = newString(output.cbData.int)
@@ -476,6 +504,17 @@ when defined(windows):
         raise newException(OSError, "sandwall winuser: user setup failed " &
           "(netapi error " & $rc & ")")
       storePassword(password)
+    # Normalize the account flags unconditionally. A fresh NetUserAdd with
+    # the corrected flags lands active, but an account created by an earlier
+    # sandwall build has UF_ACCOUNTDISABLE set and must be re-activated, or
+    # CreateProcessWithLogonW fails 1327 for every command.
+    var flagsInfo = USER_INFO_1008(flags: DWORD(UF_SCRIPT or
+      UF_NORMAL_ACCOUNT or UF_DONT_EXPIRE_PASSWD))
+    var flagsErr: DWORD
+    if netUserSetInfo(nil, name, 1008'i32, addr flagsInfo, addr flagsErr) != 0:
+      raise newException(OSError,
+        "sandwall winuser: could not activate the sandwall account " &
+        "(netapi error " & $flagsErr & ")")
     result = sidString()
     if result.len == 0:
       raise newException(OSError,
@@ -508,6 +547,30 @@ when defined(windows):
     let msys = getEnv("LOCALAPPDATA", "") & r"\3code\msys64"
     if dirExists(msys):
       discard grantExecute(msys)
+    # Deny the sandwall account read of its own credential file. Machine
+    # scope means a readable blob is a decryptable blob, and a child that
+    # learned its password could CreateProcessWithLogonW itself a fresh
+    # logon session outside the fence. Users keep the inherited
+    # %ProgramData% read ACE so the real-user parent can still decrypt.
+    let credFile = credPath() / "credentials.dat"
+    if fileExists(credFile):
+      let csid = userSid(sandwallUserName)
+      if csid != nil:
+        defer: dealloc(csid)
+        try:
+          acl.stampAce(credFile, csid, acl.denyAccess,
+                       DWORD(FILE_ALL_ACCESS), DWORD(0))
+        except OSError as e:
+          stderr.writeLine("sandwall winuser: credential ACL hardening " &
+            "failed: " & e.msg)
+    # Drop the pre-machine-store per-user credential; it lives in the
+    # (elevated) setup account's profile and no longer matches the
+    # runtime lookup.
+    let localAppData = getEnv("LOCALAPPDATA", "")
+    if localAppData.len > 0:
+      let legacy = localAppData / "sandwall" / "credentials.dat"
+      if fileExists(legacy):
+        try: removeFile(legacy) except OSError: discard
 
   proc spawnAsSandwall*(cmd: openArray[string]): Handle =
     ## Log on as the sandwall user and spawn `cmd` via

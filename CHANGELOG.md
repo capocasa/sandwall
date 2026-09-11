@@ -3,7 +3,33 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.5.6] - 2026-09-11
+
+### Fixed
+
+- Windows: `setup` created the `sandwall` account **disabled**. The
+  `UF_NORMAL_ACCOUNT` constant was `0x0002`, which is `UF_ACCOUNTDISABLE`
+  (`UF_NORMAL_ACCOUNT` is `0x0200`), so `NetUserAdd` set the disable bit
+  literally and every sandboxed `CreateProcessWithLogonW` failed 1327
+  (ERROR_ACCOUNT_RESTRICTION) - the account could never log on. The
+  constant is corrected and setup now re-activates the account via
+  `NetUserSetInfo` level 1008, which also heals accounts stranded
+  disabled by an earlier build.
+
+- Windows: the sandwall-user credential was stored per-user
+  (`%LOCALAPPDATA%\sandwall\credentials.dat`, DPAPI CurrentUser
+  scope). When setup elevated into a different account than the one
+  that later runs the sandbox (a standard user typing admin
+  credentials into the UAC prompt, or a SYSTEM install), the blob
+  landed in the setup account's profile and was undecryptable by the
+  real user - so `backendSupported` returned false and every run
+  reported the sandbox as unset up even though `setup` printed
+  success. The credential now lives in a machine-wide store
+  (`%ProgramData%\sandwall\credentials.dat`) under DPAPI
+  LOCAL_MACHINE scope, readable by any local user; the sandwall
+  account itself gets a DENY ACE on the file so a sandboxed child
+  cannot learn its own password. A leftover per-user blob from an
+  earlier setup is removed. (GitHub issue #33.)
 
 ## [0.5.5] - 2026-08-18
 

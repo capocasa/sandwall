@@ -12,8 +12,8 @@
 ## Enforcement model (the Codex "elevated sandbox" shape):
 ##   1. A one-time elevated setup (`3code wall setup-windows`) creates
 ##      a dedicated local user `sandwall` with a random password
-##      stored DPAPI-protected at %LOCALAPPDATA%\sandwall\
-##      credentials.dat (wall/winuser.nim).
+##      stored DPAPI-protected (machine scope) at the machine-wide
+##      %ProgramData%\sandwall\credentials.dat (wall/winuser.nim).
 ##   2. `restrictImpl` stamps an ALLOW ACE for the sandbox USER SID on
 ##      each writable root (full access) and traverse-only ACEs on the
 ##      ancestors of every root (private profile dirs deny traverse by
