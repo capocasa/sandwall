@@ -4,10 +4,15 @@
 ## dedicated local user `sandwall` (see winuser.nim) to loopback plus
 ## the fixed proxy port range, blocking all other egress for that
 ## user. Everyone else falls through to default-permit, so the host
-## user is unaffected. Filters live in our own provider+sublayer
-## (fixed GUIDs, hardcoded) and survive reboots; install/uninstall
-## need elevation (the BFE denies non-admin enumeration, which
-## fenceStatus reports instead of raising).
+## user is unaffected. Filters live in our own sublayer (fixed GUIDs,
+## hardcoded), are added with FWPM_*_FLAG_PERSISTENT and so survive
+## reboots; install/uninstall need elevation (the BFE denies non-admin
+## enumeration, which fenceStatus reports instead of raising).
+## There is deliberately no FWPM provider: BFE marks a provider's
+## filters disabled at boot when the provider has no Windows service
+## name (FWPM_FILTER_FLAG_DISABLED), which would leave a fence that
+## enumerates as installed but stops enforcing. The srt reference
+## (srt-win-src/src/wfp.rs) uses the same providerless shape.
 ##
 ## Filter table, checked against srt's srt-win-src/src/wfp.rs:
 ##
@@ -36,10 +41,9 @@ const
   FirstProxyPort* = 60080'u16
   LastProxyPort* = 60089'u16
 
-# Fixed GUIDs for provider / sublayer / filters, generated once and
-# hardcoded so a second install finds the first one's objects.
+# Fixed GUIDs for sublayer / filters, generated once and hardcoded so
+# a second install finds the first one's objects.
 const
-  providerGuidText* = "1f8b3d7a-6c2e-4a91-9b5d-2e7c4a0f1d35"
   sublayerGuidText* = "3c9e2b18-5d4f-4e72-a8c1-9f6b0d3e5271"
   permitV4GuidText* = "5a1d4c72-9e3b-4f58-b6a2-7d0c8e1f4a63"
   blockV4GuidText*  = "6b2e5d83-0f4c-5a69-c7b3-8e1d9f2a5b74"
@@ -158,13 +162,6 @@ when defined(windows):
       matchType: uint32  # FWP_MATCH_TYPE
       conditionValue: FWP_VALUE0
 
-    FWPM_PROVIDER0* {.bycopy.} = object
-      providerKey: GUID
-      displayData: FWPM_DISPLAY_DATA0
-      flags: uint32
-      providerData: FWP_BYTE_BLOB
-      serviceName: ptr UncheckedArray[Utf16Char]
-
     FWPM_SUBLAYER0* {.bycopy.} = object
       subLayerKey: GUID
       displayData: FWPM_DISPLAY_DATA0
@@ -259,6 +256,11 @@ when defined(windows):
 
     RPC_C_AUTHN_DEFAULT = 0xFFFFFFFF'u32  # FWPM_SESSION0.authnService
 
+    # persistence (fwpmu.h): without these flags objects are static,
+    # i.e. gone when BFE stops at shutdown
+    FWPM_FILTER_FLAG_PERSISTENT = 0x00000001'u32
+    FWPM_SUBLAYER_FLAG_PERSISTENT = 0x0001'u16
+
     ERROR_ACCESS_DENIED = 5'u32
     FWP_E_ALREADY_EXISTS = 0x80320009'u32
     FWP_E_FILTER_NOT_FOUND = 0x80320003'u32
@@ -270,13 +272,11 @@ when defined(windows):
   when sizeof(pointer) == 8:
     static:
       doAssert sizeof(FWP_VALUE0) == 16
-      doAssert sizeof(FWPM_PROVIDER0) == 64
       doAssert sizeof(FWPM_SUBLAYER0) == 72
       doAssert sizeof(FWPM_ACTION0) == 20
       doAssert sizeof(FWPM_FILTER0) == 200
 
   let
-    providerKey* = parseGuid(providerGuidText)
     sublayerKey* = parseGuid(sublayerGuidText)
     permitV4Key* = parseGuid(permitV4GuidText)
     blockV4Key* = parseGuid(blockV4GuidText)
@@ -291,18 +291,12 @@ when defined(windows):
       importc: "FwpmEngineOpen0".}
   proc fwpmEngineClose0(engineHandle: Handle): DWORD {.stdcall,
       dynlib: "fwpuclnt", importc: "FwpmEngineClose0".}
-  proc fwpmProviderAdd0(engineHandle: Handle; provider: ptr FWPM_PROVIDER0;
-      sd: pointer): DWORD {.stdcall, dynlib: "fwpuclnt",
-      importc: "FwpmProviderAdd0".}
   proc fwpmSubLayerAdd0(engineHandle: Handle; subLayer: ptr FWPM_SUBLAYER0;
       sd: pointer): DWORD {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmSubLayerAdd0".}
   proc fwpmSubLayerDeleteByKey0(engineHandle: Handle;
       key: ptr GUID): DWORD {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmSubLayerDeleteByKey0".}
-  proc fwpmProviderDeleteByKey0(engineHandle: Handle;
-      key: ptr GUID): DWORD {.stdcall, dynlib: "fwpuclnt",
-      importc: "FwpmProviderDeleteByKey0".}
   proc fwpmFilterAdd0(engineHandle: Handle; filter: ptr FWPM_FILTER0;
       sd: pointer; id: ptr uint64): DWORD {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmFilterAdd0".}
@@ -390,23 +384,16 @@ when defined(windows):
       let key = parseGuid(keyText)
       discard fwpmFilterDeleteByKey0(engine, unsafeAddr key)
 
-  proc ensureProviderAndSublayer(engine: Handle) =
+  proc ensureSublayer(engine: Handle) =
     let name = allocWide("sandwall")
-    var prov: FWPM_PROVIDER0
-    zeroMem(addr prov, sizeof(prov))
-    prov.providerKey = providerKey
-    prov.displayData.name = name
-    prov.displayData.description = name
-    var rc = fwpmProviderAdd0(engine, addr prov, nil)
-    if rc != 0 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
-      fail("FwpmProviderAdd0", rc)
     var sub: FWPM_SUBLAYER0
     zeroMem(addr sub, sizeof(sub))
     sub.subLayerKey = sublayerKey
     sub.displayData.name = name
     sub.displayData.description = name
+    sub.flags = FWPM_SUBLAYER_FLAG_PERSISTENT
     sub.weight = 0xFFFF
-    rc = fwpmSubLayerAdd0(engine, addr sub, nil)
+    let rc = fwpmSubLayerAdd0(engine, addr sub, nil)
     if rc != 0 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
       fail("FwpmSubLayerAdd0", rc)
 
@@ -482,8 +469,7 @@ when defined(windows):
     var filt: FWPM_FILTER0
     zeroMem(addr filt, sizeof(filt))
     filt.filterKey = key
-    var provKey = providerKey
-    filt.providerKey = addr provKey
+    filt.flags = FWPM_FILTER_FLAG_PERSISTENT
     filt.layerKey = layer
     filt.subLayerKey = sublayerKey
     filt.displayData.name = name
@@ -508,7 +494,7 @@ when defined(windows):
     doAssert validPortRange(firstPort, lastPort)
     let engine = openEngine("sandwall-setup")
     defer: discard fwpmEngineClose0(engine)
-    ensureProviderAndSublayer(engine)
+    ensureSublayer(engine)
     for id in enumOurFilters(engine):
       discard fwpmFilterDeleteById0(engine, id)
     deleteFiltersByKeys(engine, userFenceKeyText)
@@ -555,7 +541,7 @@ when defined(windows):
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallFence*() =
-    ## Remove our filters, sublayer and provider. Missing objects are
+    ## Remove our filters and sublayer. Missing objects are
     ## tolerated so uninstall is safe to run repeatedly.
     let engine = openEngine("sandwall-setup")
     defer: discard fwpmEngineClose0(engine)
@@ -563,8 +549,8 @@ when defined(windows):
       discard fwpmFilterDeleteById0(engine, id)
     # Also delete by key (covers filters enum may miss on busy systems)
     deleteFiltersByKeys(engine, userFenceKeyText)
+    deleteFiltersByKeys(engine, acFenceKeyText)
     discard fwpmSubLayerDeleteByKey0(engine, unsafeAddr sublayerKey)
-    discard fwpmProviderDeleteByKey0(engine, unsafeAddr providerKey)
 
   proc fenceStatus*(): tuple[installed: bool; filters: int; hint: string] =
     ## Enum-based status. Access denied (non-admin) is not an error:
@@ -624,7 +610,7 @@ when defined(windows):
     ## with FwpmFilterAdd0 ALREADY_EXISTS.
     let engine = openEngine("sandwall-ac-setup")
     defer: discard fwpmEngineClose0(engine)
-    ensureProviderAndSublayer(engine)
+    ensureSublayer(engine)
     deleteFiltersByKeys(engine, acFenceKeyText)
     let acSid = getAcSidRaw()
 

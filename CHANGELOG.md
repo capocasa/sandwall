@@ -3,6 +3,20 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [unreleased]
+
+### Fixed
+
+- Windows: the WFP fence was volatile - filters, sublayer and
+  provider were added as static objects, so the whole fence vanished
+  when the BFE stopped at shutdown and only the next `setup` re-armed
+  it. Filters and sublayer now carry `FWPM_*_FLAG_PERSISTENT` and
+  survive reboots. The FWPM provider is gone entirely: the BFE marks a
+  provider's filters disabled at boot when the provider has no
+  Windows service name (FWPM_FILTER_FLAG_DISABLED), which would have
+  left a fence that enumerates as installed but no longer enforces
+  (same providerless shape as the srt reference implementation).
+
 ## [0.5.6] - 2026-09-11
 
 ### Fixed

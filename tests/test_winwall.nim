@@ -36,7 +36,7 @@ suite "wfp pure logic":
     let a = parseGuid("C38D57D1-05A7-4C33-904F-0FBD964EE60E")
     let b = parseGuid("c38d57d1-05a7-4c33-904f-0fbd964ee60e")
     check a == b
-    check parseGuid(providerGuidText) != parseGuid(sublayerGuidText)
-    for t in [providerGuidText, sublayerGuidText, permitV4GuidText,
+    check parseGuid(permitV4GuidText) != parseGuid(blockV4GuidText)
+    for t in [sublayerGuidText, permitV4GuidText,
         blockV4GuidText, permitV6GuidText, blockV6GuidText]:
       check t.len == 36

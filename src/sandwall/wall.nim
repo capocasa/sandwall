@@ -15,7 +15,7 @@ export hosts
 import ./wall/wfp
 export wfp.FirstProxyPort, wfp.LastProxyPort, wfp.validPortRange,
   wfp.sddlForUserSid, wfp.GUID, wfp.parseGuid, wfp.guidBytes,
-  wfp.providerGuidText, wfp.sublayerGuidText, wfp.permitV4GuidText,
+  wfp.sublayerGuidText, wfp.permitV4GuidText,
   wfp.blockV4GuidText, wfp.permitV6GuidText, wfp.blockV6GuidText
 
 import ./wall/proxy
