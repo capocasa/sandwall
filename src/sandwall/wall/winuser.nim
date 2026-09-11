@@ -502,7 +502,11 @@ when defined(windows):
         rc = netUserSetInfo(nil, name, 1003'i32, addr pwInfo, addr parmErr)
       if rc != 0:
         raise newException(OSError, "sandwall winuser: user setup failed " &
-          "(netapi error " & $rc & ")")
+          (if rc == 5:
+            "(access denied: this needs an account with admin rights - " &
+            "run setup elevated)"
+          else:
+            "(netapi error " & $rc & ")"))
       storePassword(password)
     # Normalize the account flags unconditionally. A fresh NetUserAdd with
     # the corrected flags lands active, but an account created by an earlier
@@ -510,11 +514,17 @@ when defined(windows):
     # CreateProcessWithLogonW fails 1327 for every command.
     var flagsInfo = USER_INFO_1008(flags: DWORD(UF_SCRIPT or
       UF_NORMAL_ACCOUNT or UF_DONT_EXPIRE_PASSWD))
-    var flagsErr: DWORD
-    if netUserSetInfo(nil, name, 1008'i32, addr flagsInfo, addr flagsErr) != 0:
+    var flagsParm: DWORD
+    let flagsRc = netUserSetInfo(nil, name, 1008'i32, addr flagsInfo,
+                                addr flagsParm)
+    if flagsRc != 0:
       raise newException(OSError,
         "sandwall winuser: could not activate the sandwall account " &
-        "(netapi error " & $flagsErr & ")")
+        (if flagsRc == 5:
+          "(access denied: this needs an account with admin rights - " &
+          "run setup elevated)"
+        else:
+          "(netapi error " & $flagsRc & ")"))
     result = sidString()
     if result.len == 0:
       raise newException(OSError,
