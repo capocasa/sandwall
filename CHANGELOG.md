@@ -3,9 +3,15 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [unreleased]
+## [0.5.7] - 2026-09-11
 
 ### Fixed
+
+- Windows: user-setup failures from `NetUserAdd`/`NetUserSetInfo`
+  now say what to do (access denied needs an account with admin
+  rights, run setup elevated) instead of a raw netapi code, and the
+  activate path prints the actual return code - it previously
+  printed the parmErr index, which surfaced as "netapi error 0".
 
 - Windows: the WFP fence was volatile - filters, sublayer and
   provider were added as static objects, so the whole fence vanished
