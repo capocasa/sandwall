@@ -15,18 +15,18 @@ proc startEcho(): tuple[sock: Socket, port: uint16] =
   let slot = cast[ptr Thread[Ctx]](allocShared0(sizeof(Thread[Ctx])))
   createThread(slot[], proc(a: Ctx) {.thread.} =
     while true:
-      let c = posix.accept(a.sock.getFd(), nil, nil)
+      let c = nativesockets.accept(a.sock.getFd(), nil, nil)
       if c == osInvalidSocket: continue
       var buf = newString(4096)
       while true:
-        let n = posix.recv(c, addr buf[0], 4096, 0'i32)
+        let n = nativesockets.recv(c, addr buf[0], 4096, 0'i32)
         if n <= 0: break
         var off = 0
         while off < n:
-          let s = posix.send(c, addr buf[off], (n - off).cint, 0'i32)
+          let s = nativesockets.send(c, addr buf[off], (n - off).cint, 0'i32)
           if s <= 0: break
           off.inc s
-      discard posix.close(c)
+      nativesockets.close(c)
   , (sock: result.sock))
 
 var tmpDir: string
@@ -75,35 +75,43 @@ proc withFakeStdio(stdinData: string; body: proc(): int):
   discard posix.close(outPipe[0])
   (code, outData)
 
-suite "wall connect":
-  setup:
-    tmpDir = getTempDir() / "sandwall_connect_" & $getCurrentProcessId()
-    createDir(tmpDir)
-    if echoSock == nil:
-      (echoSock, echoPort) = startEcho()
-  teardown:
-    removeDir(tmpDir)
+when defined(posix):
+  suite "wall connect":
+    setup:
+      tmpDir = getTempDir() / "sandwall_connect_" & $getCurrentProcessId()
+      createDir(tmpDir)
+      if echoSock == nil:
+        (echoSock, echoPort) = startEcho()
+    teardown:
+      removeDir(tmpDir)
 
-  test "SOCKS5 handshake against the wall proxy, tunnel carries bytes":
-    let policy = tmpDir / "policy.txt"
-    writeFile(policy, "allow 127.0.0.1:" & $echoPort & "\n")
-    var p = startWallProxy(policy, tmpDir)
-    defer: p.stopWallProxy()
-    let (code, outData) = withFakeStdio("ping\n") do () -> int:
-      socksConnect(p.port, "127.0.0.1", echoPort)
-    check code == 0
-    check outData == "ping\n"
+    test "SOCKS5 handshake against the wall proxy, tunnel carries bytes":
+      let policy = tmpDir / "policy.txt"
+      writeFile(policy, "allow 127.0.0.1:" & $echoPort & "\n")
+      var p = startWallProxy(policy, tmpDir)
+      defer: p.stopWallProxy()
+      let (code, outData) = withFakeStdio("ping\n") do () -> int:
+        socksConnect(p.port, "127.0.0.1", echoPort)
+      check code == 0
+      check outData == "ping\n"
 
-  test "denied target returns 1":
-    let policy = tmpDir / "policy.txt"
-    writeFile(policy, "allow example.com\n")
-    var p = startWallProxy(policy, tmpDir)
-    defer: p.stopWallProxy()
-    let (code, _) = withFakeStdio("") do () -> int:
-      socksConnect(p.port, "127.0.0.1", echoPort)
-    check code == 1
+    test "denied target returns 1":
+      let policy = tmpDir / "policy.txt"
+      writeFile(policy, "allow example.com\n")
+      var p = startWallProxy(policy, tmpDir)
+      defer: p.stopWallProxy()
+      let (code, _) = withFakeStdio("") do () -> int:
+        socksConnect(p.port, "127.0.0.1", echoPort)
+      check code == 1
 
-  test "no proxy listening returns 1":
-    let (code, _) = withFakeStdio("") do () -> int:
-      socksConnect(1, "127.0.0.1", echoPort)
-    check code == 1
+    test "no proxy listening returns 1":
+      let (code, _) = withFakeStdio("") do () -> int:
+        socksConnect(1, "127.0.0.1", echoPort)
+      check code == 1
+else:
+  # socksConnect is the POSIX-only stdio pump (wall.nim gates connect
+  # under `defined(posix)`), so this suite has nothing to drive on
+  # Windows.
+  suite "wall connect":
+    test "posix-only":
+      check true

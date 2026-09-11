@@ -21,18 +21,18 @@ proc startEcho(): tuple[sock: Socket, port: uint16] =
     # tests, and accepting in a loop keeps the server alive across
     # tests that open more than one connection.
     while true:
-      let c = posix.accept(a.sock.getFd(), nil, nil)
+      let c = nativesockets.accept(a.sock.getFd(), nil, nil)
       if c == osInvalidSocket: continue
       var buf = newString(4096)
       while true:
-        let n = posix.recv(c, addr buf[0], 4096, 0'i32)
+        let n = nativesockets.recv(c, addr buf[0], 4096, 0'i32)
         if n <= 0: break
         var off = 0
         while off < n:
-          let s = posix.send(c, addr buf[off], (n - off).cint, 0'i32)
+          let s = nativesockets.send(c, addr buf[off], (n - off).cint, 0'i32)
           if s <= 0: break
           off.inc s
-      discard posix.close(c)
+      nativesockets.close(c)
   , (sock: result.sock, port: result.port))
 
 var tmpDir: string
@@ -51,7 +51,7 @@ proc recvLine(c: Socket; timeoutMs: int): string =
     var pfd = TPollfd(fd: c.getFd().cint, events: POLLIN)
     if poll(addr pfd, 1, remain.cint) <= 0:
       raise newException(ValueError, "recvLine timeout")
-    let n = posix.recv(c.getFd(), addr b[0], 1, 0'i32)
+    let n = nativesockets.recv(c.getFd(), addr b[0], 1, 0'i32)
     if n == 0: raise newException(ValueError, "recvLine eof")
     if n < 0: raiseOSError(osLastError())
     if b[0] == '\L': return

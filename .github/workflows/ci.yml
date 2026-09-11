@@ -53,8 +53,11 @@ jobs:
         run: |
           set -o pipefail
           nimble test 2>&1 | tee /tmp/sandwall-test.log
-          # A nimble task abort has failed to fail this step before;
-          # never report green with a FAILED test in the log.
+          # A nimble task abort (compile error) exits non-zero without
+          # printing [FAILED]; check the pipeline status too so a broken
+          # build is never reported green.
+          status=$?
+          if [ "$status" -ne 0 ]; then echo "nimble test exited $status"; exit 1; fi
           ! grep -q '\[FAILED\]' /tmp/sandwall-test.log
 
       - name: Run tests (Windows)
@@ -62,6 +65,10 @@ jobs:
         shell: pwsh
         run: |
           nimble test 2>&1 | Tee-Object -FilePath sandwall-test.log
+          # A nimble task abort (compile error) exits non-zero without
+          # printing [FAILED]; check $LASTEXITCODE too so a broken build
+          # is never reported green.
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           if (Select-String -Path sandwall-test.log -Pattern '\[FAILED\]' -Quiet) { exit 1 }
 
       - name: Package (Unix)
