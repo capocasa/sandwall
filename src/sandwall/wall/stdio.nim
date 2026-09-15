@@ -18,7 +18,7 @@
 ## ends at EOF (the relay closes its end when the command exits).
 
 when defined(windows):
-  import std/[locks, os, strutils, syncio]
+  import std/[atomics, locks, os, strutils, syncio, times]
   import std/winlean except Socket
   import ./quotecmd
 
@@ -168,12 +168,18 @@ when defined(windows):
       capLen = 0
       captureOn = false
 
+  var
+    pumpConnected: Atomic[bool]
+    pumpDone: Atomic[bool]
+
   proc pumpThread(p: ptr RelayPipe) {.thread.} =
     ## Connect the server end, then relay every byte into our stdout
     ## (or the capture buffer) until the relay child closes its end.
     let connected = connectNamedPipe(p.handle, nil)
     if connected == 0 and getLastError().int32 != 535:   # PIPE_CONNECTED
+      pumpDone.store(true, moRelease)
       return
+    pumpConnected.store(true, moRelease)
     let dst = getStdHandle(STD_OUTPUT_HANDLE)
     var buf = newString(pipeBuf)
     while true:
@@ -189,6 +195,7 @@ when defined(windows):
             capAppend(addr buf[0], n)
       if not intoCapture:
         writeAll(dst, addr buf[0], n)
+    pumpDone.store(true, moRelease)
 
   proc pumpRelay*(p: var RelayPipe) =
     ## Start the pump thread for `p`. closeRelay joins it.
@@ -198,15 +205,36 @@ when defined(windows):
     createThread(pumpThr[], pumpThread, pp)
 
   proc closeRelay*(p: var RelayPipe) =
-    ## Close the server end and join the pump so the last bytes land
-    ## in stdout or the capture buffer before the caller reads them.
-    if p.handle != 0:
-      discard closeHandle(p.handle)
-      p.handle = 0
+    ## Reap the pump so the last bytes land in stdout or the capture
+    ## buffer before the caller reads them - without ever blocking the
+    ## caller. Two parked-pump shapes must not become a deadlock here:
+    ## a child that never connected leaves the pump inside
+    ## ConnectNamedPipe forever (CloseHandle does not cancel a pending
+    ## connect on a synchronous pipe), and a descendant holding the
+    ## write end leaves it inside ReadFile. Close and join only when
+    ## the pump got a client; cap the join wait and otherwise leak the
+    ## thread, handle and control block - they hold nothing but a
+    ## stack and die with the process. This join was the Windows "tool
+    ## call holds forever": the child died before opening the pipe,
+    ## endRun joined the parked pump, and the tool never returned.
     if pumpThr != nil:
-      joinThread(pumpThr[])
-      deallocShared(pumpThr)
-      pumpThr = nil
+      if p.handle != 0 and pumpConnected.load(moAcquire):
+        discard closeHandle(p.handle)
+        p.handle = 0
+        var waited = 0
+        while not pumpDone.load(moAcquire) and waited < 3000:
+          sleep(10)
+          inc waited, 10
+        if pumpDone.load(moAcquire):
+          joinThread(pumpThr[])
+          deallocShared(pumpThr)
+          pumpThr = nil
+      else:
+        # Never connected: leak handle + thread + control block; the
+        # next pumpRelay simply overwrites pumpThr.
+        p.handle = 0
+      pumpConnected.store(false, moRelease)
+      pumpDone.store(false, moRelease)
 
   proc waitNamedPipeW(lpNamedPipeName: WideCString;
       nTimeOut: DWORD): WINBOOL {.stdcall, dynlib: "kernel32",

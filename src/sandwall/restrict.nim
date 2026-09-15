@@ -27,7 +27,8 @@ elif defined(macosx):
   export seatbelt.backendSupported, seatbelt.backendName
 elif defined(windows):
   import ./rtoken
-  export rtoken.backendSupported, rtoken.backendName
+  export rtoken.backendSupported, rtoken.backendName,
+         rtoken.interruptActiveRun
 
 proc restrict*(writable: openArray[string]; read: openArray[string] = [];
                denied: openArray[string] = [];

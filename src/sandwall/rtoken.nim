@@ -98,6 +98,8 @@ when defined(windows):
   proc setInformationJobObject(job: Handle; infoClass: int32; info: pointer;
       infoLen: DWORD): WINBOOL {.stdcall, dynlib: "kernel32",
       importc: "SetInformationJobObject".}
+  proc terminateJobObject(hJob: Handle; uExitCode: int32): WINBOOL {.stdcall,
+      dynlib: "kernel32", importc: "TerminateJobObject".}
   proc assignProcessToJobObject(job, process: Handle): WINBOOL {.stdcall,
       dynlib: "kernel32", importc: "AssignProcessToJobObject".}
   proc fail(what: string) {.noinline.} =
@@ -148,6 +150,21 @@ when defined(windows):
   var relayPipe: stdio.RelayPipe
     ## The current run's stdout pipe for the CPLW child; closed by
     ## endRun after the child exits.
+
+  var activeJob: Handle = 0
+    ## The current run's KILL_ON_JOB_CLOSE Job. Leaked with the run
+    ## (one per run, same lifetime as before); kept addressable so
+    ## `interruptActiveRun` can kill the whole sandboxed tree from
+    ## another thread (caller timeout / user cancel). Terminating a
+    ## stale handle kills an already-dead, empty job: harmless.
+
+  proc interruptActiveRun*() {.gcsafe.} =
+    ## Kill the current sandboxed run's process tree. Wakes a caller
+    ## blocked in `waitForExit`; the run then unwinds through endRun
+    ## (whose pump reap is bounded and never joins a pump that never
+    ## connected). No-op when no run is active.
+    if activeJob != 0:
+      discard terminateJobObject(activeJob, 1'i32)
 
   var logonFlagsTried = false
   var logonFlagsCache: DWORD = LOGON_WITH_PROFILE
@@ -313,7 +330,7 @@ when defined(windows):
     let job = ensureJob()
     # The Job handle must outlive the child for KILL_ON_JOB_CLOSE; we
     # leak it into this process (one Job per run, freed at exit).
-    discard job
+    activeJob = job
     let tag = $epochTime() & "-" & $getCurrentProcessId()
     relayPipe = stdio.createRelayPipe(tag)
     try:
@@ -326,8 +343,19 @@ when defined(windows):
       # itself; handle inheritance does not cross the logon boundary.
       # Start the pump after CPLW so a client will connect (a pump with
       # no client hangs endRun: ConnectNamedPipe + closeHandle).
-      let inner = quoteCmdLine(cmd)
-      let wrapped = "cmd.exe /c " & inner & " >" &
+      # The inner command travels via the environment, not the command
+      # line: quoteCmdLine escapes embedded quotes for the C runtime
+      # (\"), which cmd.exe's own parser does not honor. Inline, the
+      # nested quotes toggle cmd's quote state and the inner redirects
+      # leak out as cmd operators - cmd then tried to resolve the bash
+      # script's POSIX path as its own stdin redirect, died with "the
+      # network path was not found" before ever opening the output
+      # pipe, and the parent's pump parked in ConnectNamedPipe forever
+      # (the Windows "tool call holds forever"). With /v:on the
+      # !VAR! expansion happens after operator parsing, so the command
+      # text reaches the child byte-for-byte.
+      putenv("NIMBOX_CMD", quoteCmdLine(cmd))
+      let wrapped = "cmd.exe /v:on /c !NIMBOX_CMD! >" &
         relayPipe.childName & " 2>&1"
       let cmdW = newWideCString(wrapped)
       let userW = newWideCString(winuser.sandwallUserName)
