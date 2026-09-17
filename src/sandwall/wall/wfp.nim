@@ -397,11 +397,16 @@ when defined(windows):
     if rc != 0 and rc != cast[DWORD](FWP_E_ALREADY_EXISTS):
       fail("FwpmSubLayerAdd0", rc)
 
-  proc enumOurFilters(engine: Handle): seq[uint64] =
-    ## IDs of all filters in our sublayer (any layer), via enum.
+  proc enumOurFilters(engine: Handle; denied: var bool): seq[uint64] =
+    ## IDs of all filters in our sublayer (any layer), via enum. A
+    ## non-admin token opens the engine read-only but is denied the
+    ## enum; `denied` reports that so status probes can hint instead
+    ## of raising.
     var eh: Handle
     let rc = fwpmFilterCreateEnumHandle0(engine, nil, addr eh)
-    if rc != 0: fail("FwpmFilterCreateEnumHandle0", rc)
+    denied = rc == DWORD(ERROR_ACCESS_DENIED)
+    if rc != 0 and not denied: fail("FwpmFilterCreateEnumHandle0", rc)
+    if denied: return @[]
     defer: discard fwpmFilterDestroyEnumHandle0(engine, eh)
     while true:
       var entries: ptr UncheckedArray[ptr FWPM_FILTER0]
@@ -416,6 +421,12 @@ when defined(windows):
           let f = entries[i]
           if f[].subLayerKey == sublayerKey:
             result.add f[].filterId
+
+  proc enumOurFilters(engine: Handle): seq[uint64] =
+    var denied: bool
+    result = enumOurFilters(engine, denied)
+    if denied:
+      fail("FwpmFilterCreateEnumHandle0", DWORD(ERROR_ACCESS_DENIED))
 
   proc guidToBytes(g: GUID): array[16, byte] = guidBytes(g)
 
@@ -562,7 +573,12 @@ when defined(windows):
         "WFP status needs admin; run the sandwall-user behavioral " &
         "verify (verifyFenceBehavioral) for a non-elevated check")
     defer: discard fwpmEngineClose0(engine)
-    let ids = enumOurFilters(engine)
+    var enumDenied: bool
+    let ids = enumOurFilters(engine, enumDenied)
+    if enumDenied:
+      return (false, 0,
+        "WFP status needs admin; run the sandwall-user behavioral " &
+        "verify (verifyFenceBehavioral) for a non-elevated check")
     (ids.len > 0, ids.len, "")
 
   proc wfpProbeMain*(): int =
@@ -674,6 +690,8 @@ when defined(windows):
         inc found
         var p: pointer = fptr
         fwpmFreeMemory0(addr p)
+      elif grc == DWORD(ERROR_ACCESS_DENIED):
+        return (false, 0, "WFP status needs admin; run 'sandwall setup' elevated")
       elif grc != cast[DWORD](FWP_E_FILTER_NOT_FOUND):
         fail("FwpmFilterGetByKey0", grc)
 
