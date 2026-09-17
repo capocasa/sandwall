@@ -10,7 +10,7 @@
 ## Windows 11; the same wall Codex hit, openai/codex#17459).
 ##
 ## Enforcement model (the Codex "elevated sandbox" shape):
-##   1. A one-time elevated setup (`3code wall setup-windows`) creates
+##   1. A one-time elevated setup (`3code sandbox setup`) creates
 ##      a dedicated local user `sandwall` with a random password
 ##      stored DPAPI-protected (machine scope) at the machine-wide
 ##      %ProgramData%\sandwall\credentials.dat (wall/winuser.nim).
@@ -178,7 +178,7 @@ when defined(windows):
       if sid.len == 0:
         raise newException(OSError,
           "sandwall windows-user: the sandbox user does not exist; " &
-          "run `3code wall setup-windows` once (elevated)")
+          "run `3code sandbox setup` once (elevated)")
       if convertStringSidToSidW(newWideCString(sid),
           addr userSidCache) == 0:
         fail("ConvertStringSidToSidW(sandbox user)")
@@ -318,7 +318,7 @@ when defined(windows):
     if not ok:
       raise newException(OSError,
         "sandwall windows-user: no stored credentials; " &
-        "run `3code setup` once (elevated)")
+        "run `3code sandbox setup` once (elevated)")
     discard sandboxUserSid()  # fail fast when setup never ran
     # Stamp THIS process's winsta/desktop so user32 children of CPLW
     # can init. Setup may have granted a different session's objects.

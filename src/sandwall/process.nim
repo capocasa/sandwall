@@ -64,7 +64,7 @@ when defined(windows):
     ## Spawn `cmd` as the sandbox user, wait for it, and unwind the
     ## per-run state (stdout pipe, DENY narrowing) inside the library
     ## (rtoken.runAsSandboxUser owns it). Raises if the spawn
-    ## fails. The WFP fence installed by `3code wall setup-windows`
+    ## fails. The WFP fence installed by `3code sandbox setup`
     ## confines the sandbox user to loopback either way; the caller
     ## routes traffic through the wall proxy via env when the policy
     ## has host rules.
