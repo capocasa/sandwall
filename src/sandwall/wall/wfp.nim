@@ -563,22 +563,21 @@ when defined(windows):
     deleteFiltersByKeys(engine, acFenceKeyText)
     discard fwpmSubLayerDeleteByKey0(engine, unsafeAddr sublayerKey)
 
+  const wfpStatusDeniedHint =
+    "WFP status needs an elevated (admin) shell to read the engine"
+
   proc fenceStatus*(): tuple[installed: bool; filters: int; hint: string] =
     ## Enum-based status. Access denied (non-admin) is not an error:
-    ## report it with a hint pointing at the behavioral check.
+    ## report it with a hint instead of raising.
     var denied: bool
     let engine = openEngine("sandwall-status", denied)
     if denied:
-      return (false, 0,
-        "WFP status needs admin; run the sandwall-user behavioral " &
-        "verify (verifyFenceBehavioral) for a non-elevated check")
+      return (false, 0, wfpStatusDeniedHint)
     defer: discard fwpmEngineClose0(engine)
     var enumDenied: bool
     let ids = enumOurFilters(engine, enumDenied)
     if enumDenied:
-      return (false, 0,
-        "WFP status needs admin; run the sandwall-user behavioral " &
-        "verify (verifyFenceBehavioral) for a non-elevated check")
+      return (false, 0, wfpStatusDeniedHint)
     (ids.len > 0, ids.len, "")
 
   proc wfpProbeMain*(): int =
@@ -678,7 +677,7 @@ when defined(windows):
     var denied: bool
     let engine = openEngine("sandwall-ac-status", denied)
     if denied:
-      return (false, 0, "WFP status needs admin; run 'sandwall setup' elevated")
+      return (false, 0, wfpStatusDeniedHint)
     defer: discard fwpmEngineClose0(engine)
 
     var found = 0
@@ -691,7 +690,7 @@ when defined(windows):
         var p: pointer = fptr
         fwpmFreeMemory0(addr p)
       elif grc == DWORD(ERROR_ACCESS_DENIED):
-        return (false, 0, "WFP status needs admin; run 'sandwall setup' elevated")
+        return (false, 0, wfpStatusDeniedHint)
       elif grc != cast[DWORD](FWP_E_FILTER_NOT_FOUND):
         fail("FwpmFilterGetByKey0", grc)
 
