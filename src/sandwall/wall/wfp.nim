@@ -35,7 +35,7 @@
 ## environment. Pure helpers (SDDL, GUID bytes, port validation) run
 ## on Linux; the FFI half is checked with the mingw cross compiler.
 
-import std/strutils
+import std/[os, strutils]
 
 const
   FirstProxyPort* = 60080'u16
@@ -104,7 +104,7 @@ proc sddlForUserSid*(sid: string): string =
 
 when defined(windows):
   import std/winlean except PSID
-  import std/[widestrs, net, osproc]
+  import std/[widestrs, net, nativesockets, osproc]
   import ./winffi
   export winffi.PSID
 
@@ -588,14 +588,30 @@ when defined(windows):
     ## is irrelevant. Returns 0 iff the probe was blocked. The
     ## consumer (3code) wires one line: `<self> wall wfp-probe` ->
     ## this proc.
+    ##
+    ## WALL_PROBE_TIMEOUT_MS caps the wait for callers that run the
+    ## probe during their own startup: the blocked verdict comes back
+    ## synchronously from the filter layer, so a short cap can only
+    ## end an unfenced wait earlier, never misread a working fence.
+    let capMs = try: parseInt(getEnv("WALL_PROBE_TIMEOUT_MS", "5000"))
+                except ValueError: 5000
     let s = newSocket()
     defer: s.close()
     try:
-      s.connect("192.0.2.1", Port(9), timeout = 5000)
+      s.connect("192.0.2.1", Port(9), timeout = capMs)
       result = 1  # connected: fence missing
     except OSError as e:
-      # WSAEACCES = 10013: blocked by the fence
+      # WSAEACCES = 10013: the fence's synchronous block
       result = (if e.errorCode.int32 == 10013'i32: 0 else: 2)
+    except CatchableError:
+      # Nim's timed connect on Windows surfaces an instant failure as a
+      # full-cap TimeoutError: select-write never signals the error, so
+      # the fence's synchronous WSAEACCES lands in SO_ERROR instead (the
+      # timeout also used to escape unhandled and print its traceback
+      # into the parent's output). A clean timeout (SO_ERROR 0) means
+      # nothing stood in the connect's way.
+      result =
+        if getSockOptInt(s.getFd, SOL_SOCKET, SO_ERROR) == 10013: 0 else: 2
 
   proc getAppContainerSidString*(): string =
     ## Derive the `sandwall.fs` AppContainer SID and return it as its
