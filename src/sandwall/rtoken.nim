@@ -353,8 +353,19 @@ when defined(windows):
       # pipe, and the parent's pump parked in ConnectNamedPipe forever
       # (the Windows "tool call holds forever"). With /v:on the
       # !VAR! expansion happens after operator parsing, so the command
-      # text reaches the child byte-for-byte.
-      putenv("NIMBOX_CMD", quoteCmdLine(cmd))
+      # text reaches the child byte-for-byte. The program token is
+      # force-quoted: cmd re-parses the expanded line, and when argv[0]
+      # carries no spaces quoteCmdLine leaves it bare - the leading
+      # unquoted token then leaves cmd's quote tracking out of step
+      # with the \" escapes further right, and every spawn of a
+      # space-free bash path (a bundled PortableGit tree) died with
+      # "The filename, directory name, or volume label syntax is
+      # incorrect" before bash ever ran.
+      var quoted = quoteCmdLine(cmd)
+      if cmd.len > 0 and cmd[0].len > 0 and '"' notin cmd[0] and
+          ' ' notin cmd[0]:
+        quoted = "\"" & cmd[0] & "\"" & quoted[cmd[0].len .. ^1]
+      putenv("NIMBOX_CMD", quoted)
       let wrapped = "cmd.exe /v:on /c !NIMBOX_CMD! >" &
         relayPipe.childName & " 2>&1"
       let cmdW = newWideCString(wrapped)
