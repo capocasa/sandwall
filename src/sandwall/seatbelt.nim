@@ -94,12 +94,20 @@ proc buildProfile*(writable, read: openArray[string];
   # falls back to fork() once a redirect is involved, and fork is a
   # separately gated operation).
   result.add("(allow process-fork)\n")
-  # Exec stays usable for system binaries.
+  # Interpreters stat the machine shape at startup (sysconf -> sysctl:
+  # NPROCESSORS_ONLN and friends). `(deny default)` makes those reads
+  # EPERM, and stock perl dies with `panic: sysconf: Operation not
+  # permitted` before user code runs. Informational sysctl reads are
+  # harmless; writes stay denied by omission.
+  result.add("(allow sysctl-read)\n")
+  # Exec follows the readable set, not a hand-picked four directories:
+  # python3 on a stock macOS box is an xcrun shim that re-execs the real
+  # binary under /Library/Developer/CommandLineTools, and brew lives in
+  # /opt - both readable per the baseline above. Linux confers no exec
+  # restriction at all, so exec-of-the-readable is parity, not widening.
   result.add("(allow process-exec file-read*\n")
-  result.add("  (subpath " & quote("/bin") & ")\n")
-  result.add("  (subpath " & quote("/sbin") & ")\n")
-  result.add("  (subpath " & quote("/usr/bin") & ")\n")
-  result.add("  (subpath " & quote("/usr/sbin") & ")\n")
+  for p in baselineRead:
+    result.add("\n  (subpath " & quote(p) & ")")
   result.add(")\n")
   # Writable baseline devices (/dev/null).
   if baselineWrite.len > 0:
@@ -129,10 +137,14 @@ proc buildProfile*(writable, read: openArray[string];
     let n = paths.normalize(p)
     if n.len > 0 and not deniedN.contains(n): deniedN.add(n)
 
+  # Caller paths carry exec with them (the module contract: writable
+  # is full access, read-only is read + execute). Without process-exec
+  # here a compiled ./a.out in the project dir fails with EPERM on
+  # macOS while running fine on Linux.
   for w in wpaths:
-    result.add("(allow file-write* file-read*\n  (subpath " & quote(w) & "))\n")
+    result.add("(allow process-exec file-write* file-read*\n  (subpath " & quote(w) & "))\n")
   for p in rpaths:
-    result.add("(allow file-read*\n  (subpath " & quote(p) & "))\n")
+    result.add("(allow process-exec file-read*\n  (subpath " & quote(p) & "))\n")
   # A read-only path under a writable root must subtract the write the
   # root just granted: readonly is a narrowing, not an annotation. Emit
   # a write-deny after the allows so last-match-wins punches the hole.
@@ -146,7 +158,7 @@ proc buildProfile*(writable, read: openArray[string];
   # literal+sibling shape cannot express "dir contents minus subpath"
   # and breaks file creation in the writable root.)
   for d in deniedN:
-    result.add("(deny file-write* file-read* file-read-metadata\n  (subpath " & quote(d) & ")")
+    result.add("(deny process-exec file-write* file-read* file-read-metadata\n  (subpath " & quote(d) & ")")
     result.add("\n  (literal " & quote(d) & "))\n")
 
   if not egress:
