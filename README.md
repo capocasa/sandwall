@@ -32,35 +32,29 @@ skip the policy layer.
 |----------|-----------|-------------|
 | Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy |
 | macOS | Seatbelt `sandbox_init_with_parameters` | Seatbelt loopback-only + allowlist proxy |
-| Windows | AppContainer (lowbox token) + DACL grants | WFP fence (after `sandwall setup`): loopback-only + allowlist proxy; without setup: open + warning |
+| Windows | Dedicated local user + DACL grants | WFP fence (after `sandwall setup`): loopback-only + allowlist proxy; without setup: open + warning |
 
 The Linux and macOS backends confine the calling thread via kernel hooks
 (Landlock domains, Seatbelt profiles). The Windows backend has no single
-syscall hook; it runs the child in an **AppContainer** (a lowbox token that
-denies filesystem and network by default), stamping ALLOW ACEs and a Low
-integrity label for the AppContainer SID on each writable path and a
-read+execute grant on each read-only path. The stamps roll back after the
-child exits. See `CROSSPLATFORM.md` for the design and
-`sandbox-research.md` for the prior-art survey.
+syscall hook; it runs the child as a **dedicated local user**
+(`sandwall`, created by a one-time elevated `sandwall setup`): ALLOW ACEs
+for that user's SID are stamped on each writable path, traverse-only ACEs
+on their ancestors, and DENY ACEs (rolled back after the run) for
+deny-narrowing. The user boundary is the confinement: the sandbox user
+can write nowhere except the stamped roots. An unnamed Job Object with
+`KILL_ON_JOB_CLOSE` contains the whole tree. See `CROSSPLATFORM.md` for
+the design and `sandbox-research.md` for the prior-art survey.
 
 Windows notes:
 - Network semantics: a policy with **no host rules** leaves the
-  network working (the AppContainer child gets the `internetClient`
-  capability). A policy **with host rules** requires a one-time
+  network working. A policy **with host rules** requires a one-time
   `sandwall setup` (elevated) to install WFP (Windows Filtering
-  Platform) filters that confine the AppContainer child to loopback.
-  The per-run wall proxy (in the unrestricted parent) then enforces
-  the hostname allowlist. **Without** `sandwall setup`, host rules
+  Platform) filters that confine the sandbox user to loopback. The
+  per-run wall proxy (in the unrestricted parent) then enforces the
+  hostname allowlist. **Without** `sandwall setup`, host rules
   produce a warning and the child has OPEN network access (accepted
   degrade posture). The WFP fence uses ALE_USER_ID conditions keyed
-  on the `sandwall.fs` AppContainer SID.
-- A `cmd` inside the sandbox can run further executables by **bare name or
-  relative path** (`myexe`, `.\myexe`, `sub\myexe`) resolved against the
-  current directory, but **not** by drive-letter absolute path:
-  `cmd /c C:\path\some.exe` fails "Access is denied" (a cmd/AppContainer
-  quirk that affects even System32 exes). Run user-built executables
-  directly (`sandwall rules -- myexe`) or `cd` into their directory and
-  invoke them by name.
+  on the sandbox user's SID.
 
 ## Requirements
 
