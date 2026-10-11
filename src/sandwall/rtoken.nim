@@ -216,6 +216,14 @@ when defined(windows):
     for p in writable:
       let n = norm(p)
       if n.len == 0 or n in seen: continue
+      # A writable rule for a path that does not exist (a build dir not
+      # yet created, a typo, a stale profile the policy still names)
+      # cannot be stamped: readDacl raises on a missing object and would
+      # kill the whole run. Skip it instead. Creation inside the sandbox
+      # goes through an allowed ancestor's inheritable ACE, so a
+      # writable project root still yields writable new subdirs; with no
+      # allowed ancestor the create fails exactly as the deny intends.
+      if not dirExists(n) and not fileExists(n): continue
       seen.add(n)
       for anc in ancestorsNeedGrant(n):
         # Skip the stamp when the traverse ACE is already there: a
