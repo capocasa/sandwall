@@ -179,9 +179,16 @@ proc canonicalForDisplay(p: string): string =
   ## miss the project prefix and render absolute. Resolution is
   ## prefix-wise: realpath fails on paths that do not exist yet, so
   ## resolve the longest existing ancestor and re-append the tail.
+  ## The walk stops at a bare drive prefix on Windows: `C:` is not an
+  ## ancestor but the process's current directory ON that drive, so
+  ## resolving it maps a drive-relative path onto the cwd and makes
+  ## contraction see a nonexistent `C:\foo` as `./foo` under the
+  ## project.
   var dir = p
   var tail = ""
   while dir.len > 0:
+    when defined(windows):
+      if dir.len in 2..3 and dir[1] == ':': break
     try:
       let r = expandFilename(dir)
       if r.len > 0:
@@ -196,8 +203,9 @@ proc canonicalForDisplay(p: string): string =
 
 proc contractPath*(path, projectDir: string): string =
   ## The portable policy-file form of an absolute cleaned path: under
-  ## `projectDir` as `./name` (empty target, i.e. the bare verb, for
-  ## the project dir itself), under home as `~/...`, else absolute.
+  ## `projectDir` as `./name` (`./` for the project dir itself; the bare
+  ## verb parses to the same rule but reads as a rule that lost its
+  ## target), under home as `~/...`, else absolute with '/' separators.
   ## Display and append only; internal rule storage stays absolute.
   let proj = projectDir.normalizedPath
   let pathC = canonicalForDisplay(path)
@@ -205,7 +213,7 @@ proc contractPath*(path, projectDir: string): string =
   # The policy file is portable text: the separator in the emitted
   # form is always '/', on every OS (normalizePolicyPath accepts both
   # when parsing back).
-  if pathC == projC: return ""
+  if pathC == projC: return "./"
   if pathC.len > projC.len and pathC.startsWith(projC & DirSep):
     return "./" & (pathC[projC.len + 1 .. ^1]).replace(DirSep, '/')
   let home = getHomeDir().normalizedPath
@@ -214,7 +222,7 @@ proc contractPath*(path, projectDir: string): string =
     if path.len > home.len and
         path.startsWith(home & DirSep):
       return "~/" & (path[home.len + 1 .. ^1]).replace(DirSep, '/')
-  path
+  path.replace(DirSep, '/')
 
 proc normalizePolicyPath*(p: string; projectDir: string): string =
   ## Resolve a policy path target to an absolute, cleaned form. An empty
@@ -334,7 +342,7 @@ proc renderPolicy*(rules: openArray[Rule];
   ## Human-readable dump of the effective rules, newest last (matching
   ## file order). Hidden rules (implicit guards) are enforced but not
   ## shown. With a non-empty `projectDir`, path targets contract to the
-  ## portable form (`./foo` under the project dir, bare for the project
+  ## portable form (`./foo` under the project dir, `./` for the project
   ## dir itself, `~/...` under home); with empty, paths print absolute.
   var shown = 0
   for r in rules:
@@ -414,7 +422,7 @@ proc appendRule*(policyFile, target: string; access: AccessKind;
   ## Add a rule to `policyFile`. With a non-empty `projectDir` (the
   ## normal case), a path `target` is normalized to the portable file
   ## form first: `/proj/dir/foo` writes as `./foo`, the project dir
-  ## itself as the bare verb, home paths as `~/...`. Earlier rules for
+  ## itself as `./`, home paths as `~/...`. Earlier rules for
   ## the same target are stripped, so flipping allow -> deny (or back)
   ## moves the rule to the end instead of stacking duplicates; other
   ## targets keep their order. Host targets pass through unchanged.

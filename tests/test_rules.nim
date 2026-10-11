@@ -234,7 +234,7 @@ suite "contract and normalize":
   test "contractPath":
     check contractPath((proj / "foo").normalizedPath, proj) == "./foo"
     check contractPath((proj / "a" / "foo").normalizedPath, proj) == "./a/foo"
-    check contractPath(proj.normalizedPath, proj) == ""
+    check contractPath(proj.normalizedPath, proj) == "./"
     check contractPath((proj / ".git").normalizedPath, proj) == "./.git"
     when not defined(windows):
       check contractPath("/etc/passwd", proj) == "/etc/passwd"
