@@ -39,9 +39,23 @@ when defined(linux):
     ## Set once ensureUserns succeeded; later calls (e.g. maskDenied then
     ## enterNetns) skip the unshare entirely.
 
+  proc writeProc(path, content: string) =
+    ## The /proc id-mapping writes raise IOError on hosts where the
+    ## files are missing or unwritable (Ubuntu's apparmor userns
+    ## restriction fails HERE, after unshare already succeeded, rather
+    ## than at unshare). Callers of ensureUserns catch OSError to
+    ## degrade (restrict: "continuing without sub-path deny
+    ## enforcement"), so anything else escapes as an unhandled
+    ## exception and kills every sandboxed command. Translate.
+    try:
+      writeFile(path, content)
+    except CatchableError as e:
+      raise newException(OSError,
+        "sandwall: writing " & path & " failed: " & e.msg)
+
   proc writeIdMap(path: string; inner: cint) =
     let outer = if "uid" in path: getuid() else: getgid()
-    writeFile(path, $inner & " " & $outer & " 1\n")
+    writeProc(path, $inner & " " & $outer & " 1\n")
 
   proc ensureUserns*(extraFlags: cint = 0) =
     ## Enter our uid-mapped user+mount namespace (plus `extraFlags` such as
@@ -57,7 +71,7 @@ when defined(linux):
         "); unprivileged user namespaces may be disabled")
     # Map our own uid/gid to 0 inside the namespace so we keep ownership
     # of the bind mounts (and the netns) we make.
-    writeFile("/proc/self/setgroups", "deny\n")
+    writeProc("/proc/self/setgroups", "deny\n")
     writeIdMap("/proc/self/uid_map", 0)
     writeIdMap("/proc/self/gid_map", 0)
     # Don't let the masks propagate back to the host's mount table.
