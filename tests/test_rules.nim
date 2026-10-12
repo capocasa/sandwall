@@ -3,6 +3,7 @@
 
 import std/[os, strutils, unittest]
 import sandwall/rules
+import sandwall/defaults
 
 const proj = when defined(windows): r"C:\work\proj" else: "/work/proj"
 
@@ -292,3 +293,46 @@ suite "contract and normalize":
     check appendRule(f, "a.com:443", akWritable, proj)
     check "allow a.com:443" in readFile(f)
     removeFile(f)
+
+suite "built-in default policy":
+  # The defaults live in sandwall/defaults.nim as literal blocks; this
+  # locks the resolved behaviour so a trim has to notice. The full
+  # end-to-end (real git under the default) is 3code's
+  # test_wall_bash.nim.
+
+  test "parses; temp, project, and dev homes resolve; tokens stay fenced":
+    let s = parsePolicy(defaultPolicyText, proj)
+    when defined(windows):
+      check s.checkPath("/") == akDeny
+      check s.checkPath(getHomeDir() / "AppData" / "Local" / "Temp") ==
+        akWritable
+      check s.checkPath(getHomeDir() / "AppData" / "Local" / "npm-cache") ==
+        akWritable
+      check s.checkPath(getHomeDir() / ".cargo" / "registry") == akWritable
+      check s.checkPath(proj) == akWritable
+      check s.checkPath(getHomeDir() / ".cargo" / "credentials") == akDeny
+      check s.checkPath(getHomeDir() / ".ssh" / "id_ed25519") == akDeny
+      check s.resolve().hosts.len == 0
+    else:
+      check s.checkPath("/") == akDeny
+      check s.checkPath("/tmp") == akWritable
+      check s.checkPath("/var/tmp") == akWritable
+      check s.checkPath(proj) == akWritable
+      check s.checkPath(getHomeDir() / "go") == akWritable
+      check s.checkPath(getHomeDir() / ".cache") == akWritable
+      check s.checkPath(getHomeDir() / ".npm") == akWritable
+      check s.checkPath(getHomeDir() / ".cargo" / "registry") == akWritable
+      check s.checkPath(getHomeDir() / ".cargo" / "bin") == akReadOnly
+      check s.checkPath(getHomeDir() / ".rustup") == akReadOnly
+      check s.checkPath(getHomeDir() / ".gitconfig") == akReadOnly
+      check s.checkPath(getHomeDir() / ".config" / "git") == akReadOnly
+      check s.checkPath(getHomeDir() / ".hgrc") == akReadOnly
+      when defined(macosx):
+        check s.checkPath(getHomeDir() / "Library" / "Caches") == akWritable
+      else:
+        check s.checkPath(getHomeDir() / "Library" / "Caches") == akDeny
+      check s.checkPath(getHomeDir() / ".npmrc") == akDeny
+      check s.checkPath(getHomeDir() / ".git-credentials") == akDeny
+      check s.checkPath(getHomeDir() / ".cargo" / "credentials") == akDeny
+      check s.checkPath(getHomeDir() / ".ssh" / "id_ed25519") == akDeny
+      check s.resolve().hosts.len == 1
