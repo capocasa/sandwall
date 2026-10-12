@@ -311,8 +311,6 @@ suite "built-in default policy":
       check s.checkPath(getHomeDir() / ".cargo" / "registry") == akWritable
       check s.checkPath(getHomeDir() / ".nimble") == akWritable
       check s.checkPath(getHomeDir() / ".choosenim") == akReadOnly
-      check s.checkPath(getHomeDir() / ".gem" / "ruby") == akWritable
-      check s.checkPath(getHomeDir() / ".bundle" / "cache") == akWritable
       check s.checkPath(getHomeDir() / "AppData" / "Local" / "zig") ==
         akWritable
       check s.checkPath(proj) == akWritable
@@ -338,11 +336,9 @@ suite "built-in default policy":
         akReadOnly
       check s.checkPath(getHomeDir() / ".local" / "share" / "uv" / "python") ==
         akReadOnly
-      check s.checkPath(getHomeDir() / ".gem" / "ruby" / "3.4.0") == akWritable
-      check s.checkPath(getHomeDir() / ".local" / "share" / "gem") == akWritable
-      check s.checkPath(getHomeDir() / ".bundle" / "cache") == akWritable
-      check s.checkPath(getHomeDir() / ".gem" / "credentials") == akDeny
-      check s.checkPath(getHomeDir() / ".bundle" / "config") == akDeny
+      # Ruby lives in the manual's recipes, not the default.
+      check s.checkPath(getHomeDir() / ".gem" / "ruby") == akDeny
+      check s.checkPath(getHomeDir() / ".bundle" / "cache") == akDeny
       when defined(macosx):
         check s.checkPath(getHomeDir() / "Library" / "Caches") == akWritable
       else:

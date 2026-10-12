@@ -23,18 +23,14 @@
 ##
 ## The same logic covers command-line builds of the common
 ## languages: ~/.nimble + ~/.choosenim (the Nim toolchain: without
-## them `nim` cannot even exec on a choosenim install), ~/.local/
+## them `nim` cannot even exec on a choosenim install) and ~/.local/
 ## share/uv read-only (uv keeps its managed pythons there; a project
-## venv symlinks into it, so running .venv needs the read), and the
-## Ruby homes: ~/.gem/ruby and ~/.local/share/gem are RubyGems' user
-## install dirs (narrowed to keep ~/.gem/credentials, the rubygems
-## push token, fenced) and ~/.bundle/cache is Bundler's compact-index
-## cache (~/.bundle/config stays out; it can hold API tokens).
-## Python, Go, C and Zig builds already ride the project dir, the
-## read-only system baseline, and ~/.cache (Zig's global cache; on
-## Windows it moves to ~/AppData/Local/zig). Build systems past the
-## basics - maven, gradle, scons, and friends - are deliberately NOT
-## defaulted; their recipes live in 3code's manual.
+## venv symlinks into it, so running .venv needs the read). Python,
+## Go, C and Zig builds already ride the project dir, the read-only
+## system baseline, and ~/.cache (Zig's global cache; on Windows it
+## moves to ~/AppData/Local/zig). Stacks past that - ruby, java,
+## gradle, scons, and friends - are deliberately NOT defaulted; their
+## verified recipes live in 3code's manual.
 ##
 ## Everything else under $HOME stays denied. Token-bearing files
 ## (~/.npmrc, ~/.git-credentials, ~/.cargo/credentials, ~/.netrc,
@@ -66,8 +62,6 @@ readonly ~/.cargo/config.toml
 readonly ~/.rustup
 allow ~/.nimble
 readonly ~/.choosenim
-allow ~/.gem/ruby
-allow ~/.bundle/cache
 allow ~/AppData/Local/zig
 allow ./
 """
@@ -89,9 +83,6 @@ readonly ~/.rustup
 allow ~/.nimble
 readonly ~/.choosenim
 readonly ~/.local/share/uv
-allow ~/.gem/ruby
-allow ~/.local/share/gem
-allow ~/.bundle/cache
 readonly ~/.gitconfig
 readonly ~/.config/git
 readonly ~/.hgrc
@@ -115,9 +106,6 @@ readonly ~/.rustup
 allow ~/.nimble
 readonly ~/.choosenim
 readonly ~/.local/share/uv
-allow ~/.gem/ruby
-allow ~/.local/share/gem
-allow ~/.bundle/cache
 readonly ~/.gitconfig
 readonly ~/.config/git
 readonly ~/.hgrc
