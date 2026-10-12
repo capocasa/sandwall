@@ -134,7 +134,11 @@ when defined(macosx):
     test "readonly under a writable root subtracts the write":
       # A bare allow-read under a writable root leaves the root's
       # file-write* grant in force; readonly must punch a write-deny
-      # hole (the policy-file guard relies on this).
+      # hole (the policy-file guard relies on this). The literal is
+      # the privatized spelling: seatbelt rewrites /tmp and friends
+      # to their /private targets because subpath filters match the
+      # resolved vnode path.
       let p = seatbelt.buildProfile(["/tmp"], ["/tmp/policy"], [])
       check "(deny file-write*" in p
-      check "(literal \"/tmp/policy\")" in p
+      check "(literal \"/private/tmp/policy\")" in p
+      check "(literal \"/tmp/policy\")" notin p
