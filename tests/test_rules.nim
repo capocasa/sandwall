@@ -309,6 +309,9 @@ suite "built-in default policy":
       check s.checkPath(getHomeDir() / "AppData" / "Local" / "npm-cache") ==
         akWritable
       check s.checkPath(getHomeDir() / ".cargo" / "registry") == akWritable
+      check s.checkPath(getHomeDir() / ".nimble") == akWritable
+      check s.checkPath(getHomeDir() / ".choosenim") == akReadOnly
+      check s.checkPath(getHomeDir() / ".m2" / "repository") == akWritable
       check s.checkPath(proj) == akWritable
       check s.checkPath(getHomeDir() / ".cargo" / "credentials") == akDeny
       check s.checkPath(getHomeDir() / ".ssh" / "id_ed25519") == akDeny
@@ -327,6 +330,12 @@ suite "built-in default policy":
       check s.checkPath(getHomeDir() / ".gitconfig") == akReadOnly
       check s.checkPath(getHomeDir() / ".config" / "git") == akReadOnly
       check s.checkPath(getHomeDir() / ".hgrc") == akReadOnly
+      check s.checkPath(getHomeDir() / ".nimble" / "pkgs2") == akWritable
+      check s.checkPath(getHomeDir() / ".choosenim" / "toolchains") ==
+        akReadOnly
+      check s.checkPath(getHomeDir() / ".local" / "share" / "uv" / "python") ==
+        akReadOnly
+      check s.checkPath(getHomeDir() / ".m2" / "repository") == akWritable
       when defined(macosx):
         check s.checkPath(getHomeDir() / "Library" / "Caches") == akWritable
       else:

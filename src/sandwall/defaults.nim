@@ -21,6 +21,16 @@
 ##   mercurial's own documented config search paths, of which the
 ##   system tier (/etc) is already covered by the sandwall baseline.
 ##
+## The same logic covers the agent's own ecosystem: ~/.nimble +
+## ~/.choosenim (the Nim toolchain: without them `nim` cannot even
+## exec on a choosenim install), ~/.local/share/uv read-only (uv keeps
+## its managed pythons there; a project venv symlinks into it, so
+## running .venv needs the read), and ~/.m2/repository (maven's
+## dependency cache; settings.xml stays out because it commonly holds
+## server passwords - note the rule is inert until the directory
+## exists, so the first maven build on a fresh box must run once
+## unfenced or `mkdir -p ~/.m2/repository`).
+##
 ## Everything else under $HOME stays denied. Token-bearing files
 ## (~/.npmrc, ~/.git-credentials, ~/.cargo/credentials, ~/.netrc,
 ## ~/.ssh, ~/.aws, ...) are deliberately absent: a missed allow fails
@@ -49,6 +59,9 @@ allow ~/.cargo/git
 readonly ~/.cargo/bin
 readonly ~/.cargo/config.toml
 readonly ~/.rustup
+allow ~/.nimble
+readonly ~/.choosenim
+allow ~/.m2/repository
 allow ./
 """
 elif defined(macosx):
@@ -66,6 +79,10 @@ allow ~/.cargo/git
 readonly ~/.cargo/bin
 readonly ~/.cargo/config.toml
 readonly ~/.rustup
+allow ~/.nimble
+readonly ~/.choosenim
+readonly ~/.local/share/uv
+allow ~/.m2/repository
 readonly ~/.gitconfig
 readonly ~/.config/git
 readonly ~/.hgrc
@@ -86,6 +103,10 @@ allow ~/.cargo/git
 readonly ~/.cargo/bin
 readonly ~/.cargo/config.toml
 readonly ~/.rustup
+allow ~/.nimble
+readonly ~/.choosenim
+readonly ~/.local/share/uv
+allow ~/.m2/repository
 readonly ~/.gitconfig
 readonly ~/.config/git
 readonly ~/.hgrc

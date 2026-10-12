@@ -268,6 +268,9 @@ when defined(macosx):
       # the public/private twins deduped to one writable rule
       check p.count("(allow process-exec file-write* file-read*\n" &
         "  (subpath \"/private/tmp\"))") == 1
+      # /Applications rides the baseline: without it no app-bundled
+      # binary (xcodebuild's Xcode.app target, any bundled CLI) execs.
+      check "(subpath \"/Applications\")" in p
 
 when defined(linux) or defined(macosx):
   import sandwall

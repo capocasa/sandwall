@@ -22,9 +22,13 @@ when defined(linux):
   # /dev/null must accept writes (shells redirect stderr there constantly).
   const baselineWrite* = ["/dev/null"]
 elif defined(macosx):
+  # /Applications is world-readable by design and is where every GUI
+  # app and app-bundled CLI lives (xcodebuild's shim execs into
+  # /Applications/Xcode.app, Ghostty/Chrome CLIs live in their bundles);
+  # without it in the baseline, exec of any of them is EPERM.
   const baselineRead* = [
     "/usr", "/bin", "/sbin", "/etc",
-    "/System", "/Library", "/opt",
+    "/System", "/Library", "/opt", "/Applications",
     "/private/var/db/timezone", "/private/var/db/dyld", "/private/etc",
     "/private/tmp", "/private/var/tmp",
     "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"
