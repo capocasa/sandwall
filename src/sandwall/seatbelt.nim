@@ -47,6 +47,23 @@ proc loadSandboxFree(): SandboxFreeErrorbuf =
 
 # Baseline paths now live in baseline.nim (shared across OS backends).
 
+proc privatize*(p: string): string =
+  ## /tmp, /var, and /etc are symlinks into /private on macOS, and
+  ## seatbelt subpath filters match the resolved vnode path, not the
+  ## spelling the caller used: a rule written `allow /tmp` never fires
+  ## (the child's open() lands on /private/tmp/... and misses the
+  ## filter), so "writable /tmp" silently EPERMs every write - the
+  ## xcrun cache and every TMPDIR compiler temp die. Rewrite the
+  ## public prefixes to their /private spelling; rules already using
+  ## the private spelling pass through untouched. The prefixes are
+  ## disjoint, so first match wins. This module only ever reaches a
+  ## macOS link, so the rewrite needs no OS gate (it also lets a
+  ## Linux-side profile generator stay byte-faithful).
+  for d in ["/etc", "/var", "/tmp"]:
+    if p == d: return "/private" & d
+    if p.startsWith(d & "/"): return "/private" & p
+  return p
+
 proc quote(s: string): string =
   ## TinyScheme string literal: wrap in double quotes, escape backslash and
   ## double quote. Paths from normalize are absolute and clean, so this is
@@ -122,11 +139,11 @@ proc buildProfile*(writable, read: openArray[string];
   var wpaths: seq[string] = @[]
   var rpaths: seq[string] = @[]
   for p in writable:
-    let n = paths.normalize(p)
+    let n = privatize(paths.normalize(p))
     if n.len == 0 or seen.containsOrIncl(n): continue
     wpaths.add(n)
   for p in read:
-    let n = paths.normalize(p)
+    let n = privatize(paths.normalize(p))
     if n.len == 0 or seen.containsOrIncl(n): continue
     rpaths.add(n)
 
@@ -134,7 +151,7 @@ proc buildProfile*(writable, read: openArray[string];
   # normalised with the same helper.
   var deniedN: seq[string] = @[]
   for p in denied:
-    let n = paths.normalize(p)
+    let n = privatize(paths.normalize(p))
     if n.len > 0 and not deniedN.contains(n): deniedN.add(n)
 
   # Caller paths carry exec with them (the module contract: writable

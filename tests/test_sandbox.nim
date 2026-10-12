@@ -243,6 +243,32 @@ suite "sandwall CLI (sandboxed exec)":
 # --------------------------------------------------------------------------
 # library tests (fork a child per scenario)
 
+when defined(macosx):
+  import sandwall/seatbelt
+
+  suite "seatbelt profile generation":
+    test "public /tmp, /var/tmp, /etc spellings privatize":
+      # /tmp, /var/tmp, /etc are symlinks into /private on macOS and
+      # seatbelt subpath filters match the resolved vnode path, not
+      # the caller's spelling: a writable rule written `allow /tmp`
+      # never fires and every write EPERMs (xcrun cache, TMPDIR
+      # compiler temps). The emitted profile must carry the /private
+      # spelling; already-private spellings pass through and dedup
+      # against their public twins.
+      let p = seatbelt.buildProfile(
+        ["/tmp", "/var/tmp", "/private/tmp", "/Users/x/proj"],
+        ["/etc/ssh"])
+      check "(subpath \"/private/tmp\")" in p
+      check "(subpath \"/private/var/tmp\")" in p
+      check "(subpath \"/private/etc/ssh\")" in p
+      check "(subpath \"/Users/x/proj\")" in p
+      check "(subpath \"/tmp\")" notin p
+      check "(subpath \"/var/tmp\")" notin p
+      check "(subpath \"/etc/ssh\")" notin p
+      # the public/private twins deduped to one writable rule
+      check p.count("(allow process-exec file-write* file-read*\n" &
+        "  (subpath \"/private/tmp\"))") == 1
+
 when defined(linux) or defined(macosx):
   import sandwall
   import std/posix
