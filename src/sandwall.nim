@@ -24,9 +24,6 @@ export process
 import ./sandwall/rules
 export rules
 
-import ./sandwall/defaults
-export defaults
-
 import ./sandwall/wall
 export wall
 
