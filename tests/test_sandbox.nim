@@ -272,6 +272,26 @@ when defined(macosx):
       # binary (xcodebuild's Xcode.app target, any bundled CLI) execs.
       check "(subpath \"/Applications\")" in p
 
+    test "profile carries the JVM and process-control allows":
+      # java/javac die under (deny default) through operations no path
+      # rule can reach (issue: 3code #66, warp report). The JVM's
+      # startup read of kern.grade_cputype is classified by the kernel
+      # as a sysctl-write (the sysctl is registered CTL_RW, so even
+      # reads gate as writes), and its getpwuid user lookup goes
+      # through opendirectoryd's mach service. Test harnesses also
+      # signal and query the children they spawn; those allows must
+      # stay scoped to same-sandbox targets, never bare.
+      let p = seatbelt.buildProfile(["/tmp"], [])
+      check "(allow sysctl-write (sysctl-name \"kern.grade_cputype\"))" in p
+      check "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))" in p
+      check "(allow signal (target same-sandbox))" in p
+      check "(allow process-info* (target same-sandbox))" in p
+      # scoping: no unfiltered write/lookup slipped in
+      check "(allow sysctl-write)\n" notin p
+      check "(allow mach-lookup)\n" notin p
+      check "(allow signal)\n" notin p
+      check "(allow process-info*)\n" notin p
+
 when defined(linux) or defined(macosx):
   import sandwall
   import std/posix

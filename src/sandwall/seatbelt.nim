@@ -111,12 +111,37 @@ proc buildProfile*(writable, read: openArray[string];
   # falls back to fork() once a redirect is involved, and fork is a
   # separately gated operation).
   result.add("(allow process-fork)\n")
+  # In-sandbox process control: build tools and test harnesses signal
+  # the children they spawn (timeout(1), failure cleanup, maven and
+  # gradle wrangling compiler daemons) and query them (proc_pidinfo via
+  # libproc - what `ps` and wait-status introspection run on). Both
+  # filters restrict the target to `same-sandbox`: processes already
+  # inside this very profile, i.e. exactly what the command spawned.
+  # The user's session and unrelated processes stay unreachable, the
+  # same shape Chrome's and Codex's seatbelt profiles ship.
+  result.add("(allow signal (target same-sandbox))\n")
+  result.add("(allow process-info* (target same-sandbox))\n")
   # Interpreters stat the machine shape at startup (sysconf -> sysctl:
   # NPROCESSORS_ONLN and friends). `(deny default)` makes those reads
   # EPERM, and stock perl dies with `panic: sysconf: Operation not
   # permitted` before user code runs. Informational sysctl reads are
   # harmless; writes stay denied by omission.
   result.add("(allow sysctl-read)\n")
+  # One deliberate exception to "writes stay denied": the JVM reads
+  # kern.grade_cputype at startup (which CPU grade it runs on - native
+  # arm64 or Rosetta - picks JIT code paths), but the kernel registers
+  # that sysctl CTL_RW, so Seatbelt classifies every access to it,
+  # reads included, as sysctl-write and the sysctl-read allow above
+  # never fires. Without this line java/javac die before main, and no
+  # path rule can fix it (codex hit the same wall: openai/codex#3978).
+  result.add("(allow sysctl-write (sysctl-name \"kern.grade_cputype\"))\n")
+  # getpwnam/getpwuid (user name, home dir, shell) are served by
+  # opendirectoryd over this mach service; `(deny default)` makes the
+  # bootstrap lookup EPERM and every libc-level user lookup fails.
+  # The JVM resolves user.home through it at startup. Read-only name
+  # resolution only - the service answers lookups, it is not a general
+  # directory write path (Chromium ships the same allow: crbug 792228).
+  result.add("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n")
   # Exec follows the readable set, not a hand-picked four directories:
   # python3 on a stock macOS box is an xcrun shim that re-execs the real
   # binary under /Library/Developer/CommandLineTools, and brew lives in

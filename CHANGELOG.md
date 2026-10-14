@@ -3,6 +3,24 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.10] - 2026-10-14
+
+### Added
+
+- macOS: the seatbelt profile now carries the operations the JVM
+  needs at startup and no path rule can reach, so `java`/`javac`
+  work under the sandbox: `sysctl-write` for exactly
+  `kern.grade_cputype` (the kernel registers that sysctl CTL_RW, so
+  Seatbelt classifies even the JVM's read of it as a write) and a
+  `mach-lookup` for `com.apple.system.opendirectoryd.libinfo`
+  (getpwnam/getpwuid user lookups; the JVM resolves user.home
+  through it). Same wall as openai/codex#3978.
+
+- macOS: `signal` and `process-info*` are allowed for
+  `same-sandbox` targets only, so build tools and test harnesses can
+  kill and query the children they spawn while the user's session
+  stays unreachable (the shape Chrome's and Codex's profiles ship).
+
 ## [0.5.7] - 2026-09-11
 
 ### Fixed
