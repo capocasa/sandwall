@@ -149,6 +149,43 @@ suite "resolve":
     check r.hosts[0].access == akWritable
     check r.hosts[1].host == "b.com" and r.hosts[1].access == akDeny
 
+suite "ask verb":
+  test "parse and checkPath":
+    let pol = parsePolicy("deny /\nallow /tmp\nask /tmp/vault\n", proj)
+    when not defined(windows):
+      check pol.checkPath("/tmp/other") == akWritable
+      check pol.checkPath("/tmp/vault/k") == akAsk
+  test "ask under allow is denied like deny":
+    let pol = parsePolicy("allow /a\nask /a/s\n", proj)
+    let r = pol.resolve()
+    when not defined(windows):
+      check r.writable == @["/a"]
+      check r.denied == @["/a/s"]
+  test "later broader allow supersedes the ask mask":
+    # checkPath answers by the last COVERING rule; resolve must agree or
+    # the kernel backend masks a path the in-process gate allows.
+    let pol = parsePolicy("allow /a\nask /a/s\nallow /a\n", proj)
+    let r = pol.resolve()
+    when not defined(windows):
+      check r.writable == @["/a"]
+      check r.denied.len == 0
+  test "ask host rules are dropped (wall has no user to ask)":
+    let pol = parsePolicy("ask vault.internal\n", proj)
+    let r = pol.resolve()
+    check r.hosts.len == 0
+  test "render label":
+    let pol = parsePolicy("ask ./vault\n", proj)
+    check "ask       ./vault" in renderPolicy(pol, proj)
+  test "appendRule writes the ask word and replaces an ask in place":
+    let dir = getTempDir() / "sw-ask-append"
+    createDir(dir)
+    let f = dir / "policy"
+    writeFile(f, "allow ./\nask ./vault\n")
+    check appendRule(f, "./vault", akAsk, proj)
+    let text = readFile(f)
+    check text.count("vault") == 1
+    check text.strip.endsWith("ask ./vault")
+
 suite "concatenated levels":
   # Cascade semantics are the consumer's job (3code concatenates its
   # levels and parses once); these tests pin the property that makes

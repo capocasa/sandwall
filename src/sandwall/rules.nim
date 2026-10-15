@@ -10,6 +10,11 @@
 ##   allow    allow    - writable path, or connectable host
 ##   deny     deny     - no read, no write, no connect
 ##   readonly readonly - read + execute (path targets only)
+##   ask      ask      - enforced exactly like deny, but flagged so a
+##                       consumer can offer the user a one-time approval
+##                       (3code's bash tool prompts and, on approval,
+##                       rewrites the policy to allow). Consumers that
+##                       never ask see a plain deny.
 ##
 ## A verb only matches at a word boundary (end of line or whitespace
 ## after it), so hostnames that begin with the same letters
@@ -56,7 +61,7 @@ export paths.isPathUnder
 
 type
   AccessKind* = enum
-    akDeny, akReadOnly, akWritable
+    akDeny, akReadOnly, akWritable, akAsk
 
   RuleKind* = enum
     rkPath, rkHost
@@ -257,6 +262,7 @@ proc parsePolicy*(text: string; projectDir: string): seq[Rule] =
     of "allow": access = akWritable
     of "deny": access = akDeny
     of "readonly": access = akReadOnly
+    of "ask": access = akAsk
     else: rest = line
     if rest.len == 0:
       rest = line[first.len .. ^1].strip(leading = true, trailing = false)
@@ -297,24 +303,28 @@ proc resolve*(rules: openArray[Rule]): Resolved =
   ## intact (last-wins per host:port key only collapses repeats of the
   ## exact same key); the wall matcher applies ordering across keys.
   var latest: Table[string, AccessKind]
+  var lastIndex: Table[string, int]
   var order: seq[string]
-  for r in rules:
+  for i, r in rules:
     case r.kind
     of rkPath:
       if r.path notin latest: order.add r.path
       latest[r.path] = r.access
+      lastIndex[r.path] = i
     of rkHost:
       let key = r.host & ":" & $r.port
       if key notin latest: order.add "\x00" & key
       latest[key] = r.access
+      lastIndex[key] = i
   for k in order:
     if k.startsWith("\x00"):
       let key = k[1 .. ^1]
       # Denies are carried too: last-wins happens per host:port KEY, so
       # `+host:80` then `-host:443` must keep BOTH rules (the matcher
       # sees them in policy order). The wall's HostList does the real
-      # last-wins at match time.
-      if latest[key] != akReadOnly:
+      # last-wins at match time. akReadOnly and akAsk are meaningless
+      # for hosts (the wall has no user to ask) and dropped.
+      if latest[key] in {akDeny, akWritable}:
         let c = key.rfind(':')
         result.hosts.add Rule(access: latest[key], kind: rkHost,
                               host: key[0 .. c - 1],
@@ -323,11 +333,26 @@ proc resolve*(rules: openArray[Rule]): Resolved =
       case latest[k]
       of akWritable: result.writable.add k
       of akReadOnly: result.readonly.add k
-      of akDeny:
-        # A deny needs compensating enforcement when it narrows an
+      of akDeny, akAsk:
+        # A deny (and an ask, which denies until the consumer's user
+        # approves and rewrites the policy) needs compensating
+        # enforcement when it narrows an
         # allow that survives in the output lists, or a baseline root
         # the backends auto-grant (Landlock unions rules, so an
         # explicit deny under a baseline root must be carried through).
+        # A LATER broader allow/readonly supersedes it first: checkPath
+        # answers by the last rule COVERING the path, so a deny that a
+        # later allow re-covers must not stay masked, or the kernel
+        # backend would deny what the in-process gate allows.
+        var superseded = false
+        for j in lastIndex[k] + 1 ..< rules.len:
+          let rr = rules[j]
+          if rr.kind == rkPath and
+              rr.access in {akWritable, akReadOnly} and
+              isPathUnder(k, rr.path):
+            superseded = true
+            break
+        if superseded: continue
         for w in result.writable:
           if isPathUnder(k, w): result.denied.add k; break
         if k notin result.denied:
@@ -356,6 +381,7 @@ proc renderPolicy*(rules: openArray[Rule];
       of akDeny: "deny    "
       of akReadOnly: "readonly"
       of akWritable: "allow   "
+      of akAsk: "ask     "
     case r.kind
     of rkPath:
       let p = if projectDir.len > 0: contractPath(r.path, projectDir)
@@ -400,7 +426,7 @@ proc replaceAccess*(text, target, verb: string;
       continue
     let first = line.split(Whitespace, 1)[0]
     var rest = ""
-    if first in ["allow", "deny", "readonly"]:
+    if first in ["allow", "deny", "readonly", "ask"]:
       rest = line[first.len .. ^1].strip(leading = true, trailing = false)
       let ruleKey =
         if classifyTarget(rest) == rkPath:
@@ -432,6 +458,7 @@ proc appendRule*(policyFile, target: string; access: AccessKind;
     of akDeny: "deny"
     of akReadOnly: "readonly"
     of akWritable: "allow"
+    of akAsk: "ask"
   var t = target
   if projectDir.len > 0 and classifyTarget(t) == rkPath and t.len > 0:
     t = contractPath(normalizePolicyPath(t, projectDir), projectDir)

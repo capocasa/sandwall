@@ -81,9 +81,18 @@ when defined(linux):
     inUserns = true
 
   proc maskDenied*(denied: openArray[string]) =
-    ## Hide each denied path from this process and its children. A denied
-    ## directory is bind-masked over a fresh empty dir, a denied file over
-    ## /dev/null.
+    ## Hide each denied path from this process and its children. A
+    ## denied directory is bind-masked over a fresh empty dir, a denied
+    ## file over a fresh empty file. The scratch source is chmod'd
+    ## unwritable up front: a bare bind is writable, so a command
+    ## writing into a denied path would succeed into the mask copy and
+    ## exit 0, losing the data while looking like success. With the mode
+    ## stripped the attempt fails with EACCES instead. (A read-only
+    ## bind REMOUNT is the other way, but remounting a bind requires
+    ## repeating the source mount's full flag set or the kernel answers
+    ## EINVAL; the mode works everywhere.) DAC rather than mount flags
+    ## also means the check survives in user namespaces, where caps
+    ## granted by the ns don't reach mounts owned by the parent ns.
     if denied.len == 0: return
     ensureUserns()
     for raw in denied:
@@ -93,10 +102,28 @@ when defined(linux):
         let empty = getTempDir() / ("sandwall-mask-" & $getpid() & "-" &
                                     $hash(d))
         if not dirExists(empty): createDir(empty)
+        try: setFilePermissions(empty, {fpUserRead, fpUserExec})
+        except OSError: discard
         if mount(empty.cstring, d.cstring, nil, MS_BIND_C, nil) != 0:
           raise newException(OSError,
             "sandwall: bind-mask " & d & " failed (errno " & $errno & ")")
       else:
-        if mount("/dev/null".cstring, d.cstring, nil, MS_BIND_C, nil) != 0:
-          raise newException(OSError,
-            "sandwall: bind-mask " & d & " failed (errno " & $errno & ")")
+        let empty = getTempDir() / ("sandwall-mask-file-" & $getpid() & "-" &
+                                    $hash(d))
+        var prepared = true
+        if not fileExists(empty):
+          try:
+            writeFile(empty, "")
+            setFilePermissions(empty, {fpUserRead})
+          except CatchableError:
+            prepared = false
+        if not prepared:
+          # No scratch file available (read-only temp): fall back to
+          # /dev/null, which still hides the content.
+          if mount("/dev/null".cstring, d.cstring, nil, MS_BIND_C, nil) != 0:
+            raise newException(OSError,
+              "sandwall: bind-mask " & d & " failed (errno " & $errno & ")")
+        else:
+          if mount(empty.cstring, d.cstring, nil, MS_BIND_C, nil) != 0:
+            raise newException(OSError,
+              "sandwall: bind-mask " & d & " failed (errno " & $errno & ")")

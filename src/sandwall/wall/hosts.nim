@@ -50,13 +50,14 @@ type
 
 proc toHostList*(hosts: seq[Rule]): HostList =
   ## Compile resolved host rules into matchers, preserving policy order.
-  ## `akReadOnly` host rules are meaningless (read-only applies to paths)
-  ## and skipped. Hostnames are lowercased; a leading `*.` arms the
-  ## wildcard form.
+  ## `akReadOnly` and `akAsk` host rules are meaningless (read-only and
+  ## ask-to-allow apply to paths; the wall has no user to ask) and are
+  ## skipped, which denies. Hostnames are lowercased; a leading `*.`
+  ## arms the wildcard form.
   for r in hosts:
     if r.kind != rkHost: continue
     case r.access
-    of akReadOnly: continue
+    of akReadOnly, akAsk: continue
     of akDeny, akWritable: discard
     var m = HostMatcher(allow: r.access == akWritable,
                         host: r.host.toLowerAscii, port: r.port)
