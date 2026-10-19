@@ -187,6 +187,33 @@ proc buildProfile*(writable, read: openArray[string];
     result.add("(allow process-exec file-write* file-read*\n  (subpath " & quote(w) & "))\n")
   for p in rpaths:
     result.add("(allow process-exec file-read*\n  (subpath " & quote(p) & "))\n")
+
+  # Unix sockets ride the same grants, as network ops no file rule
+  # reaches: dotnet's diagnostic sockets and MSBuild's worker nodes
+  # bind AF_UNIX sockets under the temp dir, tsx/VS Code IPC under
+  # the project dir, and a writable path alone left them socket-dead
+  # - .NET builds died under an `allow /tmp` (3code #55, claude-code
+  # #41254; codex #12702 and Anthropic's sandbox-runtime ship the same
+  # three-op shape). Socket creation (system-socket), bind, and
+  # connect are gated separately; each filter is a single subpath
+  # because that is the shape proven in production profiles - a
+  # filter list inside (local unix-socket ...) is not. Bind stays
+  # write-scoped, connect additionally follows read paths
+  # (`readonly /var/run/docker.sock` is the shape for talking to a
+  # service socket); Landlock needs no counterpart, since MAKE_SOCK
+  # rides the writable grant there and connect() is not gated at all.
+  # Emitted before the egress section so the open-network branch's
+  # unfiltered allows stay last, and in both egress modes: a fenced
+  # build still needs its local IPC (MSBuild nodes) while TCP stays
+  # loopback-only, which is also what the netns fence permits - unix
+  # sockets are not network-namespaced on Linux either.
+  if wpaths.len + rpaths.len > 0:
+    result.add("(allow system-socket (socket-domain AF_UNIX))\n")
+  for w in wpaths:
+    result.add("(allow network-bind (local unix-socket\n  (subpath " & quote(w) & ")))\n")
+    result.add("(allow network-outbound (remote unix-socket\n  (subpath " & quote(w) & ")))\n")
+  for p in rpaths:
+    result.add("(allow network-outbound (remote unix-socket\n  (subpath " & quote(p) & ")))\n")
   # A read-only path under a writable root must subtract the write the
   # root just granted: readonly is a narrowing, not an annotation. Emit
   # a write-deny after the allows so last-match-wins punches the hole.
@@ -194,6 +221,10 @@ proc buildProfile*(writable, read: openArray[string];
   for p in rpaths:
     result.add("(deny file-write*\n  (subpath " & quote(p) & ")")
     result.add("\n  (literal " & quote(p) & "))\n")
+    # Bind is not a file op, so the write-deny above does not reach it:
+    # without this, a readonly tree under a writable root stays
+    # socket-writable (a bound socket is a created file).
+    result.add("(deny network-bind (local unix-socket\n  (subpath " & quote(p) & ")))\n")
   # Denies last: Seatbelt is last-match-wins, so a trailing deny
   # reliably punches a hole in the broader allows above. (Putting
   # denies first and splitting the allow around them was tried; the
@@ -202,6 +233,8 @@ proc buildProfile*(writable, read: openArray[string];
   for d in deniedN:
     result.add("(deny process-exec file-write* file-read* file-read-metadata\n  (subpath " & quote(d) & ")")
     result.add("\n  (literal " & quote(d) & "))\n")
+    result.add("(deny network-bind (local unix-socket\n  (subpath " & quote(d) & ")))\n")
+    result.add("(deny network-outbound (remote unix-socket\n  (subpath " & quote(d) & ")))\n")
 
   if not egress:
     # Network fence: permit loopback only, so the sandbox can reach the

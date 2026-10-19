@@ -117,19 +117,32 @@ when defined(linux):
           got.add b[0]
         got == "ping\n")
 
-when defined(macosx):
+# Profile generation is pure string assembly, so it runs on every
+# POSIX host (the seatbelt module itself links on Linux too).
+when defined(posix):
   import sandwall/seatbelt
 
-  suite "wall seatbelt egress fence (macos)":
+  suite "seatbelt egress fence profile":
     test "egress=false emits loopback-only network allows":
       let fenced = seatbelt.buildProfile(["/tmp"], [], [], egress = false)
       check "(allow network-outbound (remote ip \"localhost:*\"))" in fenced
       check "(allow network-inbound (local ip \"localhost:*\"))" in fenced
+      # unix IPC survives the fence: a fenced build still needs its
+      # local sockets (MSBuild worker nodes under the temp dir), and
+      # unix sockets are no more network-namespaced on Linux - the
+      # netns fence leaves them to the path rules there too.
+      check "(allow network-bind (local unix-socket\n" &
+        "  (subpath \"/private/tmp\")))" in fenced
+      check "(allow network-outbound (remote unix-socket\n" &
+        "  (subpath \"/private/tmp\")))" in fenced
       # open egress is unrestricted: bare allows, no remote filter
       let open = seatbelt.buildProfile(["/tmp"], [], [])
       check "(allow network-outbound)\n" in open
       check "(allow network-inbound)\n" in open
       check "localhost:*" notin open
+      # the open branch's unfiltered allows are not unix socket grants:
+      # TCP is unrestricted, unix sockets stay path-scoped
+      check "(allow network-bind (local unix-socket))" notin open
 
     test "readonly under a writable root subtracts the write":
       # A bare allow-read under a writable root leaves the root's

@@ -243,7 +243,10 @@ suite "sandwall CLI (sandboxed exec)":
 # --------------------------------------------------------------------------
 # library tests (fork a child per scenario)
 
-when defined(macosx):
+# Profile generation is pure string assembly, so it runs on every
+# POSIX host (the seatbelt module itself links on Linux too); the
+# runtime restrict tests below stay macOS-only.
+when defined(posix):
   import sandwall/seatbelt
 
   suite "seatbelt profile generation":
@@ -268,9 +271,11 @@ when defined(macosx):
       # the public/private twins deduped to one writable rule
       check p.count("(allow process-exec file-write* file-read*\n" &
         "  (subpath \"/private/tmp\"))") == 1
-      # /Applications rides the baseline: without it no app-bundled
-      # binary (xcodebuild's Xcode.app target, any bundled CLI) execs.
-      check "(subpath \"/Applications\")" in p
+      # /Applications rides the macOS baseline: without it no
+      # app-bundled binary (xcodebuild's Xcode.app target, any bundled
+      # CLI) execs. The Linux baseline carries its own /opt instead.
+      when defined(macosx):
+        check "(subpath \"/Applications\")" in p
 
     test "profile carries the JVM and process-control allows":
       # java/javac die under (deny default) through operations no path
@@ -291,6 +296,49 @@ when defined(macosx):
       check "(allow mach-lookup)\n" notin p
       check "(allow signal)\n" notin p
       check "(allow process-info*)\n" notin p
+
+    test "writable paths carry unix-socket bind/connect":
+      # dotnet's diagnostic sockets and MSBuild's worker nodes bind
+      # AF_UNIX sockets under the temp dir; tsx and VS Code IPC under
+      # the project dir. Seatbelt gates socket creation (system-socket),
+      # bind, and connect as network ops no file rule reaches, so a
+      # writable path alone was file-full but socket-dead and .NET
+      # builds died under an `allow /tmp` (3code #55, claude-code
+      # #41254; codex #12702 and Anthropic's sandbox-runtime ship the
+      # same three-op shape). Bind stays write-scoped, connect also
+      # follows read paths - `readonly /var/run/docker.sock` is the
+      # shape for talking to a service socket, matching Landlock
+      # where connect() is not gated at all. The socket path is spelled
+      # private and fictional so normalize cannot rewrite it through a
+      # host symlink layout (/var/run is /run on Linux).
+      let p = seatbelt.buildProfile(
+        ["/tmp", "/Users/x/proj"], ["/private/var/run/service.sock"])
+      check "(allow system-socket (socket-domain AF_UNIX))" in p
+      check "(allow network-bind (local unix-socket\n" &
+        "  (subpath \"/private/tmp\")))" in p
+      check "(allow network-outbound (remote unix-socket\n" &
+        "  (subpath \"/private/tmp\")))" in p
+      check "(allow network-bind (local unix-socket\n" &
+        "  (subpath \"/Users/x/proj\")))" in p
+      check "(allow network-outbound (remote unix-socket\n" &
+        "  (subpath \"/private/var/run/service.sock\")))" in p
+      # readonly narrows to connect-only: never bind
+      check "(deny network-bind (local unix-socket\n" &
+        "  (subpath \"/private/var/run/service.sock\")))" in p
+      # scoping: no unfiltered socket allows slipped in
+      check "(allow network-bind (local unix-socket))" notin p
+      check "(allow network-outbound (remote unix-socket))" notin p
+
+    test "denied paths lose their unix sockets too":
+      # Bind and connect are network ops, so the file denies alone
+      # leave a denied path socket-reachable under a writable root
+      # (3code's policy-file guard and `deny ~/.ssh` under `allow *`
+      # rely on the hole being punched).
+      let p = seatbelt.buildProfile(["/Users/x"], [], ["/Users/x/.ssh"])
+      check "(deny network-bind (local unix-socket\n" &
+        "  (subpath \"/Users/x/.ssh\")))" in p
+      check "(deny network-outbound (remote unix-socket\n" &
+        "  (subpath \"/Users/x/.ssh\")))" in p
 
 when defined(linux) or defined(macosx):
   import sandwall

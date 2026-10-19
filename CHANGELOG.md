@@ -3,6 +3,37 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.12] - 2026-10-20
+
+### Fixed
+
+- macOS: unix sockets now ride the path grants. Seatbelt gates
+  socket creation (`system-socket`), bind (`network-bind`), and
+  connect (`network-outbound` on unix paths) as network operations
+  no file rule reaches, so a writable path was file-full but
+  socket-dead: `dotnet` builds died binding their diagnostic and
+  MSBuild worker sockets under `allow /tmp` (3code #55; claude-code
+  #41254 hit the same wall, codex #12702 and Anthropic's
+  sandbox-runtime ship the same three-op shape). Writable paths get
+  bind + connect, read paths connect only (`readonly
+  /var/run/docker.sock` is the shape for a service socket), and
+  denied paths lose their sockets along with their files. The grants
+  hold in both egress modes - a fenced build still needs its local
+  IPC, and unix sockets are no more network-namespaced under the
+  Linux netns fence, which leaves them to the path rules there.
+  Landlock needed no counterpart: MAKE_SOCK already rides the
+  writable grant and connect() is not Landlock-gated.
+
+## [0.5.11] - 2026-10-15
+
+### Added
+
+- `ask` verb: rules can request interactive approval for a path
+  (`ask /path [writable] [deny-with-approval]`), denials stay
+  implicit until an ask rule fires, and superseded asks stop
+  masking later denies. Read-only ask masks landlock/seatbelt
+  write-through defaults the same way explicit readonly lines do.
+
 ## [0.5.10] - 2026-10-14
 
 ### Added
