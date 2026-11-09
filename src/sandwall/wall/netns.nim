@@ -38,9 +38,12 @@ when defined(linux):
     SIOCSIFFLAGS = 0x8914.culong
     IFF_UP = 0x1.cshort
     IFF_RUNNING = 0x40.cshort
+    PR_SET_PDEATHSIG = 1.cint
 
   proc ioctl(fd: cint; request: culong; arg: pointer): cint
       {.importc, header: "<sys/ioctl.h>".}
+  proc prctl(option: cint; arg2: culong): cint
+      {.importc, header: "<sys/prctl.h>".}
 
 
   type IfReq {.importc: "struct ifreq", header: "<net/if.h>".} = object
@@ -98,28 +101,24 @@ when defined(linux):
     ## Bridge listener sockets live until exec/exit; keeping them in a
     ## global stops the net.Socket finalizer from closing the fd.
 
-  proc bridgeProcess(listener: SocketHandle; sockPath: string;
-                     deathFd: cint) =
+  proc bridgeProcess(listener: SocketHandle; sockPath: string) =
     ## The bridge's whole lifetime: accept a connection, fork a worker
     ## to splice it, reap finished workers, repeat. Fork-per-connection
     ## because one kept-alive tunnel (a redirect target holding its
     ## first connection open, say) must not starve the next accept;
     ## worker processes are immune to the exec() that would kill
-    ## in-process threads. Polls `deathFd` alongside the listener: EOF
-    ## there means the last holder of the fenced command's pipe end is
-    ## gone, so the bridge exits; its workers die with it (session).
+    ## in-process threads. Lifetime is PR_SET_PDEATHSIG set by the
+    ## fork child (see bridgeToUnix): the kernel delivers SIGKILL when
+    ## the fenced command exits, ending this loop with the bridge.
     while true:
       var status: cint
       discard waitpid(-1.Pid, status, WNOHANG)  # reap one zombie per turn
-      var fds = [TPollfd(fd: listener.cint, events: POLLIN, revents: 0),
-                 TPollfd(fd: deathFd, events: POLLIN, revents: 0)]
-      let r = poll(addr fds[0], 2, -1)
+      var fds = [TPollfd(fd: listener.cint, events: POLLIN, revents: 0)]
+      let r = poll(addr fds[0], 1, -1)
       if r < 0:
         if osLastError().cint == EINTR: continue
         return
-      if fds[1].revents != 0:
-        return  # parent pipe closed (or errored): command tree is gone
-      if (fds[0].revents and POLLIN) == 0: continue
+      if r == 0 or (fds[0].revents and POLLIN) == 0: continue
       let cfd = posix.accept(listener, nil, nil)
       if cfd == osInvalidSocket:
         if osLastError().cint == EINTR: continue
@@ -128,7 +127,6 @@ when defined(linux):
       let wpid = posix.fork()
       if wpid == 0:
         discard posix.close(listener)
-        discard posix.close(deathFd)
         serveBridgeConn(cfd, sockPath)
         exitnow(0)
       discard posix.close(cfd)  # worker owns the connection now
@@ -144,30 +142,31 @@ when defined(linux):
     ## in-process thread. Call BEFORE exec. Returns the actual bound
     ## port.
     ##
-    ## Bridge lifetime: the restricting process (box) exec()s away
-    ## right after this call, and PR_SET_PDEATHSIG only fires when the
-    ## forking THREAD exits, not on exec - so instead the bridge
-    ## watches a pipe whose write end the parent holds. The write fd
-    ## is NOT close-on-exec: box's exec closes it implicitly? No -
-    ## exec only closes CLOEXEC fds, so the pipe end survives into the
-    ## exec'd command and the bridge lives exactly as long as the
-    ## fenced command tree (any fork of the command holds the fd too).
-    ## When the last holder exits the pipe hits EOF and the bridge
-    ## kills itself, releasing the netns.
+    ## Bridge lifetime: the bridge cannot watch a pipe held by the
+    ## fenced command - fd-hygienic children break that (ssh calls
+    ## close_range(3, ...) at startup, which used to take the netns's
+    ## only egress path down mid-command). Instead the bridge sets
+    ## PR_SET_PDEATHSIG(SIGKILL): the signal tracks the parent PID,
+    ## which survives exec() unchanged, so it fires exactly when the
+    ## process box became (the fenced command) exits. The old concern
+    ## that PDEATHSIG misses exec is misplaced: exec does not exit the
+    ## forking thread, only process death does.
     let sock = newSocket(buffered = false)
     sock.setSockOpt(OptReuseAddr, true)
     sock.bindAddr(Port(listenPort), "127.0.0.1")
     sock.listen()
     result = uint16(sock.getLocalAddr()[1])
-    var deathPipe: array[2, cint]
-    if posix.pipe(deathPipe) != 0:
-      raiseOSError(osLastError())
+    let parentPid = posix.getpid()
     let pid = posix.fork()
     if pid == 0:
-      discard posix.close(deathPipe[1])  # child only reads
-      bridgeProcess(sock.getFd(), sockPath, deathPipe[0])
+      # PDEATHSIG race guard: a parent that died between fork and
+      # prctl never delivers the signal, and an orphaned bridge serves
+      # nothing; exit instead of leaking a listener into the netns.
+      if prctl(PR_SET_PDEATHSIG, SIGKILL.culong) != 0 or
+          posix.getppid() != parentPid:
+        exitnow(0)
+      bridgeProcess(sock.getFd(), sockPath)
       exitnow(0)
     if pid < 0:
       raiseOSError(osLastError())
-    discard posix.close(deathPipe[0])  # parent (and its exec) writes
     leaked.add(sock)
