@@ -85,7 +85,12 @@ proc buildProfile*(writable, read: openArray[string];
   ## the surviving siblings), then takes an explicit deny, then any
   ## narrower later allows reinstate on top.
   result = newStringOfCap(4096)
-  result.add("(version 1)\n(deny default)\n")
+  # The deny carries a `with message` tag so `log show --predicate
+  # 'eventMessage contains "sandbox_3code"'` attributes denies to this
+  # profile: under the stock (deny default) every sandboxed process on
+  # the box logs identical lines and a debugging session cannot tell
+  # 3code's from anyone else's (3code #64).
+  result.add("(version 1)\n(deny default (with message \"sandbox_3code\"))\n")
 
   # The sandboxed process (and anything it execs) stats `/` during
   # startup path canonicalization; without this the exec'd image
@@ -142,6 +147,15 @@ proc buildProfile*(writable, read: openArray[string];
   # resolution only - the service answers lookups, it is not a general
   # directory write path (Chromium ships the same allow: crbug 792228).
   result.add("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n")
+  # The JVM's first startup call, os::get_temp_directory(), resolves
+  # _CS_DARWIN_USER_TEMP_DIR via confstr, which asks the per-user
+  # dirhelper mach service (com.apple.bsd.dirhelper) to create the
+  # temp/session dirs; under (deny default) the bootstrap lookup gets
+  # EPERM and java hangs on mach_msg inside PerfMemory::initialize
+  # before main (3code #64). Lookup only - the service hands out
+  # directory paths, it is not a general IPC channel (Chromium ships
+  # the same allow: crbug 792228).
+  result.add("(allow mach-lookup (global-name \"com.apple.bsd.dirhelper\"))\n")
   # Exec follows the readable set, not a hand-picked four directories:
   # python3 on a stock macOS box is an xcrun shim that re-execs the real
   # binary under /Library/Developer/CommandLineTools, and brew lives in
