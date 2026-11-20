@@ -53,9 +53,8 @@ when defined(linux):
       raise newException(OSError,
         "sandwall: writing " & path & " failed: " & e.msg)
 
-  proc writeIdMap(path: string; inner: cint) =
-    let outer = if "uid" in path: getuid() else: getgid()
-    writeProc(path, $inner & " " & $outer & " 1\n")
+  proc writeIdMap(path: string; outer: int) =
+    writeProc(path, $outer & " " & $outer & " 1\n")
 
   proc ensureUserns*(extraFlags: cint = 0) =
     ## Enter our uid-mapped user+mount namespace (plus `extraFlags` such as
@@ -65,15 +64,24 @@ when defined(linux):
     ## first restriction. Raises OSError when unprivileged user namespaces
     ## are unavailable; callers decide whether that is fatal.
     if inUserns: return
+    # Read the ids BEFORE the unshare: inside the fresh namespace they
+    # show as the unmapped overflow (65534) until a map exists, and a
+    # mapping write naming 65534 is rejected for any other outer id -
+    # the stranded-nobody bug.
+    let outerUid = int(getuid())
+    let outerGid = int(getgid())
     if unshare(CLONE_NEWUSER_C or CLONE_NEWNS_C or extraFlags) != 0:
       raise newException(OSError,
         "sandwall: unshare(user+mount ns) failed (errno " & $errno &
         "); unprivileged user namespaces may be disabled")
-    # Map our own uid/gid to 0 inside the namespace so we keep ownership
-    # of the bind mounts (and the netns) we make.
+    # Self-map (not 0): the confined process keeps the launching user's
+    # id, so `id`, listings and ownership checks show the truth. Caps
+    # over the namespace come from the unshare itself, not from the
+    # mapped value - mapping to 0 bought nothing except a lying `id`
+    # and root-shaped tool behavior inside the fence.
     writeProc("/proc/self/setgroups", "deny\n")
-    writeIdMap("/proc/self/uid_map", 0)
-    writeIdMap("/proc/self/gid_map", 0)
+    writeIdMap("/proc/self/uid_map", outerUid)
+    writeIdMap("/proc/self/gid_map", outerGid)
     # Don't let the masks propagate back to the host's mount table.
     if mount(nil, "/", nil, MS_REC_C or MS_PRIVATE_C, nil) != 0:
       raise newException(OSError,

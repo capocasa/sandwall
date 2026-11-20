@@ -3,6 +3,26 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.15] - 2026-11-20
+
+### Fixed
+
+- Linux: the user namespace is now mapped, so fenced commands run
+  as the launching user instead of nobody. ensureUserns composed its
+  id-map writes from ids read only AFTER unshare(2) - by then they
+  read as the unmapped overflow 65534, and the kernel rejects a
+  "0 65534 1" line (an unprivileged writer may map only its own
+  id), so every deny-masked or network-fenced command ran stranded
+  in an unmapped namespace: `id` said nobody, files read
+  nobody:nobody, git flagged dubious ownership, ssh saw a passwd
+  home of `/`. The ids are now read before the unshare and SELF-
+  mapped (uid/gid onto themselves, not onto 0): the confined
+  process keeps the user's id - caps over the namespace come from
+  the unshare itself, not from the mapped value, and mapping to 0
+  bought nothing except a lying `id` and root-shaped tool behavior.
+  A nested run under an outer Landlock domain still degrades (the
+  map files cannot be opened for write there); callers report it.
+
 ## [0.5.12] - 2026-10-20
 
 ### Fixed
