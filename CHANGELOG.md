@@ -3,6 +3,19 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.16] - 2026-11-24
+
+### Changed
+
+- POSIX baselines grant `/dev/ptmx` writable. Pty allocation opens
+  ptmx O_RDWR - `script`, `ssh`, `python pty` all start there - and
+  the node was in no baseline set, so every fenced open died EACCES
+  even where the caller's device handling spared it (3code's device
+  mask excludes ptmx; the Landlock domain denied it anyway). The
+  kernel-minted slaves under `/dev/pts` stay ungranted: they are
+  other sessions' terminals, and exposing them is a caller grant's
+  decision, not the baseline's.
+
 ## [0.5.15] - 2026-11-20
 
 ### Fixed

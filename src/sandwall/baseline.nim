@@ -20,7 +20,12 @@ when defined(linux):
     "/dev/dri", "/dev/shm"
   ]
   # /dev/null must accept writes (shells redirect stderr there constantly).
-  const baselineWrite* = ["/dev/null"]
+  # /dev/ptmx is the pty allocation interface: open(O_RDWR) is how every
+  # pty consumer (script, ssh, python pty) starts. The kernel-minted
+  # slaves under /dev/pts stay ungranted - they are other sessions'
+  # terminals, and exposing them is a caller grant's decision, not the
+  # baseline's.
+  const baselineWrite* = ["/dev/null", "/dev/ptmx"]
 elif defined(macosx):
   # /Applications is world-readable by design and is where every GUI
   # app and app-bundled CLI lives (xcodebuild's shim execs into
@@ -33,7 +38,9 @@ elif defined(macosx):
     "/private/tmp", "/private/var/tmp",
     "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"
   ]
-  const baselineWrite* = ["/dev/null"]
+  # Same pty-allocation carve-out as Linux: ptmx opens, /dev/pts stays
+  # a caller grant.
+  const baselineWrite* = ["/dev/null", "/dev/ptmx"]
 elif defined(windows):
   # The AppContainer child reads/executes system binaries via the standard
   # ALL APPLICATION PACKAGES grant already on C:\Windows, so no baseline
