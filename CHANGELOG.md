@@ -19,6 +19,10 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
   confinement". The EPERM that 0.5.17 and 0.5.18 attributed to kernels
   rejecting the prctl inside a fresh user namespace was this: mainline
   kernels do not reject it.
+- Linux: Landlock rule paths are opened with O_PATH. Opening them
+  O_RDONLY made add_rule fail for any path the sandboxed process could
+  not read (write-only files, FIFOs, /dev/tty without a controlling
+  terminal), and the swallowed error silently dropped the rule.
 
 ## [0.5.18] - 2026-11-25
 
