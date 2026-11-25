@@ -32,7 +32,7 @@
 ## (the allows are the whole world), while a list of only deny rules
 ## allows whatever no rule mentions (the denies are the only fences).
 
-import std/strutils
+import std/[algorithm, strutils]
 import ../rules
 
 type
@@ -69,13 +69,20 @@ proc toHostList*(hosts: seq[Rule]): HostList =
     if m.allow: result.hasAllow = true
     result.matchers.add m
 
-proc normalizeHost(host: string): string =
+proc normalizeHost*(host: string): string =
   ## The comparison form of a requested host: lowercased, one trailing
   ## FQDN root dot stripped, IPv6 brackets removed.
   result = host.toLowerAscii
   if result.endsWith("."): result = result[0 .. ^2]
   if result.startsWith("[") and result.endsWith("]"):
     result = result[1 .. ^2]
+
+proc coversName(m: HostMatcher; h: string): bool =
+  ## Does the matcher name `h`? `h` is already in `normalizeHost` form;
+  ## the matcher's port is not looked at.
+  if m.isAll: true
+  elif m.isWildcard: h == m.host or h.endsWith("." & m.host)
+  else: h == m.host
 
 proc allows*(l: HostList; host: string; port: uint16): bool =
   ## Last-wins decision for `host:port`. When nothing matches the
@@ -85,8 +92,28 @@ proc allows*(l: HostList; host: string; port: uint16): bool =
   let h = normalizeHost(host)
   for m in l.matchers:
     if m.port != 0 and m.port != port: continue
-    let hit =
-      if m.isAll: true
-      elif m.isWildcard: h == m.host or h.endsWith("." & m.host)
-      else: h == m.host
-    if hit: result = m.allow
+    if m.coversName(h): result = m.allow
+
+proc winningPorts*(l: HostList; host: string): seq[uint16] =
+  ## The ports the allow rules for `host` still stand for, ascending.
+  ## An allow rule is superseded when a later rule naming the host
+  ## decides its whole scope (a later bare rule, or a later rule for
+  ## the same port); the others contribute: `0` when a bare allow
+  ## survives (every port), otherwise its port. So `allow host` then
+  ## `deny host:22` still yields `@[0]`: the carve-out cannot be
+  ## expressed as a list of ports. Empty when no allow survives. A
+  ## deny-only policy leaves unlisted hosts open; that default is not
+  ## an allow rule and is not reported here.
+  let h = normalizeHost(host)
+  for i, m in l.matchers:
+    if not m.allow or not m.coversName(h): continue
+    var superseded = false
+    for j in i + 1 ..< l.matchers.len:
+      let n = l.matchers[j]
+      if n.coversName(h) and (n.port == 0 or n.port == m.port):
+        superseded = true
+        break
+    if not superseded:
+      if m.port == 0: return @[0'u16]
+      if m.port notin result: result.add m.port
+  result.sort
