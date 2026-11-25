@@ -154,7 +154,11 @@ when defined(linux):
               ((allFsRights and not uint64(readRights(allFsRights))) and mask))
 
   proc openPath(path: string): cint =
-    result = rawOpen(path, 0o2000000)  # O_PATH (010000000 octal)
+    # O_PATH, not O_RDONLY: opening the rule path must not depend on the
+    # target being readable. A FIFO would block, a write-only file would
+    # EACCES, and /dev/tty ENXIOs without a controlling terminal - and a
+    # swallowed add_rule error would silently drop the rule instead.
+    result = rawOpen(path, posix.O_PATH or posix.O_CLOEXEC)
     if result < 0: checkErrno("open('" & path & "') O_PATH")
 
   proc closeFd(fd: cint) =

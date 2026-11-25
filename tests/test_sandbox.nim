@@ -408,3 +408,20 @@ when defined(linux) or defined(macosx):
           except CatchableError: raised = true
           raised and fileExists(a / "a2.txt")
         check: ok
+
+      test "rule on a path that cannot open O_RDONLY is kept":
+        # openPath must reference the rule path with O_PATH, not O_RDONLY:
+        # a write-only file (like /dev/tty without a controlling terminal,
+        # which ENXIOs) made add_rule fail, and the swallowed error dropped the
+        # rule entirely.
+        let p = tempDir("wo") / "secret"
+        writeFile(p, "x")
+        setFilePermissions(p, {fpUserWrite})
+        let ok = runScenario("wo") do () -> bool:
+          restrict(@[p], read = systemReadDirs())
+          let fd = posix.open(p.cstring, posix.O_WRONLY)
+          if fd >= 0:
+            discard posix.close(fd)
+            return true
+          false
+        check: ok
