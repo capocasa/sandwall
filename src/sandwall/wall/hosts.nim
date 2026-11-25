@@ -108,6 +108,14 @@ proc allowsAnyPort*(l: HostList; host: string): bool =
     if m.port == 0: result = m.allow
     elif m.allow: result = true
 
+proc hasWildcardAllow*(l: HostList): bool =
+  ## Does an allow rule cover names no snapshot can enumerate: `*`, or
+  ## `*.suffix`? The spawn-time backends permit addresses and never
+  ## hear of a name a wildcard admits, so such a policy is decided by
+  ## the forwarder (env mode), which matches the name itself.
+  for m in l.matchers:
+    if m.allow and (m.isAll or m.isWildcard): return true
+
 proc winningPorts*(l: HostList; host: string): seq[uint16] =
   ## The ports the allow rules for `host` still stand for, ascending.
   ## An allow rule is superseded when a later rule naming the host

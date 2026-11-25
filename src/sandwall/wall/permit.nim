@@ -628,6 +628,26 @@ proc clear*(ps: PermitSet) =
 proc hold(e: PermitEntry; ip: IpAddress; now: float): bool =
   ip in e.current or (now < e.prevUntil and ip in e.previous)
 
+proc liveAddresses*(e: PermitEntry; now: float): seq[IpAddress] =
+  ## Every address a spawn may permit for `e` at `now`: `current`, plus
+  ## `previous` while its grace lasts, without duplicates. The
+  ## spawn-time backends stamp this (wall/wfp.nim); the forwarder
+  ## itself dials the two generations in order and never needs it
+  ## merged. `e` is the caller's own copy, never the set's.
+  result = fresh(e.current)
+  if now < e.prevUntil:
+    for ip in e.previous:
+      if ip notin result: result.add ip
+
+proc canStamp*(hosts: HostList): bool =
+  ## Can a snapshot stand in for the forwarder's decision by name?
+  ## Only when every allow rule names an exact host or an IP literal: a
+  ## wildcard allow admits names no snapshot can enumerate, and a
+  ## deny-only policy has no allow rule to stamp at all (its open
+  ## default is the forwarder's to apply). Either way the run goes
+  ## through the forwarder (env mode).
+  hosts.hasAllow and not hosts.hasWildcardAllow
+
 proc matchIp*(ps: PermitSet; ip: IpAddress; port: uint16): Option[PermitEntry] =
   ## The entry that permits `ip` on `port`: `ip` is in its `current`
   ## set, or in `previous` while that is still within its grace, and
@@ -676,19 +696,25 @@ proc entryFromJson(n: JsonNode): PermitEntry =
   result.expires = unstamp(n["expires"])
   result.prevUntil = unstamp(n["prevUntil"])
 
-proc writeSnapshot*(ps: PermitSet; path: string) =
-  ## Write every entry that has an address to `path`, sorted by host.
-  ## A `previous` set past its grace is left out: the snapshot carries
-  ## what a spawn may stamp.
-  var entries: seq[PermitEntry]
+proc snapshot*(ps: PermitSet): seq[PermitEntry] =
+  ## What `writeSnapshot` writes, in this process instead of through a
+  ## file: every entry that has an address, sorted by host, with a
+  ## `previous` set past its grace left out. Private copies all the way
+  ## down, made under the lock, so the caller may keep and hand them on.
   withLock ps.lock:
     let now = ps.clock()
     for e in ps.table.values:
       if e.current.len == 0: continue
       var c = fresh(e)
       if now >= c.prevUntil: c.previous = @[]
-      entries.add c
-  entries.sort(proc (a, b: PermitEntry): int = cmp(a.host, b.host))
+      result.add c
+  result.sort(proc (a, b: PermitEntry): int = cmp(a.host, b.host))
+
+proc writeSnapshot*(ps: PermitSet; path: string) =
+  ## Write every entry that has an address to `path`, sorted by host.
+  ## A `previous` set past its grace is left out: the snapshot carries
+  ## what a spawn may stamp.
+  let entries = ps.snapshot()
   let nodes = newJArray()
   for e in entries: nodes.add e.entryJson
   writeFile(path, $ %* {"version": SnapshotVersion, "entries": nodes})

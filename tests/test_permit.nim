@@ -538,6 +538,51 @@ suite "snapshot":
     expect ValueError:
       discard readSnapshot(path)
 
+  test "snapshot() is the same list in memory, as private copies":
+    var rig = newRig()
+    let ps = rig.ps
+    rig.script.plan("rot.test", [
+      Answer(outcome: roAddrs, addresses: @["192.0.2.1"]),
+      Answer(outcome: roAddrs, addresses: @["192.0.2.2"])])
+    discard ps.getOrResolve("rot.test", [443'u16])
+    discard ps.getOrResolve("gone.test", [22'u16])   # no answer: no entry
+    rig.t = 1300.0
+    discard ps.getOrResolve("rot.test", [443'u16])   # previous until 1600
+    let live = ps.snapshot()
+    check live.len == 1
+    check live[0].host == "rot.test"
+    check live[0].current == @[ip("192.0.2.2")]
+    check live[0].previous == @[ip("192.0.2.1")]
+    # and it is what the file carries, entry for entry
+    let path = getTempDir() / "sandwall_permit_snapshot_live_" &
+      $getCurrentProcessId() & ".json"
+    defer: removeFile(path)
+    ps.writeSnapshot(path)
+    let filed = readSnapshot(path)
+    check filed.len == live.len
+    check filed[0].host == live[0].host
+    check filed[0].current == live[0].current
+    check filed[0].previous == live[0].previous
+    check filed[0].ports == live[0].ports
+
+suite "spawn-time stamping":
+  test "liveAddresses: current plus previous within the grace":
+    let e = PermitEntry(host: "a.test", ports: @[443'u16],
+      current: @[ip("192.0.2.2")],
+      previous: @[ip("192.0.2.1"), ip("192.0.2.2")],
+      prevUntil: 2000.0)
+    check liveAddresses(e, 1999.0) == @[ip("192.0.2.2"), ip("192.0.2.1")]
+    check liveAddresses(e, 2000.0) == @[ip("192.0.2.2")]
+
+  test "canStamp: exact allow rules only":
+    check listOf("allow a.test\nallow 1.2.3.4:443\ndeny evil.test\n").canStamp
+    # the star, a suffix wildcard: names no snapshot can enumerate
+    check not listOf("allow *\ndeny evil.test\n").canStamp
+    check not listOf("allow *.example.com\n").canStamp
+    # deny-only: nothing to stamp, the open default is the forwarder's
+    check not listOf("deny evil.test\n").canStamp
+    check not listOf("").canStamp
+
 suite "system resolver":
   test "localhost answers; a reserved name is NXDOMAIN":
     let good = systemResolver("localhost")

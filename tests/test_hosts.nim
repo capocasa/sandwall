@@ -90,6 +90,12 @@ suite "host list matching":
     check l.allows("localhost", 8080)
     check not l.allows("127.0.0.1", 8080)
 
+  test "hasWildcardAllow: the star and a suffix wildcard, allows only":
+    check listOf("allow *\ndeny evil.test\n").hasWildcardAllow
+    check listOf("allow *.example.com\n").hasWildcardAllow
+    check not listOf("deny *.example.com\nallow a.test\n").hasWildcardAllow
+    check not listOf("deny evil.test\n").hasWildcardAllow
+
 suite "wildcard parsing":
   test "leading *. validates as a host rule":
     let pol = parsePolicy("allow *.example.com\n", proj)
