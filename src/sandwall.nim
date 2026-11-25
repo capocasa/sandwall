@@ -213,13 +213,21 @@ filesystem policy are enforced with no setup step.
       var wallProxy: WallProxy
       var permits: seq[PermitEntry]
       if not netAllowed:
-        let fenceInstalled = try: fenceStatus().installed
-                              except CatchableError: false
-        if not fenceInstalled:
-          stderr.writeLine("sandwall: WARNING: host rules are present but " &
-            "the WFP fence is not installed. The child will have OPEN " &
-            "network access. Run 'sandwall setup' (elevated) to install " &
-            "the fence and enforce the host allowlist.")
+        let st = try: fenceStatus()
+                 except CatchableError: (false, 0, "")
+        if not st.installed:
+          if st.hint.len > 0:
+            # Denied, not absent: the spawning account is unelevated and
+            # cannot read the engine. Unknown is not "not installed",
+            # so this is a note, not the warning, on every such run.
+            stderr.writeLine("sandwall: note: WFP fence status unknown (" &
+              st.hint & "); without the fence the child has open network " &
+              "access")
+          else:
+            stderr.writeLine("sandwall: WARNING: host rules are present but " &
+              "the WFP fence is not installed. The child will have OPEN " &
+              "network access. Run 'sandwall setup' (elevated) to install " &
+              "the fence and enforce the host allowlist.")
         # Raw path first. When every allow rule is an exact name or an
         # IP literal, the policy's addresses are seeded here, within
         # 1.5 s, and the kernel permits them for this run
