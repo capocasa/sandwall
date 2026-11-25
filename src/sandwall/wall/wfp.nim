@@ -31,9 +31,10 @@
 ##           action types: FWP_ACTION_BLOCK 0x00002001,
 ##           FWP_ACTION_PERMIT 0x00002002
 ##
-## Compile-verified only: there is no Windows machine in this
-## environment. Pure helpers (SDDL, GUID bytes, port validation) run
-## on Linux; the FFI half is checked with the mingw cross compiler.
+## No Windows machine in this environment. Pure helpers (SDDL,
+## GUID bytes, port validation) run on Linux; the FFI half is
+## checked with the mingw cross compiler and run on a Windows box by
+## hand (`wfp-probe`, `wfp-stamp-probe`).
 
 import std/[algorithm, net, os, strutils]
 import ./permit
@@ -108,6 +109,54 @@ proc sddlForUserSid*(sid: string): string =
   ## given user SID. The ALE_USER_ID filter condition matches the
   ## connecting token's user against this descriptor.
   "O:LSG:LSD:(A;;CC;;;" & sid & ")"
+
+const
+  DELETE_ACCESS = 0x00010000'u32  ## DELETE: what FwpmFilterDeleteById0 checks
+
+proc permitFilterSddl*(callerSid: string): string =
+  ## Security descriptor SDDL for a per-run permit filter. The
+  ## default descriptor would let the caller only classify and open
+  ## the filter; this one gives its own user DELETE, so `clearPermits`
+  ## removes what it added. The owner is the caller too, never
+  ## Administrators: the spawning account is unelevated, and BFE
+  ## refuses a filter whose owner that account's token cannot assign
+  ## (1307, ERROR_INVALID_OWNER, seen on a real BFE). No group is
+  ## named; the token's default applies.
+  "O:" & callerSid & "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x" &
+    toHex(DELETE_ACCESS.BiggestInt, 8) & ";;;" & callerSid & ")"
+
+type
+  IpAddrString* {.bycopy.} = object
+    ## IP_ADDR_STRING (iptypes.h), the fields read here.
+    next*: ptr IpAddrString
+    address*: array[16, char]
+    mask*: array[16, char]
+    context*: uint32
+
+  FixedInfo* {.bycopy.} = object
+    ## The head of FIXED_INFO up to DnsServerList, as iptypes.h lays
+    ## it out: `char HostName[MAX_HOSTNAME_LEN + 4]` (128 + 4 = 132)
+    ## twice under natural alignment, so CurrentDnsServer sits at 264
+    ## and the list at 272. Measured on Win11 26100 (GetNetworkParams):
+    ## the first server's text lands at 280 and NodeType at 320.
+    hostName*: array[132, char]
+    domainName*: array[132, char]
+    currentDnsServer*: ptr IpAddrString
+    dnsServerList*: IpAddrString
+
+proc dnsServersIn*(info: ptr FixedInfo): seq[IpAddress] =
+  ## The resolver addresses in a FIXED_INFO buffer (what
+  ## GetNetworkParams fills): the list's `address` texts, in order.
+  var node: ptr IpAddrString = addr info[].dnsServerList
+  while not node.isNil:
+    var text = ""
+    for c in node[].address:
+      if c == '\0': break
+      text.add c
+    if text.len > 0:
+      try: result.add parseIpAddress(text)
+      except ValueError: discard
+    node = node[].next
 
 type
   PermitFilter* = object
@@ -315,7 +364,6 @@ when defined(windows):
     DACL_SECURITY_INFORMATION = 0x00000004'u32
     FWPM_ACTRL_ADD = 0x00000001'u32        ## add an object to its container
     FWPM_ACTRL_ADD_LINK = 0x00000002'u32   ## reference a layer or sublayer
-    DELETE_ACCESS = 0x00010000'u32         ## what FwpmFilterDeleteById0 checks
 
     RPC_C_AUTHN_DEFAULT = 0xFFFFFFFF'u32  # FWPM_SESSION0.authnService
 
@@ -833,9 +881,11 @@ when defined(windows):
   # descriptors give a standard user none of that (taviso's probe in
   # henrypp/simplewall#680: the add fails with 5 until a descriptor
   # admits it), and `grantPermitStamping` is the elevated half that
-  # admits the spawning account. Compile-verified only: whether BFE
-  # honors the grant for a standard user is `sandwall wfp-stamp-probe`'s
-  # question on a Windows host.
+  # admits the spawning account. Probed on a real host (Win11 26100,
+  # 2026-11-25, `wfp-stamp-probe` unelevated): with the grant a
+  # standard user adds and removes a permit; the filter's owner must
+  # be the caller (`permitFilterSddl`), or BFE fails the add with
+  # 1307.
   #
   # Nothing outlives the run. The filters go in through a dynamic
   # session, so BFE deletes them itself when the session ends, a crash
@@ -967,8 +1017,7 @@ when defined(windows):
       raise newException(OSError,
         "sandwall wfp: the calling process has no user SID")
     var filterSdRaw: pointer
-    let fsddl = allocWide("O:BAG:BAD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x" &
-      toHex(DELETE_ACCESS.BiggestInt, 8) & ";;;" & me & ")")
+    let fsddl = allocWide(permitFilterSddl(me))
     if convertStringSecurityDescriptorToSecurityDescriptorW(fsddl, 1,
         addr filterSdRaw, nil) == 0:
       fail("ConvertStringSecurityDescriptorToSecurityDescriptorW(filters)",
@@ -1094,23 +1143,6 @@ when defined(windows):
 
   # --- system resolvers --------------------------------------------
 
-  type
-    IpAddrString {.bycopy.} = object
-      ## IP_ADDR_STRING (iptypes.h), the fields read here.
-      next: ptr IpAddrString
-      address: array[16, char]
-      mask: array[16, char]
-      context: uint32
-
-    FixedInfo {.bycopy.} = object
-      ## The head of FIXED_INFO up to DnsServerList. Both 136-byte
-      ## fields make the pointer land at offset 272 whether or not the
-      ## C header packs the struct, so the layout holds either way.
-      hostName: array[136, char]
-      domainName: array[136, char]
-      currentDnsServer: ptr IpAddrString
-      dnsServerList: IpAddrString
-
   proc getNetworkParams(pFixedInfo: pointer;
       pOutBufLen: ptr uint32): DWORD {.stdcall, dynlib: "iphlpapi",
       importc: "GetNetworkParams".}
@@ -1120,18 +1152,8 @@ when defined(windows):
     ## `stampPermits`' `resolvers`. Empty when Windows does not say.
     var size: uint32
     discard getNetworkParams(nil, addr size)
-    if size == 0: return
+    if size < uint32(sizeof(FixedInfo)): return
     let buf = alloc0(size)
     defer: dealloc(buf)
     if getNetworkParams(buf, addr size) != 0: return
-    let info = cast[ptr FixedInfo](buf)
-    var node: ptr IpAddrString = addr info[].dnsServerList
-    while not node.isNil:
-      var text = ""
-      for c in node[].address:
-        if c == '\0': break
-        text.add c
-      if text.len > 0:
-        try: result.add parseIpAddress(text)
-        except ValueError: discard
-      node = node[].next
+    dnsServersIn(cast[ptr FixedInfo](buf))
