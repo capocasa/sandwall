@@ -12,12 +12,15 @@
 ## any local process may use the proxy, by design; the confinement lives
 ## on the sandboxed side, which cannot reach anywhere else.
 ##
-## The allow decision is purely string-based on the name the client
-## requested (see hosts.nim). DNS resolution happens here, after the
-## allow decision, via the OS resolver. Denies are logged to stderr;
-## allows are silent unless `verbose` is set.
+## The allow decision has two halves. A name is checked against the
+## HostList as a string (see hosts.nim) and then resolved through the
+## permit set (permit.nim), which answers with the addresses that still
+## stand for the rule. The proxy dials addresses, never names: a request
+## for an IP is decided by the same set, so a rule that was withdrawn
+## stops being dialable too. Denies are logged to stderr; allows are
+## silent unless `verbose` is set.
 
-import std/[locks, nativesockets, net, os, strutils, syncio, times]
+import std/[locks, nativesockets, net, options, os, strutils, syncio, times]
 when defined(posix):
   import std/posix
 else:
@@ -25,6 +28,7 @@ else:
 
 import ../rules
 import ./hosts
+import ./permit
 from ./wfp import FirstProxyPort, LastProxyPort
 import ./sockshim
 
@@ -50,6 +54,8 @@ type
     verbose: bool
     listeners: seq[SocketHandle]  ## tcp listener, then optional unix socket
     running: bool
+    ps: PermitSet              ## the addresses behind the names in `list`
+    ownPermit: bool            ## this proxy created `ps` and closes it
 
   ProxyCtx = ref object
     ## Must stay a GC ref rooted from WallProxy.acceptCtx. Storing only
@@ -75,7 +81,10 @@ const
 # ------------------------------------------------------------- policy
 
 proc loadList(sh: var ProxyShared) =
-  ## Load (or reload) the allowlist from the policy file.
+  ## Load (or reload) the allowlist from the policy file, and start the
+  ## address set over with it: a rule that went away must stop being
+  ## resolved and dialed. The policy's IP-literal allow rules go into the
+  ## set as they are, because nothing else will ever look those up.
   let hosts = loadPolicy(sh.policyPath, sh.projectDir).resolve().hosts
   let l = hosts.toHostList()
   withLock sh.lock:
@@ -84,6 +93,10 @@ proc loadList(sh: var ProxyShared) =
     if fileExists(sh.policyPath):
       getLastModificationTime(sh.policyPath).toUnixFloat()
     else: 0.0
+  sh.ps.clear()
+  for m in l.matchers:
+    if m.allow and not m.isAll and not m.isWildcard and isIpAddress(m.host):
+      discard sh.ps.getOrResolve(m.host, l.winningPorts(m.host))
 
 proc maybeReload(sh: var ProxyShared) =
   ## Called before each accept: one stat per connection, reload on
@@ -100,6 +113,52 @@ proc allowed(sh: var ProxyShared; host: string; port: uint16): bool =
     stderr.writeLine("sandwall proxy: DENY " & host & ":" & $port)
   elif sh.verbose:
     stderr.writeLine("sandwall proxy: allow " & host & ":" & $port)
+
+type
+  Verdict {.pure.} = enum
+    vAllowed    ## dial `ips`
+    vDenied     ## the policy does not allow this target
+    vNoAddress  ## the name is allowed, but has no address to serve
+
+proc admit(sh: var ProxyShared; host: string; port: uint16):
+    tuple[verdict: Verdict, ips: seq[IpAddress]] =
+  ## The one decision behind CONNECT, plain HTTP and SOCKS5. A name is
+  ## decided by the HostList and then resolved through the permit set,
+  ## which answers with the addresses that still stand for the rule:
+  ## `current`, then `previous` while its grace runs, so a rotation does
+  ## not cut off a peer holding the old address. An IP literal is decided
+  ## by the set alone (an entry put there by an IP rule, or one that an
+  ## allowed name resolved to); with no entry, the policy's own decision
+  ## about the literal stands, which is what an open default and `+*`
+  ## mean. `ips` is empty unless the verdict is `vAllowed`.
+  var ip: IpAddress
+  let literal = try:
+      ip = parseIpAddress(host)
+      true
+    except ValueError:
+      false
+  if literal:
+    let e = sh.ps.matchIp(ip, port)
+    if e.isSome:
+      let ent = e.get
+      if sh.verbose:
+        stderr.writeLine("sandwall proxy: allow " & $ip & ":" & $port &
+                         " (" & ent.host & ")")
+      return (vAllowed, @[ip])
+    if sh.allowed($ip, port): return (vAllowed, @[ip])
+    return (vDenied, @[])
+  if not sh.allowed(host, port): return (vDenied, @[])
+  var won: seq[uint16]
+  withLock sh.lock:
+    won = sh.list.winningPorts(host)
+  let e = sh.ps.getOrResolve(host, won)
+  if e.isNone:
+    stderr.writeLine("sandwall proxy: no address for " & host & ":" & $port)
+    return (vNoAddress, @[])
+  let ent = e.get
+  result.verdict = vAllowed
+  result.ips = ent.current
+  if sh.ps.clock() < ent.prevUntil: result.ips.add ent.previous
 
 # ---------------------------------------------------------- raw fds
 # After the handshake everything runs on unbuffered fds under poll();
@@ -147,28 +206,31 @@ proc sendFd(fd: SocketHandle; data: string): bool =
   if data.len == 0: return true
   sendAll(fd, addr data[0], data.len)
 
-proc dialUp(host: string; port: uint16): SocketHandle =
-  ## Resolve and connect to `host:port` with a single overall timeout.
-  ## DNS resolution happens here, after the allow decision, via the OS
-  ## resolver. Returns osInvalidSocket on failure.
-  var aiList: ptr AddrInfo
-  let portStr = $port
-  if getaddrinfo(host, portStr.cstring, nil, aiList) != 0:
-    return osInvalidSocket
-  defer: freeAddrInfo(aiList)
+proc dialUp(ips: seq[IpAddress]; port: uint16): SocketHandle =
+  ## Connect to the first of `ips` that accepts, within one overall
+  ## timeout shared by every address. The addresses come from the permit
+  ## set: a name is resolved once there and never again here, so the dial
+  ## cannot reach an address the decision did not just stand for.
+  ## Returns osInvalidSocket when none accepted.
+  if ips.len == 0: return osInvalidSocket
   let deadline = epochTime() + upstreamTimeout / 1000
-  var it = aiList
-  while it != nil:
+  for ip in ips:
+    var sa: Sockaddr_storage
+    var slen: SockLen
+    toSockAddr(ip, Port(port), sa, slen)
+    let domain = case ip.family
+                 of IpAddressFamily.IPv4: Domain.AF_INET
+                 of IpAddressFamily.IPv6: Domain.AF_INET6
     when defined(posix):
-      let fd = posix.socket(it.ai_family, it.ai_socktype, it.ai_protocol)
+      let fd = posix.socket(toInt(domain), toInt(SockType.SOCK_STREAM), 0)
     else:
-      let fd = wsaSocket(it.ai_family, it.ai_socktype, it.ai_protocol)
+      let fd = wsaSocket(toInt(domain), toInt(SockType.SOCK_STREAM), 0)
     if fd != osInvalidSocket:
       when defined(posix):
         let nb = fcntl(fd, F_GETFL, 0)
         if nb >= 0:
           discard fcntl(fd, F_SETFL, nb or O_NONBLOCK)
-          if posix.connect(fd, it.ai_addr, it.ai_addrlen) < 0:
+          if posix.connect(fd, cast[ptr SockAddr](addr sa), slen) < 0:
             let err = osLastError().cint
             if err == EINPROGRESS:
               let remain = int((deadline - epochTime()) * 1000)
@@ -177,9 +239,9 @@ proc dialUp(host: string; port: uint16): SocketHandle =
                 if poll(addr pfd, 1, remain.cint) > 0 and
                    (pfd.revents and POLLOUT) != 0:
                   var soerr: cint
-                  var slen = SockLen(sizeof(soerr))
+                  var optLen = SockLen(sizeof(soerr))
                   if getsockopt(fd, SOL_SOCKET, SO_ERROR, addr soerr,
-                                addr slen) == 0 and soerr == 0:
+                                addr optLen) == 0 and soerr == 0:
                     discard fcntl(fd, F_SETFL, nb)  # back to blocking
                     return fd
             elif err == EINTR:
@@ -189,7 +251,7 @@ proc dialUp(host: string; port: uint16): SocketHandle =
       else:
         var nbMode: culong = 1
         if wsaIoctl(fd, FIONBIO_W, addr nbMode) == 0:
-          if wsaConnect(fd, it.ai_addr, it.ai_addrlen.cint) < 0:
+          if wsaConnect(fd, cast[ptr SockAddr](addr sa), slen.cint) < 0:
             let err = osLastError().cint
             if err == WSAEWOULDBLOCK:
               let remain = int((deadline - epochTime()) * 1000)
@@ -198,9 +260,9 @@ proc dialUp(host: string; port: uint16): SocketHandle =
                 if pollW(addr pfd, 1, remain.cint) > 0 and
                    (pfd.revents and POLLOUT_W) != 0:
                   var soerr: cint
-                  var slen = SockLen(sizeof(soerr))
+                  var optLen = SockLen(sizeof(soerr))
                   if getsockopt(fd, SOL_SOCKET, SO_ERROR, addr soerr,
-                                addr slen) == 0 and soerr == 0:
+                                addr optLen) == 0 and soerr == 0:
                     nbMode = 0
                     discard wsaIoctl(fd, FIONBIO_W, addr nbMode)
                     return fd
@@ -209,7 +271,6 @@ proc dialUp(host: string; port: uint16): SocketHandle =
               discard wsaIoctl(fd, FIONBIO_W, addr nbMode)
               return fd
         sockshim.closeSock(fd)
-    it = it.ai_next
   osInvalidSocket
 
 # ----------------------------------------------------------- protocols
@@ -259,10 +320,11 @@ proc serveConnect(sh: var ProxyShared; fd: SocketHandle; first: char) =
     except ValueError:
       discard sendFd(fd, "HTTP/1.1 400 Bad Request\c\L\c\L")
       return
-    if not sh.allowed(host, port):
+    let d = sh.admit(host, port)
+    if d.verdict == vDenied:
       discard sendFd(fd, "HTTP/1.1 403 Forbidden\c\L\c\L")
       return
-    let up = dialUp(host, port)
+    let up = dialUp(d.ips, port)
     if up == osInvalidSocket:
       discard sendFd(fd, "HTTP/1.1 502 Bad Gateway\c\L\c\L")
       return
@@ -290,10 +352,11 @@ proc serveConnect(sh: var ProxyShared; fd: SocketHandle; first: char) =
       port = 80
     let path = if uri.len > 7 + authority.len: uri[7 + authority.len .. ^1]
                else: "/"
-    if not sh.allowed(host, port):
+    let d = sh.admit(host, port)
+    if d.verdict == vDenied:
       discard sendFd(fd, "HTTP/1.1 403 Forbidden\c\L\c\L")
       return
-    let up = dialUp(host, port)
+    let up = dialUp(d.ips, port)
     if up == osInvalidSocket:
       discard sendFd(fd, "HTTP/1.1 502 Bad Gateway\c\L\c\L")
       return
@@ -308,23 +371,6 @@ proc serveConnect(sh: var ProxyShared; fd: SocketHandle; first: char) =
       return
     splice(fd, up)
     closeSock(up)
-
-proc ip4String(a: array[4, char]): string =
-  $uint8(a[0]) & "." & $uint8(a[1]) & "." & $uint8(a[2]) & "." & $uint8(a[3])
-
-proc ip6String(a: array[16, char]): string =
-  when defined(posix):
-    var in6: In6Addr
-    copyMem(addr in6, unsafeAddr a[0], 16)
-    result = newString(64)
-    let r = inet_ntop(AF_INET.cint, addr in6, result.cstring, 64)
-    if r == nil: raise newException(ValueError, "bad IPv6 address")
-    result.setLen(r.len)
-  else:
-    var buf = newWideCString("", 64)
-    let r = inetNtopW(23, unsafeAddr a[0], buf, 64)  # AF_INET6
-    if r == nil: raise newException(ValueError, "bad IPv6 address")
-    result = $buf
 
 proc socksReply(fd: SocketHandle; code: char) =
   discard sendFd(fd, "\x05" & code & "\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -353,10 +399,10 @@ proc serveSocks5(sh: var ProxyShared; fd: SocketHandle; first: char) =
   var host: string
   case req[3]
   of '\x01':
-    var a: array[4, char]
+    var a: array[4, uint8]
     if recvFd(fd, addr a[0], 4, handshakeTimeout) != 4:
       raise newException(ValueError, "socks ipv4 truncated")
-    host = ip4String(a)
+    host = $IpAddress(family: IpAddressFamily.IPv4, address_v4: a)
   of '\x03':
     var ln: array[1, char]
     if recvFd(fd, addr ln[0], 1, handshakeTimeout) != 1:
@@ -367,10 +413,10 @@ proc serveSocks5(sh: var ProxyShared; fd: SocketHandle; first: char) =
       raise newException(ValueError, "socks domain truncated")
     host = d
   of '\x04':
-    var a: array[16, char]
+    var a: array[16, uint8]
     if recvFd(fd, addr a[0], 16, handshakeTimeout) != 16:
       raise newException(ValueError, "socks ipv6 truncated")
-    host = ip6String(a)
+    host = $IpAddress(family: IpAddressFamily.IPv6, address_v6: a)
   else:
     socksReply(fd, '\x08')   # address type not supported
     return
@@ -378,10 +424,14 @@ proc serveSocks5(sh: var ProxyShared; fd: SocketHandle; first: char) =
   if recvFd(fd, addr pb[0], 2, handshakeTimeout) != 2:
     raise newException(ValueError, "socks port truncated")
   let port = (uint16(uint8(pb[0])) shl 8) or uint16(uint8(pb[1]))
-  if not sh.allowed(host, port):
+  let d = sh.admit(host, port)
+  if d.verdict == vDenied:
     socksReply(fd, '\x02')   # not allowed by ruleset
     return
-  let up = dialUp(host, port)
+  if d.verdict == vNoAddress:
+    socksReply(fd, '\x04')   # host unreachable: no address to serve
+    return
+  let up = dialUp(d.ips, port)
   if up == osInvalidSocket:
     socksReply(fd, '\x05')   # connection refused
     return
@@ -497,10 +547,12 @@ when defined(posix):
     discard chmod(path, 0o777)
 
 proc startProxyListeners(policyPath, projectDir: string; port: uint16;
-                         unixSockPath: string; verbose: bool): WallProxy =
+                         unixSockPath: string; verbose: bool;
+                         permit: PermitSet): WallProxy =
   ## Shared body of the public startWallProxy variants: bind the TCP
   ## loopback listener (plus a unix listener when unixSockPath is set),
-  ## load the policy, spawn the accept loop.
+  ## load the policy, spawn the accept loop. A nil `permit` means the
+  ## proxy makes its own set and closes it in stopWallProxy.
   let sock = newSocket(buffered = false)
   sock.setSockOpt(OptReuseAddr, true)
   sock.bindAddr(Port(port), "127.0.0.1")
@@ -508,7 +560,10 @@ proc startProxyListeners(policyPath, projectDir: string; port: uint16;
   let p = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
                                    projectDir: projectDir,
                                    verbose: verbose,
-                                   running: true))
+                                   running: true,
+                                   ps: if permit.isNil: newPermitSet()
+                                       else: permit,
+                                   ownPermit: permit.isNil))
   p.sh.listeners.add(sock.getFd())
   when defined(posix):
     if unixSockPath.len > 0:
@@ -524,11 +579,14 @@ proc startProxyListeners(policyPath, projectDir: string; port: uint16;
   result.verbose = verbose
 
 proc startWallProxy*(policyPath: string; projectDir: string;
-                     port: uint16 = 0; verbose = false): WallProxy =
+                     port: uint16 = 0; verbose = false;
+                     permit: PermitSet = nil): WallProxy =
   ## Bind 127.0.0.1:port (0 = ephemeral), load the policy, spawn the
   ## accept loop on a background thread. Port 0 lets the caller read
   ## back `proxy.port`; consumers that need a fixed port range (the
-  ## Windows fence story) pass explicit ports instead.
+  ## Windows fence story) pass explicit ports instead. A passed
+  ## `permit` is used but not owned: the caller keeps it, seeds it,
+  ## closes it. The names the policy allows are resolved through it.
   when defined(windows):
     # The fence permits loopback egress only to remote ports
     # FirstProxyPort..LastProxyPort (wfp.nim, the single source: the
@@ -537,24 +595,27 @@ proc startWallProxy*(policyPath: string; projectDir: string;
     # through the fence: try each port in the range until one binds.
     for p in FirstProxyPort .. LastProxyPort:
       try:
-        return startProxyListeners(policyPath, projectDir, p, "", verbose)
+        return startProxyListeners(policyPath, projectDir, p, "", verbose,
+                                  permit)
       except CatchableError:
         continue
     raise newException(OSError,
       "sandwall proxy: no free port in the fence range " &
       $FirstProxyPort & "-" & $LastProxyPort)
   else:
-    startProxyListeners(policyPath, projectDir, port, "", verbose)
+    startProxyListeners(policyPath, projectDir, port, "", verbose, permit)
 
 proc startWallProxy*(policyPath: string; projectDir: string;
                      unixSockPath: string; port: uint16 = 0;
-                     verbose = false): WallProxy =
+                     verbose = false; permit: PermitSet = nil): WallProxy =
   ## As startWallProxy, plus a second listener on the AF_UNIX socket at
   ## `unixSockPath`. A filesystem unix socket crosses netns boundaries,
   ## so this is how the unfenced parent offers the proxy to a fenced
   ## child (see wall/netns.nim). Same accept loop, family AF_UNIX; peer
-  ## address checks are skipped (filesystem perms are the ACL).
-  startProxyListeners(policyPath, projectDir, port, unixSockPath, verbose)
+  ## address checks are skipped (filesystem perms are the ACL). Same
+  ## `permit` contract as the other overload.
+  startProxyListeners(policyPath, projectDir, port, unixSockPath, verbose,
+                      permit)
 
 when defined(posix):
   proc proxyChild(dir, policyPath, projectDir: string; sockFd: SocketHandle;
@@ -570,7 +631,9 @@ when defined(posix):
     let ctx = ProxyCtx(sh: ProxyShared(policyPath: policyPath,
                                        projectDir: projectDir,
                                        verbose: verbose,
-                                       running: true))
+                                       running: true,
+                                       ps: newPermitSet(),
+                                       ownPermit: true))
     ctx.sh.listeners.add(sockFd)
     when defined(linux):
       ctx.sh.listeners.add(listenUnix(dir / "proxy.sock"))
@@ -691,6 +754,7 @@ proc stopWallProxy*(p: var WallProxy) =
     closeSock(p.sock.getFd())
   p.sock = nil
   if ctx != nil:
+    if ctx.sh.ownPermit: ctx.sh.ps.close()
     deinitLock(ctx.sh.lock)
   p.acceptCtx = nil
 
