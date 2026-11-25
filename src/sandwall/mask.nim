@@ -103,6 +103,17 @@ when defined(linux):
         "sandwall: making mounts private failed (errno " & $errno & ")")
     inUserns = true
 
+  proc bindMount*(source, target: string) =
+    ## Bind `source` over `target` (a file or a directory) in this
+    ## process's mount namespace. Raises OSError; the caller decides
+    ## whether that is fatal. Requires the user+mount namespace
+    ## (`ensureUserns`) to be in place, and the mounts to be private so
+    ## nothing propagates to the host.
+    if mount(source.cstring, target.cstring, nil, MS_BIND_C, nil) != 0:
+      raise newException(OSError,
+        "sandwall: bind-mount " & source & " over " & target &
+        " failed (errno " & $errno & ")")
+
   proc maskDenied*(denied: openArray[string]) =
     ## Hide each denied path from this process and its children. A
     ## denied directory is bind-masked over a fresh empty dir, a denied

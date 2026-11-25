@@ -45,6 +45,23 @@ suite "host list matching":
     check not d.allows("host.com", 22)
     check d.allows("host.com", 443)
 
+  test "allowsAnyPort is the fence DNS's question":
+    # a port is unknown at resolution time; the connect decides it
+    let p = listOf("allow host.com:443\n")
+    check p.allowsAnyPort("host.com")
+    check not p.allowsAnyPort("other.com")
+    # a bare rule decides the whole name
+    check not listOf("allow host.com:443\ndeny host.com\n").allowsAnyPort("host.com")
+    check listOf("deny host.com\nallow host.com:443\n").allowsAnyPort("host.com")
+    # a deny for one port leaves the other ports to the other rules
+    check listOf("allow host.com\ndeny host.com:22\n").allowsAnyPort("host.com")
+    # deny-only policies keep their open default
+    let d = listOf("deny evil.com\n")
+    check not d.allowsAnyPort("evil.com")
+    check d.allowsAnyPort("example.com")
+    check listOf("deny evil.com:22\n").allowsAnyPort("evil.com")
+    check listOf("allow *\n").allowsAnyPort("anything.test")
+
   test "star is all networks":
     check listOf("allow *\n").allows("anything.at.all", 1)
     check listOf("deny x.com\nallow *\n").allows("x.com", 443)  # later allow * wins

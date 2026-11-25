@@ -94,6 +94,20 @@ proc allows*(l: HostList; host: string; port: uint16): bool =
     if m.port != 0 and m.port != port: continue
     if m.coversName(h): result = m.allow
 
+proc allowsAnyPort*(l: HostList; host: string): bool =
+  ## Does the policy let anything through to `host` at all, on some
+  ## port? The question the fence DNS asks (wall/dns.nim): a port is
+  ## not known at resolution time, the connect decides it. A bare
+  ## rule for the name decides the whole name, an allow for one port
+  ## makes it reachable, a deny for one port leaves the other rules to
+  ## speak; the default is as in `allows`.
+  result = not l.hasAllow
+  let h = normalizeHost(host)
+  for m in l.matchers:
+    if not m.coversName(h): continue
+    if m.port == 0: result = m.allow
+    elif m.allow: result = true
+
 proc winningPorts*(l: HostList; host: string): seq[uint16] =
   ## The ports the allow rules for `host` still stand for, ascending.
   ## An allow rule is superseded when a later rule naming the host

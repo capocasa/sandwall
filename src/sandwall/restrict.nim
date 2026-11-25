@@ -22,6 +22,7 @@ when defined(linux):
   import ./baseline
   import ./wall/netns
   export landlock.backendSupported, landlock.backendName
+  export netns.RawUnavailableError, netns.RawMarker, netns.RawFallbackExit
 elif defined(macosx):
   import ./seatbelt
   export seatbelt.backendSupported, seatbelt.backendName
@@ -34,8 +35,20 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
                denied: openArray[string] = [];
                fenceNet: bool = false; proxyPort: uint16 = 0;
                proxySockPath: string = "";
-               bridgePort: ptr uint16 = nil) =
+               bridgePort: ptr uint16 = nil;
+               raw: bool = false; dnsSockPath: string = "") =
   ## Confine the calling thread (and all future children).
+  ##
+  ## `raw` (Linux, with fenceNet and proxySockPath) adds the env-var-free
+  ## egress path on top of the netns (wall/netns.nim): the fake pool
+  ## routed, an nft redirect onto a raw bridge, `/etc/resolv.conf`
+  ## pointing at a DNS relay to `dnsSockPath` (the forwarder's unix
+  ## datagram listener), and the raw bridge itself; all of it before
+  ## exec, and the two relays forked after Landlock so they inherit it.
+  ## The proxy env vars are then the caller's to leave alone. When the
+  ## raw half cannot go up it raises RawUnavailableError before Landlock
+  ## with nothing half-applied, which `restrict(rules)` turns into exit
+  ## 75 with `RawMarker` (the parent's cue to re-spawn in env mode).
   ##
   ## `fenceNet` confines network egress to loopback: on Linux by
   ## unsharing a network namespace (CLONE_NEWNET alongside the mask.nim
@@ -78,12 +91,24 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
     landlock.setNoNewPrivsEarly()
     # When fencing, the userns must be created WITH CLONE_NEWNET, so the
     # netns comes first and maskDenied's ensureUserns is a no-op after.
+    if raw and (not fenceNet or proxySockPath.len == 0):
+      raise newException(ValueError,
+        "sandwall: the raw fence needs fenceNet and proxySockPath")
     if fenceNet:
       try:
         enterNetns()
       except OSError as e:
+        if raw:
+          # env mode is the better degrade: tools that honor proxy vars
+          # still go through the policy. Let the parent switch to it.
+          raise newException(RawUnavailableError, "network namespace: " & e.msg)
         stderr.writeLine("sandwall: " & e.msg &
           "; continuing WITHOUT network fencing")
+    var rawFence: RawFence
+    if raw:
+      # nft needs exec and the resolv.conf bind mount needs the mount
+      # namespace as it is: both before Landlock and the masks.
+      rawFence = prepareRawFence(proxySockPath, dnsSockPath)
     # Denies under a baseline root are re-scoped inside Landlock
     # itself (rules union there, a bind-mask would not help); the
     # mount-namespace mask is only needed for denies narrowing a
@@ -114,6 +139,8 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
       # consumer must place proxySockPath under a writable path.
       let bp = bridgeToUnix(proxyPort, proxySockPath)
       if bridgePort != nil: bridgePort[] = bp
+    if raw:
+      startRawBridges(rawFence)
   elif defined(macosx):
     seatbelt.restrictImpl(writable, read, denied, egress = not fenceNet)
   elif defined(windows):
@@ -130,11 +157,24 @@ import std/os
 import ./rules
 when defined(posix):
   import ./wall/proxy
+when defined(linux):
+  import std/posix
 
 proc restrict*(rules: openArray[Rule]; projectDir: string;
-               policyPath: string = ""; verbose = false) =
+               policyPath: string = ""; verbose = false;
+               raw: bool = false; fallbackFd: cint = -1) =
   ## Apply a parsed policy to the calling thread (and all future
   ## children): filesystem rules first, then the network wall.
+  ##
+  ## `raw` (Linux) asks for the env-var-free path instead: fence DNS
+  ## with fake-IPs, an nft redirect, and the proxy's raw forward path
+  ## (wall/netns.nim). Then no proxy env var is set. The mode is the
+  ## parent's call: when the raw half is refused this process prints
+  ## the reason, `RawMarker`, writes the marker to `fallbackFd` when
+  ## given (the caller's pipe to its parent, which it should make
+  ## CLOEXEC so the exec'd command cannot fake the signal) and exits
+  ## 75, before Landlock and exec. A caller that wants the fallback
+  ## forks for the attempt.
   ##
   ## With no host rules this is the filesystem sandbox alone. With at
   ## least one host rule, egress is fenced to loopback and a per-run
@@ -177,9 +217,24 @@ proc restrict*(rules: openArray[Rule]; projectDir: string;
     # env must point at that port, not the host one. On macOS the
     # sandbox reaches host loopback directly, so the proxy's own port.
     var bp: uint16
-    restrict(writable, r.readonly, r.denied, fenceNet = true,
-             proxyPort = 0, proxySockPath = proxy.sockPath,
-             bridgePort = addr bp)
+    when defined(linux):
+      try:
+        restrict(writable, r.readonly, r.denied, fenceNet = true,
+                 proxyPort = 0, proxySockPath = proxy.sockPath,
+                 bridgePort = addr bp,
+                 raw = raw, dnsSockPath = runDir / "dns.sock")
+      except RawUnavailableError as e:
+        stderr.writeLine("sandwall: " & e.msg)
+        stderr.writeLine(RawMarker)
+        if fallbackFd >= 0:
+          var marker = RawMarker
+          discard posix.write(fallbackFd, addr marker[0], marker.len)
+        exitnow(RawFallbackExit)
+      if raw: return   # the redirect and the fence DNS carry egress: no env
+    else:
+      restrict(writable, r.readonly, r.denied, fenceNet = true,
+               proxyPort = 0, proxySockPath = proxy.sockPath,
+               bridgePort = addr bp)
     let fencePort = when defined(linux): bp else: proxy.port
     # Point the exec'd command's proxy env at the wall proxy. On linux
     # the fenced side reaches it through the netns bridge's ephemeral

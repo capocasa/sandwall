@@ -329,3 +329,211 @@ suite "wall proxy":
       # and deciding that needs no lookup
       check p.echoThrough("127.0.0.1:" & $echoPort)
       check s.callCount() == 1
+
+# ---------------------------------------------------- raw path (posix)
+# The netns bridge (wall/netns.nim) hands redirected connections to the
+# unix listener with an `SWRAW <ip> <port>` line ahead of the bytes, and
+# the fence DNS arrives as datagrams on dns.sock. Both ends are exercised
+# here against the in-process proxy without a netns.
+
+when defined(posix):
+  import std/posix
+  import sandwall/wall/dns
+  import sandwall/wall/sockshim
+
+  proc dialUnix(path: string): SocketHandle =
+    result = posix.socket(AF_UNIX, SOCK_STREAM, 0)
+    if result == osInvalidSocket: raiseOSError(osLastError())
+    var sa: Sockaddr_un
+    sa.sun_family = TSa_Family(AF_UNIX)
+    if path.len >= sa.sun_path.len: raise newException(ValueError, "path")
+    copyMem(addr sa.sun_path[0], cstring(path), path.len + 1)
+    if posix.connect(result, cast[ptr SockAddr](addr sa),
+                     SockLen(sizeof(sa))) != 0:
+      raiseOSError(osLastError())
+
+  proc sendAll(fd: SocketHandle; data: string) =
+    var off = 0
+    while off < data.len:
+      let n = posix.send(fd, addr data[off], (data.len - off).cint,
+                         MSG_NOSIGNAL)
+      if n <= 0: raiseOSError(osLastError())
+      off.inc n
+
+  proc recvAll(fd: SocketHandle; want: int; timeoutMs = 5_000): string =
+    ## Up to `want` bytes, stopping early at EOF; times out with "".
+    let deadline = epochTime() + timeoutMs / 1000
+    var b: array[1, char]
+    while result.len < want:
+      let remain = int((deadline - epochTime()) * 1000)
+      if remain <= 0: return ""
+      var pfd = TPollfd(fd: fd.cint, events: POLLIN, revents: 0)
+      if poll(addr pfd, 1, remain.cint) <= 0: return ""
+      let n = posix.recv(fd, addr b[0], 1, 0)
+      if n <= 0: return
+      result.add b[0]
+
+  proc encodeQName(name: string): seq[uint8] =
+    for label in name.split('.'):
+      result.add uint8(label.len)
+      for c in label: result.add uint8(c)
+    result.add 0'u8
+
+  proc dnsQuery(id: uint16; name: string; qtype: uint16): string =
+    var q = @[uint8(id shr 8), uint8(id and 0xff), 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+    q.add encodeQName(name)
+    q.add [uint8(qtype shr 8), uint8(qtype and 0xff), 0, 1]
+    for b in q: result.add char(b)
+
+  var asked = 0
+
+  proc ask(p: WallProxy; dnsPath: string; name: string;
+           qtype = uint16(qtA)): string =
+    ## One query to the fence DNS at `dnsPath`; "" when nothing came.
+    ## The socket is bound to an abstract name first, like the netns
+    ## relay's: the answer is sent to the sender's address.
+    let s = posix.socket(AF_UNIX, SOCK_DGRAM, 0)
+    if s == osInvalidSocket: raiseOSError(osLastError())
+    defer: discard posix.close(s)
+    inc asked
+    doAssert bindUnixAbstract(s, "sandwall-test-" & $getCurrentProcessId() &
+                             "-" & $asked)
+    var sa: Sockaddr_un
+    sa.sun_family = TSa_Family(AF_UNIX)
+    copyMem(addr sa.sun_path[0], cstring(dnsPath), dnsPath.len + 1)
+    if posix.connect(s, cast[ptr SockAddr](addr sa), SockLen(sizeof(sa))) != 0:
+      raiseOSError(osLastError())
+    let q = dnsQuery(0x1234, name, qtype)
+    if posix.send(s, addr q[0], q.len.cint, 0) != q.len: return ""
+    var pfd = TPollfd(fd: s.cint, events: POLLIN, revents: 0)
+    if poll(addr pfd, 1, 5_000) <= 0: return ""
+    var buf: array[4096, char]
+    let n = posix.recv(s, addr buf[0], buf.len, 0)
+    if n <= 0: return ""
+    for i in 0 ..< n: result.add buf[i]
+
+  proc rcodeOf(resp: string): int = int(ord(resp[3]) and 0x0F)
+  proc anCount(resp: string): int = (int(ord(resp[6])) shl 8) or int(ord(resp[7]))
+  proc lastAddress(resp: string): string =
+    ## The rdata of the one A answer: the last four bytes.
+    let a = resp[resp.len - 4 ..< resp.len]
+    $ord(a[0]) & "." & $ord(a[1]) & "." & $ord(a[2]) & "." & $ord(a[3])
+
+  proc fakeOf(resp: string): string = lastAddress(resp)
+
+  const ping = "ping\n"
+
+  suite "wall proxy raw path (posix)":
+    setup:
+      tmpDir = getTempDir() / "sandwall_raw_" & $getCurrentProcessId()
+      createDir(tmpDir)
+      if echoSock == nil:
+        (echoSock, echoPort) = startEcho()
+    teardown:
+      removeDir(tmpDir)
+
+    test "SWRAW carries the original destination; an IP rule admits its address":
+      let path = writePolicy("allow 127.0.0.1:" & $echoPort & "\n")
+      let sockPath = tmpDir / "proxy.sock"
+      var p = startWallProxy(path, tmpDir, unixSockPath = sockPath)
+      defer: p.stopWallProxy()
+      let c = dialUnix(sockPath)
+      sendAll(c, "SWRAW 127.0.0.1 " & $echoPort & "\n")
+      # the forwarder needs a moment to dial; bytes sent ahead of the
+      # dial are what a real client's first packet looks like
+      sendAll(c, ping)
+      check recvAll(c, ping.len) == ping
+      discard posix.close(c)
+      # the rule stands for one port only: closed without a word
+      let other = uint16(int(echoPort) xor 0x40)
+      let d = dialUnix(sockPath)
+      sendAll(d, "SWRAW 127.0.0.1 " & $other & "\n" & ping)
+      check recvAll(d, ping.len, 2_000) == ""
+      discard posix.close(d)
+
+    test "an unknown address, a malformed line and a bad port are closed":
+      let path = writePolicy("allow names.test\n")
+      let sockPath = tmpDir / "proxy.sock"
+      var p = startWallProxy(path, tmpDir, unixSockPath = sockPath)
+      defer: p.stopWallProxy()
+      # no allowed name resolved to 127.0.0.1: the default does not
+      # vouch for a bare address on the raw path
+      let a = dialUnix(sockPath)
+      sendAll(a, "SWRAW 127.0.0.1 " & $echoPort & "\n" & ping)
+      check recvAll(a, ping.len, 2_000) == ""
+      discard posix.close(a)
+      let b = dialUnix(sockPath)
+      sendAll(b, "SWRAW nonsense\n")
+      check recvAll(b, 1, 2_000) == ""
+      discard posix.close(b)
+      let e = dialUnix(sockPath)
+      sendAll(e, "SWRAW 127.0.0.1 99999\n")
+      check recvAll(e, 1, 2_000) == ""
+      discard posix.close(e)
+
+    test "an HTTP request that merely starts with S still gets its 400":
+      let path = writePolicy("allow 127.0.0.1\n")
+      let sockPath = tmpDir / "proxy.sock"
+      var p = startWallProxy(path, tmpDir, unixSockPath = sockPath)
+      defer: p.stopWallProxy()
+      let c = dialUnix(sockPath)
+      sendAll(c, "SWXYZ what HTTP/1.1\c\L\c\L")
+      check recvAll(c, 12, 2_000) == "HTTP/1.1 400"
+
+    test "the fence DNS answers by policy and the fake-IP leads back to its name":
+      let path = writePolicy("allow svc.test:" & $echoPort & "\n" &
+                             "allow gone.test\n")
+      let s = newScript()
+      s.answer(roAddrs, ["127.0.0.1"])
+      let sockPath = tmpDir / "proxy.sock"
+      let dnsPath = tmpDir / "dns.sock"
+      var p = startWallProxy(path, tmpDir, unixSockPath = sockPath,
+                             permit = permitSetFor(s), dnsSockPath = dnsPath)
+      defer: p.stopWallProxy()
+      let a = p.ask(dnsPath, "svc.test")
+      check rcodeOf(a) == 0
+      check anCount(a) == 1
+      let fake = fakeOf(a)
+      check fake == "198.18.0.1"
+      check s.callCount() == 1                 # the query warmed the set
+      # stable across queries, and AAAA is NODATA
+      check fakeOf(p.ask(dnsPath, "svc.test")) == fake
+      let aaaa = p.ask(dnsPath, "svc.test", uint16(qtAAAA))
+      check rcodeOf(aaaa) == 0
+      check anCount(aaaa) == 0
+      # denied: NXDOMAIN. Allowed but unresolvable (the resolver now
+      # says so): SERVFAIL, and the permit set keeps it that way until
+      # the refresh. The port is not the DNS's business: a name allowed
+      # on one port answers for every port, the connect decides.
+      let no = p.ask(dnsPath, "elsewhere.test")
+      check rcodeOf(no) == 3
+      check anCount(no) == 0
+      s.answer(roNxdomain)
+      let gone = p.ask(dnsPath, "gone.test")
+      check rcodeOf(gone) == 2
+      check anCount(gone) == 0
+      # the raw path: the fake-IP is the name
+      let c = dialUnix(sockPath)
+      sendAll(c, "SWRAW " & fake & " " & $echoPort & "\n")
+      sendAll(c, ping)
+      check recvAll(c, ping.len) == ping
+      discard posix.close(c)
+
+    test "a fake-IP whose rule is withdrawn is denied on the raw path":
+      let path = writePolicy("allow svc.test:" & $echoPort & "\n")
+      let s = newScript()
+      s.answer(roAddrs, ["127.0.0.1"])
+      let sockPath = tmpDir / "proxy.sock"
+      let dnsPath = tmpDir / "dns.sock"
+      var p = startWallProxy(path, tmpDir, unixSockPath = sockPath,
+                             permit = permitSetFor(s), dnsSockPath = dnsPath)
+      defer: p.stopWallProxy()
+      let fake = fakeOf(p.ask(dnsPath, "svc.test"))
+      # the rule goes away (another host stays allowed so the default is
+      # still deny), mtime pushed so the reload is visible
+      discard writePolicy("allow other.test\n")
+      setLastModificationTime(path, getTime() + initDuration(seconds = 2))
+      let a = dialUnix(sockPath)
+      sendAll(a, "SWRAW " & fake & " " & $echoPort & "\n" & ping)
+      check recvAll(a, ping.len, 2_000) == ""
+      discard posix.close(a)

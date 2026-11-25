@@ -56,6 +56,11 @@ Usage:
   connection). System dirs stay read-only so CMD's binaries and libs
   stay runnable.
 
+  On Linux with nft available the run first tries the raw path: CMD
+  gets no proxy env vars, its DNS resolves allowed names to fake-IPs
+  and plain ssh/scp/telnet work. If the raw fence cannot go up the
+  command is re-run with proxy env vars (the env path) instead.
+
   sandwall connect HOST PORT
       SOCKS5 stdio adapter for ssh ProxyCommand-style tools: pumps
       stdio through the wall proxy at 127.0.0.1:$WALL_PROXY_PORT
@@ -92,6 +97,58 @@ filesystem policy are enforced with no setup step.
     else:
       stderr.writeLine("sandwall: connect is POSIX-only"); 2
 
+  when defined(linux):
+    import ./sandwall/wall/netns
+
+    proc runRaw(rules: seq[Rule]; projectDir, policyPath: string;
+                cmd: seq[string]): int =
+      ## The first attempt of a run when nft is around: fork, and let
+      ## the child fence itself in raw mode and exec. Returns the
+      ## child's exit code, or -1 when the child refused raw mode (exit
+      ## 75 AND the marker over the pipe only the pre-exec fence code
+      ## could write), in which case the caller runs env mode in-process.
+      ## The marker on stderr alone is not enough: a command may exit
+      ## 75 on its own, and running it twice is not an option.
+      var marker: array[2, cint]
+      if posix.pipe(marker) != 0: raiseOSError(osLastError())
+      let pid = posix.fork()
+      if pid == 0:
+        discard posix.close(marker[0])
+        discard fcntl(marker[1], F_SETFD, FD_CLOEXEC)
+        discard setsid()
+        try:
+          restrict(rules, projectDir, policyPath, raw = true,
+                   fallbackFd = marker[1])
+          exec(cmd)
+        except CatchableError as e:
+          stderr.writeLine("sandwall: " & e.msg)
+        exitnow(127)
+      if pid < 0:
+        discard posix.close(marker[0])
+        discard posix.close(marker[1])
+        raiseOSError(osLastError())
+      discard posix.close(marker[1])
+      var status: cint
+      discard posix.waitpid(pid, status, 0)
+      # The proxy the child forked may still hold the write end for a
+      # moment; the marker, if any, is already in the pipe, so look
+      # without waiting.
+      var pfd = TPollfd(fd: marker[0], events: POLLIN, revents: 0)
+      var got: array[RawMarker.len, char]
+      let n = if poll(addr pfd, 1, 0) > 0:
+                posix.read(marker[0], addr got[0], got.len)
+              else: 0
+      discard posix.close(marker[0])
+      var gotMarker = newString(max(n, 0))
+      for i in 0 ..< gotMarker.len: gotMarker[i] = got[i]
+      var code = 1
+      if WIFEXITED(status): code = int(WEXITSTATUS(status))
+      elif WIFSIGNALED(status): code = 128 + int(WTERMSIG(status))
+      if code == RawFallbackExit and gotMarker == RawMarker:
+        stderr.writeLine("sandwall: retrying with proxy env")
+        return -1
+      code
+
   proc runMain(args: seq[string]): int =
     ## sandwall RULES [--] CMD [ARGS...]
     if args.len < 2:
@@ -121,6 +178,12 @@ filesystem policy are enforced with no setup step.
     # would miss CMD's children.
     when defined(posix):
       discard setsid()
+      when defined(linux):
+        # Raw mode is tried only when nft is there to load the redirect;
+        # the child decides whether it holds (restrict, RawUnavailableError).
+        if findNft().len > 0:
+          let rc = runRaw(rules, projectDir, policyPath, cmd)
+          if rc >= 0: return rc
       try:
         restrict(rules, projectDir, policyPath)
         exec(cmd)

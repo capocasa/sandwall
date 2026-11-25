@@ -1,14 +1,19 @@
 ## wall: the network half of sandwall. Public API.
 ##
 ##   hosts   - compiled hostname allowlist (matching semantics)
+##   permit  - hostname rules as resolved address sets
+##   dns     - the fence DNS codec and the fake-IP pool (Linux raw mode)
 ##   proxy   - threaded CONNECT+SOCKS5 proxy enforcing a HostList
 ##   connect - minimal SOCKS5 client (git ProxyCommand helper)
-##   netns   - Linux kernel fence: netns + unix-socket bridge
+##   netns   - Linux kernel fence: netns + unix-socket bridges, nft
+##             redirect, fence DNS relay (raw mode), or env mode
 ##   wfp     - Windows kernel fence: WFP filters on the sandwall user
 ##   winuser - Windows sandwall user: setup, DPAPI creds, spawn
 
 import ./wall/hosts
 export hosts
+import ./wall/dns
+export dns
 
 # Proxy port range is a cross-platform constant: consumers reference it
 # even when compiling for POSIX (the Windows WFP permit uses it).

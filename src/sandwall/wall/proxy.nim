@@ -19,6 +19,15 @@
 ## for an IP is decided by the same set, so a rule that was withdrawn
 ## stops being dialable too. Denies are logged to stderr; allows are
 ## silent unless `verbose` is set.
+##
+## Linux raw mode (wall/netns.nim) needs no env vars in the child and
+## reaches this proxy twice: TCP connections that nft redirected arrive
+## through the unix listener with an `SWRAW <ip> <port>` line ahead of
+## the bytes, naming the original destination, which is a fake-IP the
+## fence DNS (wall/dns.nim) handed out; and DNS queries arrive as
+## datagrams on a second unix socket, answered by policy with a stable
+## fake-IP per allowed name. The pool of bindings lives here because
+## this process outlives the netns.
 
 import std/[locks, nativesockets, net, options, os, strutils, syncio, times]
 when defined(posix):
@@ -27,6 +36,7 @@ else:
   import winlean except Socket
 
 import ../rules
+import ./dns
 import ./hosts
 import ./permit
 from ./wfp import FirstProxyPort, LastProxyPort
@@ -41,6 +51,11 @@ type
     ## ptr back into ProxyShared is fine too, but ref is simpler.)
     sh: ptr ProxyShared
     fd: SocketHandle
+    dns: bool              ## a DNS datagram (`query`, from `peer`), not a connection
+    query: string
+    when defined(posix):
+      peer: Sockaddr_un
+      peerLen: SockLen
 
   ProxyShared = object
     ## Everything the accept/client threads need, heap-allocated and
@@ -56,6 +71,9 @@ type
     running: bool
     ps: PermitSet              ## the addresses behind the names in `list`
     ownPermit: bool            ## this proxy created `ps` and closes it
+    dnsFd: SocketHandle        ## fence DNS listener (unix datagram, posix; else invalid)
+    fakeLock: Lock             ## `fakes`, under its own lock: DNS workers write, raw readers read
+    fakes: FakePool            ## fake-IP -> name bindings, for this proxy's lifetime
 
   ProxyCtx = ref object
     ## Must stay a GC ref rooted from WallProxy.acceptCtx. Storing only
@@ -77,6 +95,8 @@ const
   handshakeTimeout = 30_000   ## ms to read the initial request
   upstreamTimeout = 15_000    ## ms to connect+read the upstream
   spliceBuf = 64 * 1024
+  rawPrefix = "SWRAW "      ## the netns bridge's original-destination line
+  rawLineMax = 128
 
 # ------------------------------------------------------------- policy
 
@@ -120,6 +140,78 @@ type
     vDenied     ## the policy does not allow this target
     vNoAddress  ## the name is allowed, but has no address to serve
 
+proc dialable(sh: var ProxyShared; ent: PermitEntry): seq[IpAddress] =
+  ## The addresses to dial for an entry: `current`, then `previous`
+  ## while its grace runs, so a rotation does not cut off a peer still
+  ## holding the old address.
+  result = ent.current
+  if sh.ps.clock() < ent.prevUntil: result.add ent.previous
+
+proc fakeName(sh: var ProxyShared; ip: IpAddress): Option[string] =
+  ## The name behind a fake address, as a private copy: DNS workers
+  ## write the pool, this thread keeps only what it copied out.
+  withLock sh.fakeLock: result = sh.fakes.nameFor(ip)
+
+proc fakeFor(sh: var ProxyShared; name: string): Option[IpAddress] =
+  withLock sh.fakeLock: result = sh.fakes.fakeFor(name)
+
+proc dnsDecide(sh: var ProxyShared; name: string):
+    tuple[decision: DnsDecision, ip: IpAddress] =
+  ## Policy first, by name: a port is not known at resolution time
+  ## (the connect checks it), so a rule for any port makes the name
+  ## resolvable. Then the permit set: an allowed name nothing resolves
+  ## behind is SERVFAIL, so a typo reports as a resolution failure
+  ## rather than as a dead tunnel. The set is warmed on the way, and
+  ## the connect that follows finds the entry fresh.
+  withLock sh.lock:
+    if not sh.list.allowsAnyPort(name):
+      result.decision = ddNxDomain
+  if result.decision == ddNxDomain:
+    stderr.writeLine("sandwall proxy: dns DENY " & name)
+    return
+  var won: seq[uint16]
+  withLock sh.lock:
+    won = sh.list.winningPorts(name)
+  if sh.ps.getOrResolve(name, won).isNone:
+    result.decision = ddServFail
+    if sh.verbose:
+      stderr.writeLine("sandwall proxy: dns " & name & ": no address")
+    return
+  let ip = sh.fakeFor(name)
+  if ip.isNone:
+    result.decision = ddServFail
+    stderr.writeLine("sandwall proxy: dns " & name &
+                     ": fake-IP pool exhausted")
+    return
+  result.decision = ddFake
+  result.ip = ip.get
+  if sh.verbose:
+    stderr.writeLine("sandwall proxy: dns " & name & " -> " & $ip.get)
+
+proc dnsReply(sh: var ProxyShared; query: string): seq[uint8] =
+  ## The fence DNS's answer to one query datagram (wall/dns.nim builds
+  ## it; this decides).
+  let p = addr sh
+  proc decide(name: string): tuple[decision: DnsDecision, ip: IpAddress]
+      {.gcsafe, raises: [].} =
+    try:
+      p[].dnsDecide(name)
+    except CatchableError:
+      (ddServFail, IpAddress())   # nothing stands behind it right now
+  var q = newSeq[uint8](query.len)
+  for i, c in query: q[i] = uint8(c)
+  dns.reply(q, decide)
+
+when defined(posix):
+  proc dnsServe(sh: var ProxyShared; query: string; peer: Sockaddr_un;
+                peerLen: SockLen) =
+    ## Answer one datagram from `peer`, to `peer`: the relay's per-query
+    ## socket, which is gone if the client stopped waiting.
+    let resp = sh.dnsReply(query)
+    if resp.len > 0:
+      discard posix.sendto(sh.dnsFd, addr resp[0], resp.len, 0,
+                           cast[ptr SockAddr](unsafeAddr peer), peerLen)
+
 proc admit(sh: var ProxyShared; host: string; port: uint16):
     tuple[verdict: Verdict, ips: seq[IpAddress]] =
   ## The one decision behind CONNECT, plain HTTP and SOCKS5. A name is
@@ -155,10 +247,8 @@ proc admit(sh: var ProxyShared; host: string; port: uint16):
   if e.isNone:
     stderr.writeLine("sandwall proxy: no address for " & host & ":" & $port)
     return (vNoAddress, @[])
-  let ent = e.get
   result.verdict = vAllowed
-  result.ips = ent.current
-  if sh.ps.clock() < ent.prevUntil: result.ips.add ent.previous
+  result.ips = sh.dialable(e.get)
 
 # ---------------------------------------------------------- raw fds
 # After the handshake everything runs on unbuffered fds under poll();
@@ -206,12 +296,14 @@ proc sendFd(fd: SocketHandle; data: string): bool =
   if data.len == 0: return true
   sendAll(fd, addr data[0], data.len)
 
-proc dialUp(ips: seq[IpAddress]; port: uint16): SocketHandle =
+proc dialUp(ips: seq[IpAddress]; port: uint16;
+              via: ptr IpAddress = nil): SocketHandle =
   ## Connect to the first of `ips` that accepts, within one overall
   ## timeout shared by every address. The addresses come from the permit
   ## set: a name is resolved once there and never again here, so the dial
   ## cannot reach an address the decision did not just stand for.
-  ## Returns osInvalidSocket when none accepted.
+  ## `via`, when given, gets the address that accepted. Returns
+  ## osInvalidSocket when none accepted.
   if ips.len == 0: return osInvalidSocket
   let deadline = epochTime() + upstreamTimeout / 1000
   for ip in ips:
@@ -243,6 +335,7 @@ proc dialUp(ips: seq[IpAddress]; port: uint16): SocketHandle =
                   if getsockopt(fd, SOL_SOCKET, SO_ERROR, addr soerr,
                                 addr optLen) == 0 and soerr == 0:
                     discard fcntl(fd, F_SETFL, nb)  # back to blocking
+                    if via != nil: via[] = ip
                     return fd
             elif err == EINTR:
               discard fcntl(fd, F_SETFL, nb)
@@ -265,6 +358,7 @@ proc dialUp(ips: seq[IpAddress]; port: uint16): SocketHandle =
                                 addr optLen) == 0 and soerr == 0:
                     nbMode = 0
                     discard wsaIoctl(fd, FIONBIO_W, addr nbMode)
+                    if via != nil: via[] = ip
                     return fd
             elif err == WSAEINTR:
               nbMode = 0
@@ -288,10 +382,10 @@ proc parseHostPort(target: string): tuple[host: string, port: uint16] =
     result.host = target[0 .. c - 1]
     result.port = uint16(parseUInt(target[c .. ^1][1 .. ^1]))
 
-proc readHttpHead(fd: SocketHandle; first: char): string =
-  ## Read the request line plus headers up to the blank line.
-  ## `first` is the byte already consumed by the protocol peek.
-  result = $first
+proc readHttpHead(fd: SocketHandle; pre: string): string =
+  ## Read the request line plus headers up to the blank line. `pre` is
+  ## what the protocol peek already consumed.
+  result = pre
   let deadline = epochTime() + handshakeTimeout / 1000
   var b: array[1, char]
   while true:
@@ -303,10 +397,10 @@ proc readHttpHead(fd: SocketHandle; first: char): string =
     result.add b[0]
     if result.endsWith("\c\L\c\L") or result.endsWith("\L\L"): return
 
-proc serveConnect(sh: var ProxyShared; fd: SocketHandle; first: char) =
+proc serveConnect(sh: var ProxyShared; fd: SocketHandle; pre: string) =
   ## Handle one HTTP request: CONNECT (a tunnel) or any other method
   ## with an absolute-URI target (plain HTTP, forwarded).
-  let head = readHttpHead(fd, first)
+  let head = readHttpHead(fd, pre)
   let line = head.splitLines()[0]
   let parts = line.splitWhitespace()
   if parts.len < 2:
@@ -441,56 +535,170 @@ proc serveSocks5(sh: var ProxyShared; fd: SocketHandle; first: char) =
   splice(fd, up)
   closeSock(up)
 
+proc readRawLine(fd: SocketHandle; pre: string): string =
+  ## The rest of the bridge's `SWRAW <ip> <port>` line after `pre`
+  ## (the prefix already matched), up to the newline, bounded. "" when
+  ## it never came.
+  result = pre
+  var b: array[1, char]
+  while result.len < rawLineMax:
+    if recvFd(fd, addr b[0], 1, handshakeTimeout) != 1: return ""
+    if b[0] == '\L': return
+    result.add b[0]
+  return ""
+
+proc serveRaw(sh: var ProxyShared; fd: SocketHandle; target: string) =
+  ## One connection the netns bridge redirected here, `target` being
+  ## `<ip> <port>`, where it was going. The ip is a fake-IP the fence
+  ## DNS handed out: its name goes through the same decision as CONNECT
+  ## (HostList, then the permit set), so a rule withdrawn since the
+  ## answer was given is still enforced here. A bare ip is admitted
+  ## only by an address some allowed name resolved to; the policy's
+  ## default does not vouch for it, fail closed. Nothing is told to
+  ## the client: the dial happening, or the connection closing, is the
+  ## whole protocol.
+  let parts = target.splitWhitespace()
+  var ip: IpAddress
+  var port: uint16
+  var wellFormed = false
+  if parts.len == 2:
+    try:
+      ip = parseIpAddress(parts[0])
+      let p = parseUInt(parts[1])
+      if p <= 65535:
+        port = uint16(p)
+        wellFormed = true
+    except ValueError:
+      discard
+  if not wellFormed:
+    stderr.writeLine("sandwall proxy: DENY malformed raw target " &
+      target)
+    return
+  let name = sh.fakeName(ip)
+  var ips: seq[IpAddress]
+  if name.isSome:
+    let d = sh.admit(name.get, port)
+    if d.verdict != vAllowed: return   # admit logged the reason
+    ips = d.ips
+  else:
+    let e = sh.ps.matchIp(ip, port)
+    if e.isNone:
+      stderr.writeLine("sandwall proxy: DENY " & $ip & ":" & $port &
+                       " (raw, no allowed name stands for it)")
+      return
+    ips = sh.dialable(e.get)
+  var via: IpAddress
+  let up = dialUp(ips, port, addr via)
+  if up == osInvalidSocket:
+    stderr.writeLine("sandwall proxy: raw " & $ip & ":" & $port &
+                     " refused or unreachable")
+    return
+  if sh.verbose:
+    stderr.writeLine("sandwall proxy: raw " &
+      (if name.isSome: name.get else: $ip) & " fake=" & $ip &
+      " real=" & $via & ":" & $port)
+  splice(fd, up)
+  closeSock(up)
+
 proc serveClient(sh: var ProxyShared; fd: SocketHandle) =
   ## One client connection, already accepted. Peek the first byte to
-  ## pick the protocol: 0x05 is SOCKS5, anything else is parsed as an
-  ## HTTP request where only CONNECT is accepted.
+  ## pick the protocol: 0x05 is SOCKS5, `SWRAW ` is the netns bridge
+  ## naming a redirected connection's original destination, anything
+  ## else is parsed as an HTTP request where only CONNECT is accepted.
   try:
     var b: array[1, char]
     if recvFd(fd, addr b[0], 1, handshakeTimeout) != 1: return
     if b[0] == '\x05':
       serveSocks5(sh, fd, b[0])
-    else:
-      serveConnect(sh, fd, b[0])
+      return
+    var pre = $b[0]
+    if b[0] == rawPrefix[0]:
+      # as much of the prefix as matches, so a short non-match falls
+      # back to the HTTP parser with every byte it would have read
+      while pre.len < rawPrefix.len and rawPrefix.startsWith(pre):
+        if recvFd(fd, addr b[0], 1, handshakeTimeout) != 1: return
+        pre.add b[0]
+      if pre == rawPrefix:
+        serveRaw(sh, fd, readRawLine(fd, ""))
+        return
+    serveConnect(sh, fd, pre)
   except CatchableError:
     discard
   finally:
     closeSock(fd)
 
 proc clientThread(ca: ClientArg) {.thread.} =
-  ## Serve one accepted connection. Thread-per-connection: a kept-alive
-  ## tunnel (splice has no idle timeout, deliberately) must not starve
-  ## the next CONNECT behind it.
-  ca.sh[].serveClient(ca.fd)
+  ## Serve one accepted connection, or answer one DNS datagram.
+  ## Thread-per-request: a kept-alive tunnel (splice has no idle
+  ## timeout, deliberately) must not starve the next CONNECT behind it,
+  ## and a first resolution must not stall the accept loop.
+  when defined(posix):
+    if ca.dns: ca.sh[].dnsServe(ca.query, ca.peer, ca.peerLen)
+    else: ca.sh[].serveClient(ca.fd)
+  else:
+    ca.sh[].serveClient(ca.fd)
 
-proc serveAsync(sh: ptr ProxyShared; fd: SocketHandle) =
-  ## Hand an accepted connection to a fresh worker thread. The Thread
-  ## object lives on the shared heap, not this frame: the worker
-  ## thread's wrapper writes `thrd.core = nil` back through it AFTER
-  ## the client has been served, long past this proc's return
-  ## (stack-allocated, that write is a use-after-return that crashes
-  ## the worker). The handle is then deliberately leaked; it is ~40
-  ## bytes per connection on a per-run proxy. Detached, never joined.
+proc spawnWorker(sh: ptr ProxyShared; arg: ClientArg): bool =
+  ## Hand one request to a fresh worker thread. The Thread object
+  ## lives on the shared heap, not this frame: the worker thread's
+  ## wrapper writes `thrd.core = nil` back through it AFTER the client
+  ## has been served, long past this proc's return (stack-allocated,
+  ## that write is a use-after-return that crashes the worker). The
+  ## handle is then deliberately leaked; it is ~40 bytes per connection
+  ## on a per-run proxy. Detached, never joined. False when no thread
+  ## could be made, so the caller serves the request inline.
   let t = cast[ptr Thread[ClientArg]](allocShared0(sizeof(Thread[ClientArg])))
   try:
-    createThread(cast[var Thread[ClientArg]](t), clientThread,
-                 ClientArg(sh: sh, fd: fd))
+    createThread(cast[var Thread[ClientArg]](t), clientThread, arg)
     when defined(posix):
       discard pthread_detach(cast[Pthread](t.sys))
+    true
   except ResourceExhaustedError:
     deallocShared(t)
+    false
+
+proc serveAsync(sh: ptr ProxyShared; fd: SocketHandle) =
+  ## Hand an accepted connection to a fresh worker thread.
+  if not spawnWorker(sh, ClientArg(sh: sh, fd: fd)):
     sh[].serveClient(fd)
+
+when defined(posix):
+  proc serveDnsAsync(sh: ptr ProxyShared; query: string; peer: Sockaddr_un;
+                     peerLen: SockLen) =
+    ## Hand one DNS datagram to a fresh worker thread: the first
+    ## resolution of a name blocks as long as the resolver does, and
+    ## that must not hold up the accept loop.
+    if not spawnWorker(sh, ClientArg(sh: sh, dns: true, query: query,
+                                     peer: peer, peerLen: peerLen)):
+      sh[].dnsServe(query, peer, peerLen)
+
+  proc recvDns(sh: var ProxyShared) =
+    ## Take one datagram off the DNS listener and hand it to a worker.
+    var buf: array[DnsMaxPacket, char]
+    var peer: Sockaddr_un
+    var plen = SockLen(sizeof(peer))
+    let n = posix.recvfrom(sh.dnsFd, addr buf[0], buf.len, 0,
+                           cast[ptr SockAddr](addr peer), addr plen)
+    if n <= 0: return
+    var query = newString(n)
+    copyMem(addr query[0], addr buf[0], n)
+    (addr sh).serveDnsAsync(query, peer, plen)
 
 proc acceptThread(sh: ptr ProxyShared) {.thread.} =
   while sh.running:
     var listener = osInvalidSocket
     when defined(posix):
-      var pfds = newSeq[TPollfd](sh.listeners.len)
+      let hasDns = sh.dnsFd != osInvalidSocket
+      var pfds = newSeq[TPollfd](sh.listeners.len + 1)
       for i, l in sh.listeners:
         pfds[i] = TPollfd(fd: l.cint, events: POLLIN)
+      pfds[^1] = TPollfd(fd: if hasDns: sh.dnsFd.cint else: -1, events: POLLIN)
       if poll(addr pfds[0], pfds.len.Tnfds, 200) <= 0:
         continue   # timeout or error: re-check sh.running
-      for pfd in pfds:
+      if hasDns and (pfds[^1].revents and POLLIN) != 0:
+        sh[].maybeReload()
+        sh[].recvDns()
+      for pfd in pfds[0 ..< sh.listeners.len]:
         if (pfd.revents and POLLIN) != 0:
           listener = SocketHandle(pfd.fd)
           break
@@ -546,13 +754,34 @@ when defined(posix):
     # the sanctioned egress; the policy, not the file mode, is the ACL.
     discard chmod(path, 0o777)
 
+  proc listenUnixDgram(path: string): SocketHandle =
+    ## Bind the AF_UNIX datagram socket at `path`: the fence DNS's
+    ## listener, where the netns bridge's relay sends the child's
+    ## queries. Datagrams, not a stream: a query is self-contained and
+    ## needs no accept. Same file mode and ACL reasoning as listenUnix.
+    result = posix.socket(AF_UNIX, SOCK_DGRAM, 0)
+    if result == osInvalidSocket: raiseOSError(osLastError())
+    var sa: Sockaddr_un
+    sa.sun_family = TSa_Family(AF_UNIX)
+    if path.len >= sa.sun_path.len:
+      discard posix.close(result)
+      raise newException(ValueError, "sandwall proxy: unix socket path too long: " & path)
+    copyMem(addr sa.sun_path[0], cstring(path), path.len + 1)
+    removeFile(path)
+    if bindSocket(result, cast[ptr SockAddr](addr sa), SockLen(sizeof(sa))) != 0:
+      let e = osLastError()
+      discard posix.close(result)
+      raiseOSError(e)
+    discard chmod(path, 0o777)
+
 proc startProxyListeners(policyPath, projectDir: string; port: uint16;
                          unixSockPath: string; verbose: bool;
-                         permit: PermitSet): WallProxy =
+                         permit: PermitSet; dnsSockPath = ""): WallProxy =
   ## Shared body of the public startWallProxy variants: bind the TCP
-  ## loopback listener (plus a unix listener when unixSockPath is set),
-  ## load the policy, spawn the accept loop. A nil `permit` means the
-  ## proxy makes its own set and closes it in stopWallProxy.
+  ## loopback listener (plus a unix listener when unixSockPath is set,
+  ## and a unix datagram listener for the fence DNS when dnsSockPath is
+  ## set), load the policy, spawn the accept loop. A nil `permit` means
+  ## the proxy makes its own set and closes it in stopWallProxy.
   let sock = newSocket(buffered = false)
   sock.setSockOpt(OptReuseAddr, true)
   sock.bindAddr(Port(port), "127.0.0.1")
@@ -563,12 +792,17 @@ proc startProxyListeners(policyPath, projectDir: string; port: uint16;
                                    running: true,
                                    ps: if permit.isNil: newPermitSet()
                                        else: permit,
-                                   ownPermit: permit.isNil))
+                                   ownPermit: permit.isNil,
+                                   dnsFd: osInvalidSocket,
+                                   fakes: initFakePool()))
   p.sh.listeners.add(sock.getFd())
   when defined(posix):
     if unixSockPath.len > 0:
       p.sh.listeners.add(listenUnix(unixSockPath))
+    if dnsSockPath.len > 0:
+      p.sh.dnsFd = listenUnixDgram(dnsSockPath)
   initLock(p.sh.lock)
+  initLock(p.sh.fakeLock)
   p.sh.loadList()
   createThread(p.acceptThread, acceptThread, addr p.sh)
   result.sock = sock
@@ -607,15 +841,20 @@ proc startWallProxy*(policyPath: string; projectDir: string;
 
 proc startWallProxy*(policyPath: string; projectDir: string;
                      unixSockPath: string; port: uint16 = 0;
-                     verbose = false; permit: PermitSet = nil): WallProxy =
+                     verbose = false; permit: PermitSet = nil;
+                     dnsSockPath: string = ""): WallProxy =
   ## As startWallProxy, plus a second listener on the AF_UNIX socket at
   ## `unixSockPath`. A filesystem unix socket crosses netns boundaries,
   ## so this is how the unfenced parent offers the proxy to a fenced
   ## child (see wall/netns.nim). Same accept loop, family AF_UNIX; peer
   ## address checks are skipped (filesystem perms are the ACL). Same
   ## `permit` contract as the other overload.
+  ##
+  ## `dnsSockPath` (posix) adds the fence DNS: an AF_UNIX datagram
+  ## listener that answers the netns bridge's relay by policy with
+  ## stable fake-IPs, the Linux raw mode's resolver (wall/dns.nim).
   startProxyListeners(policyPath, projectDir, port, unixSockPath, verbose,
-                      permit)
+                      permit, dnsSockPath)
 
 when defined(posix):
   proc proxyChild(dir, policyPath, projectDir: string; sockFd: SocketHandle;
@@ -633,11 +872,16 @@ when defined(posix):
                                        verbose: verbose,
                                        running: true,
                                        ps: newPermitSet(),
-                                       ownPermit: true))
+                                       ownPermit: true,
+                                       dnsFd: osInvalidSocket,
+                                       fakes: initFakePool()))
     ctx.sh.listeners.add(sockFd)
     when defined(linux):
       ctx.sh.listeners.add(listenUnix(dir / "proxy.sock"))
+      # the raw path's resolver end (wall/netns.nim relays UDP 53 to it)
+      ctx.sh.dnsFd = listenUnixDgram(dir / "dns.sock")
     initLock(ctx.sh.lock)
+    initLock(ctx.sh.fakeLock)
     ctx.sh.loadList()
     var sa: Sockaddr_in
     var slen = SockLen(sizeof(sa))
@@ -649,16 +893,22 @@ when defined(posix):
     var ps = $port
     discard posix.write(portFd, addr ps[0], ps.len)
     discard posix.close(portFd)
+    let hasDns = ctx.sh.dnsFd != osInvalidSocket
     while true:
       var fds = @[TPollfd(fd: deathFd, events: POLLIN, revents: 0)]
       for l in ctx.sh.listeners:
         fds.add TPollfd(fd: l.cint, events: POLLIN, revents: 0)
+      fds.add TPollfd(fd: if hasDns: ctx.sh.dnsFd.cint else: -1, events: POLLIN)
       let r = poll(addr fds[0], fds.len.Tnfds, -1)
       if r < 0:
         if osLastError().cint == EINTR: continue
         break
       if fds[0].revents != 0: break   # command tree is gone
-      for i in 1 ..< fds.len:
+      let dnsAt = fds.len - 1
+      if hasDns and (fds[dnsAt].revents and POLLIN) != 0:
+        ctx.sh.maybeReload()
+        ctx.sh.recvDns()
+      for i in 1 ..< dnsAt:
         if (fds[i].revents and POLLIN) == 0: continue
         let fd = posix.accept(SocketHandle(fds[i].fd), nil, nil)
         if fd == osInvalidSocket:
@@ -756,6 +1006,8 @@ proc stopWallProxy*(p: var WallProxy) =
   if ctx != nil:
     if ctx.sh.ownPermit: ctx.sh.ps.close()
     deinitLock(ctx.sh.lock)
+    when defined(posix):
+      deinitLock(ctx.sh.fakeLock)
   p.acceptCtx = nil
 
 
