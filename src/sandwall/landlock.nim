@@ -18,11 +18,15 @@ when defined(linux):
 
   type AccessFds = distinct uint64
 
-  # Syscall numbers are stable on every Linux/Arch combination (UAPI).
+  # The Landlock syscall numbers are stable on every Linux/arch
+  # combination (they joined the unified table). Older calls are NOT:
+  # prctl is 157 on x86_64 but 167 on arm64/riscv, where 157 is setsid(2).
+  # Every arch-dependent call goes through libc instead.
   const
     sysLandlockCreateRuleset = 444
     sysLandlockAddRule = 445
     sysLandlockRestrictSelf = 446
+    PR_SET_NO_NEW_PRIVS = 38
 
     LANDLOCK_CREATE_RULESET_VERSION = 1.cuint
 
@@ -57,6 +61,9 @@ when defined(linux):
   proc syscall(n: clong): clong {.importc: "syscall", header: "<unistd.h>", varargs.}
   proc rawOpen(path: cstring, flags: cint): cint {.importc: "open", header: "<fcntl.h>".}
   proc rawClose(fd: cint): cint {.importc: "close", header: "<unistd.h>".}
+  {.push header: "<sys/prctl.h>".}
+  proc prctl(option: cint): cint {.importc: "prctl", varargs, discardable.}
+  {.pop.}
   template checkErrno(ctx: string) =
     let e = osLastError()
     raise newException(OSError,
@@ -224,16 +231,12 @@ when defined(linux):
     ## and inherited across unshare(2); apply()'s own call stays as a
     ## no-op re-set for direct backend users. Best effort: apply() still
     ## reports when the flag truly cannot be set.
-    const PR_SET_NO_NEW_PRIVS = 38
-    discard syscall(clong 157, PR_SET_NO_NEW_PRIVS.clong, 1.clong,
-                    0.clong, 0.clong, 0.clong)
+    discard prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
 
   proc apply(rs: var Ruleset) =
     if rs.fd < 0:
       raise newException(ValueError, "sandwall: ruleset already consumed")
-    const PR_SET_NO_NEW_PRIVS = 38
-    let p = syscall(clong 157, PR_SET_NO_NEW_PRIVS.clong, 1.clong,
-                    0.clong, 0.clong, 0.clong)
+    let p = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
     if p < 0: checkErrno("prctl(NO_NEW_PRIVS)")
     let r = syscall(clong sysLandlockRestrictSelf, rs.fd.clong, 0.cuint)
     if r < 0: checkErrno("restrict_self")

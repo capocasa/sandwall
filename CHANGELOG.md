@@ -3,6 +3,23 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.19] - 2026-11-25
+
+### Fixed
+
+- Linux: the Landlock layer sets NO_NEW_PRIVS through libc's `prctl`
+  instead of raw syscall 157. That number is prctl only on x86_64; on
+  arm64 it is `setsid(2)` (asm-generic numbers; prctl is 167 there), so
+  the flag was never set on arm64. A qemu-aarch64 probe shows the call
+  returning a fresh session id: the fenced command was silently
+  detached from its controlling terminal, and the next call failed with
+  EPERM, which is the "prctl(NO_NEW_PRIVS) failed (errno=1)" the arm64
+  CI runner has shown since the sandbox trio went chronic, and which
+  0.5.17's degrade now turns into "continuing WITHOUT landlock
+  confinement". The EPERM that 0.5.17 and 0.5.18 attributed to kernels
+  rejecting the prctl inside a fresh user namespace was this: mainline
+  kernels do not reject it.
+
 ## [0.5.18] - 2026-11-25
 
 ### Fixed

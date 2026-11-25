@@ -61,10 +61,11 @@ when defined(linux):
   proc setNoNewPrivsBestEffort*() =
     ## prctl(PR_SET_NO_NEW_PRIVS), ignoring failure: landlock's apply()
     ## sets the flag again and reports when it truly cannot be set. Set
-    ## BEFORE any unshare(2): the flag is inherited across the namespace
-    ## switch, and some kernels reject the prctl with EPERM once the
-    ## caller sits in a fresh user namespace (arm64 CI runners, observed
-    ## 2026-11), where a late set would crash or degrade the fence.
+    ## BEFORE any unshare(2): the flag is sticky and inherited across the
+    ## namespace switch, so landlock's own set is a no-op re-set there.
+    ## (The arm64 CI EPERM that motivated the early set was never prctl's:
+    ## landlock.nim issued the x86_64 syscall number, which is setsid(2)
+    ## on arm64.)
 
     const PR_SET_NO_NEW_PRIVS = 38
     discard prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
