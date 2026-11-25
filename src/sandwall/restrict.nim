@@ -194,6 +194,14 @@ proc restrict*(rules: openArray[Rule]; projectDir: string;
   if r.hosts.len == 0:
     restrict(r.writable, r.readonly, r.denied)
     return
+  when defined(macosx):
+    # No raw path here. Seatbelt's network filters take `*` or
+    # `localhost` as the host and refuse a literal address (the whole
+    # profile is rejected), so no address can be permitted for a run.
+    if raw:
+      raise newException(ValueError,
+        "sandwall: the raw path is not available on macOS (Seatbelt cannot " &
+        "permit single addresses); use the env path")
   when defined(posix):
     # The proxy is forked BEFORE any restriction: after restrict it
     # would inherit the fence, after exec the forking image is gone.

@@ -21,7 +21,9 @@ import ./wall/wfp
 export wfp.FirstProxyPort, wfp.LastProxyPort, wfp.validPortRange,
   wfp.sddlForUserSid, wfp.GUID, wfp.parseGuid, wfp.guidBytes,
   wfp.sublayerGuidText, wfp.permitV4GuidText,
-  wfp.blockV4GuidText, wfp.permitV6GuidText, wfp.blockV6GuidText
+  wfp.blockV4GuidText, wfp.permitV6GuidText, wfp.blockV6GuidText,
+  wfp.PermitFilter, wfp.permitFilters, wfp.MaxPermitFilters,
+  wfp.PermitStampError
 
 import ./wall/proxy
 export proxy
@@ -43,6 +45,7 @@ when defined(windows):
   export wfp.installFence, wfp.uninstallFence, wfp.fenceStatus,
     wfp.installAcFence, wfp.uninstallAcFence, wfp.acFenceStatus,
     wfp.exemptAcLoopback, wfp.unexemptAcLoopback,
-    wfp.wfpProbeMain
+    wfp.wfpProbeMain, wfp.PermitStamp, wfp.stampPermits, wfp.clearPermits,
+    wfp.grantPermitStamping, wfp.wfpStampProbeMain, wfp.dnsServers
   import ./wall/winuser
   export winuser
