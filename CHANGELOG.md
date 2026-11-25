@@ -3,6 +3,18 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.18] - 2026-11-25
+
+### Fixed
+
+- Linux: NO_NEW_PRIVS is now set inside ensureUserns, before the very
+  first unshare(2). 0.5.17 set it at the top of restrict(), but the
+  device-mask and rule-file paths enter the user namespace before that
+  point, so the flag was still set too late on kernels that reject
+  prctl(PR_SET_NO_NEW_PRIVS) inside a fresh user namespace (arm64 CI
+  runners). Every unshare funnels through ensureUserns, so this covers
+  the netns fence, the deny masks and the mount namespace alike.
+
 ## [0.5.17] - 2026-11-25
 
 ### Fixed

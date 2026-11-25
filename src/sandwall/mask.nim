@@ -56,6 +56,19 @@ when defined(linux):
   proc writeIdMap(path: string; outer: int) =
     writeProc(path, $outer & " " & $outer & " 1\n")
 
+  proc prctl(option: cint): cint {.importc: "prctl", varargs, discardable.}
+
+  proc setNoNewPrivsBestEffort*() =
+    ## prctl(PR_SET_NO_NEW_PRIVS), ignoring failure: landlock's apply()
+    ## sets the flag again and reports when it truly cannot be set. Set
+    ## BEFORE any unshare(2): the flag is inherited across the namespace
+    ## switch, and some kernels reject the prctl with EPERM once the
+    ## caller sits in a fresh user namespace (arm64 CI runners, observed
+    ## 2026-11), where a late set would crash or degrade the fence.
+
+    const PR_SET_NO_NEW_PRIVS = 38
+    discard prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+
   proc ensureUserns*(extraFlags: cint = 0) =
     ## Enter our uid-mapped user+mount namespace (plus `extraFlags` such as
     ## CLONE_NEWNET), exactly once per process. No-op on repeat calls: the
@@ -64,6 +77,7 @@ when defined(linux):
     ## first restriction. Raises OSError when unprivileged user namespaces
     ## are unavailable; callers decide whether that is fatal.
     if inUserns: return
+    setNoNewPrivsBestEffort()
     # Read the ids BEFORE the unshare: inside the fresh namespace they
     # show as the unmapped overflow (65534) until a map exists, and a
     # mapping write naming 65534 is rejected for any other outer id -
