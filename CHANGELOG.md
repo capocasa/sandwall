@@ -37,8 +37,17 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
   refusal). `setup --stamp-as ACCOUNT` (elevated) grants the spawning
   account the right to add and remove its own filters, and
   `wfp-stamp-probe` (unelevated, as that account) checks the grant.
-  Compile-verified only so far: neither the grant nor the stamping has
-  run on a Windows host.
+  Run on a Windows 11 host (26100): the grant is honored for a standard
+  user (`wfp-stamp-probe` exits 0 there, 1 without the grant), a raw run
+  reached its permitted address and no other, and names resolve inside
+  the fence. Two defects surfaced and are fixed: the permit filters'
+  descriptor named Administrators as owner, which an unelevated spawner
+  cannot assign (the add failed with 1307), so `permitFilterSddl` makes
+  the caller the owner; and `dnsServers` read `GetNetworkParams`'
+  FIXED_INFO 8 bytes off the header's layout (132-byte name fields, the
+  list at 272) and crashed, now `dnsServersIn` with a test. The CLI no
+  longer says the fence is not installed when an unelevated process
+  merely cannot read the engine.
 - `hosts.hasWildcardAllow`, `hosts.winningPorts`, `hosts.allowsAnyPort`;
   the fence DNS decision, where a port-restricted allow keeps the name
   resolvable.

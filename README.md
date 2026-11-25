@@ -162,9 +162,16 @@ names an exact host:
   at once see the union of their permits (same sandbox user). The
   spawning account resolves through the system resolver, so names leak
   there where Linux leaks none. Past 512 address/port pairs a run takes
-  the env path. **Unverified on Windows hardware at the time of
-  writing**; `sandwall wfp-stamp-probe`, run unelevated as the spawning
-  account after the grant, is the gate probe.
+  the env path. `sandwall wfp-stamp-probe`, run unelevated as the
+  spawning account after the grant, is the gate probe. **Run on a
+  Windows 11 host (26100)**: with the grant the unelevated spawner
+  stamps and removes a permit (the probe exits 0; without the grant it
+  exits 1, access denied), a raw run reached its permitted address and
+  no other, and names resolved inside the fence. That run fixed two
+  defects here: permit filters owned by Administrators, which an
+  unelevated spawner cannot assign (1307), and the resolver list read 8
+  bytes off `GetNetworkParams`' layout (a crash). Only the standalone
+  CLI ran; a consumer's own launch has not.
 - **macOS has no raw path.** Seatbelt's `(remote ip "host:port")`
   accepts `*` or `localhost` only, so a literal address cannot be
   permitted; `restrict(rules, raw = true)` raises there.
