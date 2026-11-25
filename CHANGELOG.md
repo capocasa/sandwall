@@ -5,6 +5,57 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.5.19] - 2026-11-25
 
+### Added
+
+- Linux: the raw egress path. `restrict(..., raw = true, dnsSockPath =
+  ...)` puts up a fence DNS that answers A queries for policy-allowed
+  names with a stable synthetic address from 198.18.0.0/15 and refuses
+  the rest, routes the pool, loads an nft redirect of every non-loopback
+  TCP connection onto a raw forwarder listener (SO_ORIGINAL_DST, `SWRAW
+  <ip> <port>`), and binds a `/etc/resolv.conf` pointing at a DNS relay
+  over inside the namespace. The forwarder maps the synthetic address
+  back to its name and checks the rule again at connect time; nothing in
+  the fence ever learns a real address. `startWallProxy` gained
+  `dnsSockPath` for the fence DNS listener; `RawUnavailableError`,
+  `RawMarker` and `RawFallbackExit` (75) are the fallback contract; the
+  standalone CLI tries raw first when `nft` is around and re-runs env
+  mode on the marker. (`wall/netns.nim`, `wall/dns.nim`,
+  `wall/proxy.nim`)
+- `wall/permit.nim`: a permit set, hostname rules as resolved address
+  sets with a fixed refresh (not DNS TTL), a previous-generation grace
+  period and single-flight lookups: `seedFromPolicy`, `refreshForSpawn`,
+  `snapshot`, `writeSnapshot`, `readSnapshot`, `matchIp`, `liveAddresses`,
+  `canStamp`. The proxy decides names through it (`getOrResolve`) and
+  bare IPs through `matchIp` plus the policy's own decision about the
+  literal, so an open policy keeps admitting them on the env path.
+- Windows: per-run permit filters. `wfp.stampPermits` adds one WFP PERMIT
+  filter per (address, port) of a snapshot in a dynamic engine session,
+  keyed on the sandwall user's SID, so a raw child connects straight out
+  with no proxy env; `runSandboxed(..., permits = snapshot)` stamps
+  before restricting or spawning and raises `PermitStampError` with
+  nothing stamped when it cannot (more than 512 pairs, or any engine
+  refusal). `setup --stamp-as ACCOUNT` (elevated) grants the spawning
+  account the right to add and remove its own filters, and
+  `wfp-stamp-probe` (unelevated, as that account) checks the grant.
+  Compile-verified only so far: neither the grant nor the stamping has
+  run on a Windows host.
+- `hosts.hasWildcardAllow`, `hosts.winningPorts`, `hosts.allowsAnyPort`;
+  the fence DNS decision, where a port-restricted allow keeps the name
+  resolvable.
+
+### Changed
+
+- The raw path is fail-closed for bare addresses: `matchIp` only, the
+  policy default does not vouch for a literal, so an open policy denies
+  `ssh 1.2.3.4` in raw mode where the env path admitted it. Name the host
+  or allow the address.
+- macOS: `restrict(rules, raw = true)` raises instead of silently running
+  env mode. Seatbelt's `(remote ip "host:port")` accepts `*` or
+  `localhost` only, so there is no per-address permit to stamp; macOS
+  stays on the proxy env path.
+- The CLI's "fence not installed" warning checks the dedicated-user
+  fence (`fenceStatus`), not the legacy AppContainer one.
+
 ### Fixed
 
 - Linux: the Landlock layer sets NO_NEW_PRIVS through libc's `prctl`

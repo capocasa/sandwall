@@ -30,9 +30,9 @@ skip the policy layer.
 
 | Platform | Filesystem | Network fence |
 |----------|-----------|-------------|
-| Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy |
+| Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy; raw: fence DNS + nft redirect, no proxy env |
 | macOS | Seatbelt `sandbox_init_with_parameters` | Seatbelt loopback-only + allowlist proxy |
-| Windows | Dedicated local user + DACL grants | WFP fence (after `sandwall setup`): loopback-only + allowlist proxy; without setup: open + warning |
+| Windows | Dedicated local user + DACL grants | WFP fence (after `sandwall setup`): loopback-only + allowlist proxy; raw (after `setup --stamp-as`, exact rules): per-run permits; without setup: open + warning |
 
 The Linux and macOS backends confine the calling thread via kernel hooks
 (Landlock domains, Seatbelt profiles). The Windows backend has no single
@@ -125,6 +125,58 @@ export GIT_SSH_COMMAND="ssh -o ProxyCommand='sandwall connect %h %p'"
 
 (Setting that variable is the consumer's job, sandwall only provides the
 adapter.)
+
+### Raw egress (Linux, Windows)
+
+The env path above needs every tool to honor proxy variables, or an
+adapter. The raw path needs neither: the child connects as it would
+outside the fence and the kernel carries it, so plain `ssh`, `scp`,
+`telnet` and proxy-unaware libraries work. `sandwall` tries it first on
+Linux when `nft` is installed, and on Windows when every `allow` rule
+names an exact host:
+
+- **Linux.** A fence DNS answers A queries for allowed names with a stable
+  synthetic address from `198.18.0.0/15` and refuses the rest; `nft`
+  redirects every non-loopback TCP connection onto the forwarder, which
+  maps the synthetic address back to the name and checks the rule again
+  at connect time. Nothing inside the fence ever learns a real address
+  and a denied name does not resolve. Loopback is not redirected, so the
+  child's own services keep working and the host's do not. When the fence
+  cannot be put up (no user namespace, `nft` fails to load, a dangling
+  `resolv.conf` symlink) the child exits 75 with `sandwall: raw
+  unavailable, retrying env` on stderr before running anything, and
+  `sandwall` re-runs the command on the env path. Library users get the
+  same contract: `restrict(..., raw = true, dnsSockPath = ...)` raises
+  `RawUnavailableError` with nothing half applied.
+- **Windows.** The forwarder seeds a permit set from the policy's exact
+  allow rules (a snapshot the consumer hands over with
+  `runSandboxed(..., permits = ...)`), and the kernel learns those
+  addresses as per-run WFP permit filters, so the child connects
+  straight out. Two gates: `sandwall setup --stamp-as ACCOUNT` (elevated)
+  must have granted the spawning account the right to add and remove its
+  own filters, and the policy must be exact. A wildcard allow admits
+  names no snapshot can enumerate, a deny-only policy has nothing to
+  stamp; both take the env path, as does a refused stamp
+  (`PermitStampError`, nothing stamped). Permits are addresses: a denied
+  name sharing an address with an allowed one is reachable, and two runs
+  at once see the union of their permits (same sandbox user). The
+  spawning account resolves through the system resolver, so names leak
+  there where Linux leaks none. Past 512 address/port pairs a run takes
+  the env path. **Unverified on Windows hardware at the time of
+  writing**; `sandwall wfp-stamp-probe`, run unelevated as the spawning
+  account after the grant, is the gate probe.
+- **macOS has no raw path.** Seatbelt's `(remote ip "host:port")`
+  accepts `*` or `localhost` only, so a literal address cannot be
+  permitted; `restrict(rules, raw = true)` raises there.
+
+Addresses come from a permit set refreshed on a fixed interval (the
+system resolver reports no TTL), with the previous set kept for a grace
+period so a failover between two commands is covered; nothing is repaired
+mid-command. A bare address is admitted on the raw path only when an
+allowed name resolved to it: `matchIp` decides, the policy default does
+not vouch for a literal, so an open policy denies `ssh 1.2.3.4` in raw
+mode where the env path admitted it. Name the host, or allow the
+address.
 
 ## The policy file
 
