@@ -35,11 +35,18 @@
 ## environment. Pure helpers (SDDL, GUID bytes, port validation) run
 ## on Linux; the FFI half is checked with the mingw cross compiler.
 
-import std/[os, strutils]
+import std/[algorithm, net, os, strutils]
+import ./permit
 
 const
   FirstProxyPort* = 60080'u16
   LastProxyPort* = 60089'u16
+
+  MaxPermitFilters* = 512
+    ## Permits one run may stamp (wall/permit.nim snapshot -> filters).
+    ## Past it a run goes through the forwarder (env mode) with a log
+    ## line: BFE takes more, one RPC each, and a spawn should not pay
+    ## for a large policy.
 
 # Fixed GUIDs for sublayer / filters, generated once and hardcoded so
 # a second install finds the first one's objects.
@@ -102,9 +109,57 @@ proc sddlForUserSid*(sid: string): string =
   ## connecting token's user against this descriptor.
   "O:LSG:LSD:(A;;CC;;;" & sid & ")"
 
+type
+  PermitFilter* = object
+    ## One permit: `ip` on `port`, for the sandbox user only. Port 0
+    ## is every port (no port condition).
+    ip*: IpAddress
+    port*: uint16
+
+  PermitStampError* = object of OSError
+    ## `stampPermits` could not stamp, and stamped nothing: over the
+    ## cap, or BFE refused the unelevated session (no setup grant for
+    ## this account). Not a spawn failure: the caller runs the command
+    ## through the forwarder instead (env mode).
+
+proc permitFilters*(entries: openArray[PermitEntry]; now: float): seq[PermitFilter] =
+  ## The (address, port) pairs a spawn may stamp for `entries` at
+  ## `now`: both generations within their grace (permit.liveAddresses),
+  ## deduplicated and sorted, so the same snapshot always stamps the
+  ## same list. `entries` is the caller's own copy (a snapshot).
+  for e in entries:
+    for ip in e.liveAddresses(now):
+      for p in e.ports:
+        let f = PermitFilter(ip: ip, port: p)
+        if f notin result: result.add f
+  result.sort(proc (a, b: PermitFilter): int =
+    result = cmp($a.ip, $b.ip)
+    if result == 0: result = cmp(a.port, b.port))
+
+proc permitKey*(runId: uint64; index: int): GUID =
+  ## The filter key of the `index`th permit of a run: two 64-bit mixes
+  ## (splitmix64) of `runId` and `index`. A run's keys share nothing
+  ## with another run's (BFE refuses a duplicate key), and the same
+  ## run stamps the same keys twice.
+  template mix(x: var uint64) =
+    inc x, 0x9E3779B97F4A7C15'u64
+    var z = x
+    z = (z xor (z shr 30)) * 0xBF58476D1CE4E5B9'u64
+    z = (z xor (z shr 27)) * 0x94D049BB133111EB'u64
+    x = z xor (z shr 31)
+  var h = runId xor (index.uint64 + 1) * 0x9E3779B97F4A7C15'u64
+  mix(h)
+  let a = h
+  mix(h)
+  result.data1 = uint32(a and 0xFFFFFFFF'u64)
+  result.data2 = uint16((a shr 32) and 0xFFFF'u64)
+  result.data3 = uint16((a shr 48) and 0xFFFF'u64)
+  for i in 0 ..< 8:
+    result.data4[i] = uint8((h shr (8 * i)) and 0xFF'u64)
+
 when defined(windows):
   import std/winlean except PSID
-  import std/[widestrs, net, nativesockets, osproc]
+  import std/[widestrs, nativesockets, osproc, times]
   import ./winffi
   export winffi.PSID
 
@@ -254,6 +309,14 @@ when defined(windows):
     FWP_ACTION_BLOCK = 0x00001001'u32
     FWP_ACTION_PERMIT = 0x00001002'u32
 
+    # per-run permits (fwpmu.h / winnt.h)
+    FWPM_SESSION_FLAG_DYNAMIC = 0x00000001'u32
+      ## the session's objects die with the session, process exit included
+    DACL_SECURITY_INFORMATION = 0x00000004'u32
+    FWPM_ACTRL_ADD = 0x00000001'u32        ## add an object to its container
+    FWPM_ACTRL_ADD_LINK = 0x00000002'u32   ## reference a layer or sublayer
+    DELETE_ACCESS = 0x00010000'u32         ## what FwpmFilterDeleteById0 checks
+
     RPC_C_AUTHN_DEFAULT = 0xFFFFFFFF'u32  # FWPM_SESSION0.authnService
 
     # persistence (fwpmu.h): without these flags objects are static,
@@ -327,6 +390,37 @@ when defined(windows):
       filter: ptr ptr FWPM_FILTER0): DWORD {.stdcall, dynlib: "fwpuclnt",
       importc: "FwpmFilterGetByKey0".}
 
+  # security descriptors of the WFP objects (a NULL or all-zero key is
+  # the object's container, e.g. the filters container)
+  proc fwpmFilterGetSecurityInfoByKey0(engineHandle: Handle; key: ptr GUID;
+      securityInfo: uint32; sidOwner, sidGroup, dacl, sacl: ptr pointer;
+      sd: ptr pointer): DWORD {.stdcall, dynlib: "fwpuclnt",
+      importc: "FwpmFilterGetSecurityInfoByKey0".}
+  proc fwpmFilterSetSecurityInfoByKey0(engineHandle: Handle; key: ptr GUID;
+      securityInfo: uint32; sidOwner, sidGroup, dacl, sacl: pointer): DWORD {.
+      stdcall, dynlib: "fwpuclnt", importc: "FwpmFilterSetSecurityInfoByKey0".}
+  proc fwpmLayerGetSecurityInfoByKey0(engineHandle: Handle; key: ptr GUID;
+      securityInfo: uint32; sidOwner, sidGroup, dacl, sacl: ptr pointer;
+      sd: ptr pointer): DWORD {.stdcall, dynlib: "fwpuclnt",
+      importc: "FwpmLayerGetSecurityInfoByKey0".}
+  proc fwpmLayerSetSecurityInfoByKey0(engineHandle: Handle; key: ptr GUID;
+      securityInfo: uint32; sidOwner, sidGroup, dacl, sacl: pointer): DWORD {.
+      stdcall, dynlib: "fwpuclnt", importc: "FwpmLayerSetSecurityInfoByKey0".}
+  proc fwpmSubLayerGetSecurityInfoByKey0(engineHandle: Handle; key: ptr GUID;
+      securityInfo: uint32; sidOwner, sidGroup, dacl, sacl: ptr pointer;
+      sd: ptr pointer): DWORD {.stdcall, dynlib: "fwpuclnt",
+      importc: "FwpmSubLayerGetSecurityInfoByKey0".}
+  proc fwpmSubLayerSetSecurityInfoByKey0(engineHandle: Handle; key: ptr GUID;
+      securityInfo: uint32; sidOwner, sidGroup, dacl, sacl: pointer): DWORD {.
+      stdcall, dynlib: "fwpuclnt", importc: "FwpmSubLayerSetSecurityInfoByKey0".}
+  proc convertSecurityDescriptorToStringSecurityDescriptorW(sd: pointer;
+      revision: uint32; securityInfo: uint32; sddl: ptr WideCString;
+      sddlLen: ptr uint32): WINBOOL {.stdcall, dynlib: "advapi32", importc:
+      "ConvertSecurityDescriptorToStringSecurityDescriptorW".}
+  proc getSecurityDescriptorDacl(sd: pointer; present: ptr WINBOOL;
+      dacl: ptr pointer; defaulted: ptr WINBOOL): WINBOOL {.stdcall,
+      dynlib: "advapi32", importc: "GetSecurityDescriptorDacl".}
+
 
 
   proc allocWide(s: string): ptr UncheckedArray[Utf16Char] =
@@ -350,12 +444,12 @@ when defined(windows):
     raise newException(OSError, "sandwall wfp: " & what &
       " failed (" & named & ")")
 
-  proc openEngine*(name: string; denied: var bool): Handle =
-    ## Open the BFE engine with a display name. `denied` is set (and
-    ## 0 returned) on ERROR_ACCESS_DENIED: status probes report it as
-    ## a hint instead of raising, every other caller lets it raise.
+  proc openEngineFlags(name: string; flags: uint32; denied: var bool): Handle =
+    ## `flags` goes into FWPM_SESSION0.flags verbatim (0, or
+    ## FWPM_SESSION_FLAG_DYNAMIC for the per-run permits).
     var session: FWPM_SESSION0
     zeroMem(addr session, sizeof(session))
+    session.flags = flags
     let w = allocWide(name)
     session.displayData.name = w
     session.displayData.description = w
@@ -363,6 +457,12 @@ when defined(windows):
       addr session, addr result)
     denied = rc == DWORD(ERROR_ACCESS_DENIED)
     if rc != 0 and not denied: fail("FwpmEngineOpen0", rc)
+
+  proc openEngine*(name: string; denied: var bool): Handle =
+    ## Open the BFE engine with a display name. `denied` is set (and
+    ## 0 returned) on ERROR_ACCESS_DENIED: status probes report it as
+    ## a hint instead of raising, every other caller lets it raise.
+    openEngineFlags(name, 0, denied)
 
   proc openEngine(name: string): Handle =
     var denied: bool
@@ -468,8 +568,13 @@ when defined(windows):
 
   proc addFilter(engine: Handle; key: GUID; name: ptr UncheckedArray[Utf16Char];
       layer: GUID; actionType: uint32;
-      conditions: openArray[FWPM_FILTER_CONDITION0]) =
-    ## Build FWPM_FILTER0 in Nim and call FwpmFilterAdd0 directly.
+      conditions: openArray[FWPM_FILTER_CONDITION0];
+      flags: uint32 = FWPM_FILTER_FLAG_PERSISTENT;
+      sd: pointer = nil): uint64 =
+    ## Build FWPM_FILTER0 in Nim and call FwpmFilterAdd0 directly;
+    ## returns the runtime id. The per-run permits pass flags 0 in a
+    ## dynamic session, and the descriptor that lets their adder
+    ## delete them.
     ## Every string embedded in the struct comes from allocWide (raw
     ## alloc, not GC) and every condition value's storage is a caller
     ## stack local that outlives this call - the two invariants that
@@ -480,7 +585,7 @@ when defined(windows):
     var filt: FWPM_FILTER0
     zeroMem(addr filt, sizeof(filt))
     filt.filterKey = key
-    filt.flags = FWPM_FILTER_FLAG_PERSISTENT
+    filt.flags = flags
     filt.layerKey = layer
     filt.subLayerKey = sublayerKey
     filt.displayData.name = name
@@ -496,8 +601,9 @@ when defined(windows):
       else: nil
     filt.action.actionType = actionType
     var id: uint64
-    let rc = fwpmFilterAdd0(engine, addr filt, nil, addr id)
+    let rc = fwpmFilterAdd0(engine, addr filt, sd, addr id)
     if rc != 0: fail("FwpmFilterAdd0", rc)
+    id
 
   proc installFence*(userSid: string; firstPort, lastPort: uint16) =
     ## Idempotent install: provider + sublayer (tolerate existing),
@@ -540,15 +646,15 @@ when defined(windows):
     # v4/v6 permit (loopback + port range), then the block (user SID).
     let permitV4 = [condV4Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v4am),
                     portCond]
-    addFilter(engine, permitV4Key, allocWide("sandwall-permit-v4"),
+    discard addFilter(engine, permitV4Key, allocWide("sandwall-permit-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_PERMIT, permitV4)
-    addFilter(engine, blockV4Key, allocWide("sandwall-block-v4"),
+    discard addFilter(engine, blockV4Key, allocWide("sandwall-block-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_BLOCK, blockCond)
     let permitV6 = [condV6Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr loopback6),
                     portCond]
-    addFilter(engine, permitV6Key, allocWide("sandwall-permit-v6"),
+    discard addFilter(engine, permitV6Key, allocWide("sandwall-permit-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_PERMIT, permitV6)
-    addFilter(engine, blockV6Key, allocWide("sandwall-block-v6"),
+    discard addFilter(engine, blockV6Key, allocWide("sandwall-block-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallFence*() =
@@ -654,15 +760,15 @@ when defined(windows):
     let pkgSid = condSid(FWPM_CONDITION_ALE_PACKAGE_ID, acSid)
 
     let permitV4 = [pkgSid, condV4Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v4am)]
-    addFilter(engine, parseGuid(acPermitV4GuidText), allocWide("sandwall-ac-permit-v4"),
+    discard addFilter(engine, parseGuid(acPermitV4GuidText), allocWide("sandwall-ac-permit-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_PERMIT, permitV4)
     let blockCond = [pkgSid]
-    addFilter(engine, parseGuid(acBlockV4GuidText), allocWide("sandwall-ac-block-v4"),
+    discard addFilter(engine, parseGuid(acBlockV4GuidText), allocWide("sandwall-ac-block-v4"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_BLOCK, blockCond)
     let permitV6 = [pkgSid, condV6Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr loopback6)]
-    addFilter(engine, parseGuid(acPermitV6GuidText), allocWide("sandwall-ac-permit-v6"),
+    discard addFilter(engine, parseGuid(acPermitV6GuidText), allocWide("sandwall-ac-permit-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_PERMIT, permitV6)
-    addFilter(engine, parseGuid(acBlockV6GuidText), allocWide("sandwall-ac-block-v6"),
+    discard addFilter(engine, parseGuid(acBlockV6GuidText), allocWide("sandwall-ac-block-v6"),
       FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_BLOCK, blockCond)
 
   proc uninstallAcFence*() =
@@ -711,3 +817,321 @@ when defined(windows):
         fail("FwpmFilterGetByKey0", grc)
 
     (found == 4, found, "")
+
+  # --- per-run permits ---------------------------------------------
+  # The forwarder decides by name. A child that connects directly has
+  # no forwarder, so the kernel has to know its addresses when the
+  # child is spawned: one PERMIT filter per (address, port), for the
+  # sandbox user only, added by the spawning process before the spawn
+  # and gone when the run ends.
+  #
+  # All of it unelevated, which is the gate the plan calls the
+  # elevation probe. BFE applies the standard access model per object
+  # (WFP "Access control"): FwpmFilterAdd0 wants FWPM_ACTRL_ADD on the
+  # filters container and FWPM_ACTRL_ADD_LINK on the layer and the
+  # sublayer, FwpmFilterDeleteById0 DELETE on the filter. The default
+  # descriptors give a standard user none of that (taviso's probe in
+  # henrypp/simplewall#680: the add fails with 5 until a descriptor
+  # admits it), and `grantPermitStamping` is the elevated half that
+  # admits the spawning account. Compile-verified only: whether BFE
+  # honors the grant for a standard user is `sandwall wfp-stamp-probe`'s
+  # question on a Windows host.
+  #
+  # Nothing outlives the run. The filters go in through a dynamic
+  # session, so BFE deletes them itself when the session ends, a crash
+  # included: no handle file, no dead-pid sweep (an unelevated session
+  # cannot enumerate to sweep with), and no way for a denied remove to
+  # leave a permit behind. `clearPermits` only makes the removal prompt.
+  #
+  # Concurrent fenced runs share the permit union: every filter is for
+  # the same user SID, so one run's permits admit the other runs'
+  # addresses too. Documented, not isolated.
+
+  type
+    PermitStamp* = object
+      ## One run's permits: the dynamic engine session that owns them
+      ## and their runtime ids. The default value is "nothing stamped".
+      engine: Handle
+      ids: seq[uint64]
+
+    WfpObject = enum
+      woFilterContainer, woLayerV4, woLayerV6, woSublayer
+
+  proc openEngineDynamic(name: string): Handle =
+    var denied: bool
+    result = openEngineFlags(name, FWPM_SESSION_FLAG_DYNAMIC, denied)
+    if denied: fail("FwpmEngineOpen0", DWORD(ERROR_ACCESS_DENIED))
+
+  proc newRunId(): uint64 =
+    ## The seed of a run's filter keys: the clock and the pid, mixed.
+    ## Uniqueness among live filters is all that is needed.
+    uint64(epochTime() * 1_000_000) xor
+      (getCurrentProcessId().uint64 * 0x9E3779B97F4A7C15'u64)
+
+  proc v4AsUint32(ip: IpAddress): uint32 =
+    ## The address as the big-endian number FWP_V4_ADDR_AND_MASK
+    ## takes (the loopback permit's 0x7F000000 is 127.0.0.0).
+    (ip.address_v4[0].uint32 shl 24) or (ip.address_v4[1].uint32 shl 16) or
+      (ip.address_v4[2].uint32 shl 8) or ip.address_v4[3].uint32
+
+  proc addPermit(engine: Handle; key: GUID; label: string;
+                 userSd: ptr FWP_BYTE_BLOB; filterSd: pointer;
+                 ip: IpAddress; port: uint16): uint64 =
+    ## One PERMIT filter: the sandbox user (the same ALE_USER_ID
+    ## condition the block uses), the remote address, and the remote
+    ## port unless `port` is 0. Two or three conditions against the
+    ## block's one, so BFE's automatic weight ranks it above the
+    ## block, exactly as the loopback permits do.
+    var
+      rng: FWP_RANGE0
+      v4: FWP_V4_ADDR_AND_MASK
+      v6: FWP_V6_ADDR_AND_MASK
+    var conds: array[3, FWPM_FILTER_CONDITION0]
+    var n = 0
+    conds[n] = condSd(FWPM_CONDITION_ALE_USER_ID, userSd); inc n
+    var layer: GUID
+    if ip.family == IpAddressFamily.IPv4:
+      v4 = FWP_V4_ADDR_AND_MASK(addr4: v4AsUint32(ip), mask: 0xFFFFFFFF'u32)
+      conds[n] = condV4Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v4); inc n
+      layer = FWPM_LAYER_ALE_AUTH_CONNECT_V4
+    else:
+      for i in 0 ..< 16: v6.v6addr[i] = ip.address_v6[i]
+      v6.prefixLength = 128
+      conds[n] = condV6Mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, addr v6); inc n
+      layer = FWPM_LAYER_ALE_AUTH_CONNECT_V6
+    if port != 0:
+      rng = FWP_RANGE0(valueLow: FWP_VALUE0(kind: FWP_UINT16),
+                        valueHigh: FWP_VALUE0(kind: FWP_UINT16))
+      rng.valueLow.data.uint16Value = port
+      rng.valueHigh.data.uint16Value = port
+      conds[n] = condRangePort(FWPM_CONDITION_IP_REMOTE_PORT, addr rng); inc n
+    let name = allocWide(label)
+    defer: dealloc(name)
+    addFilter(engine, key, name, layer, FWP_ACTION_PERMIT,
+      conds.toOpenArray(0, n - 1), flags = 0, sd = filterSd)
+
+  proc stampAll(s: var PermitStamp; userSid: string;
+                 work: seq[PermitFilter])
+
+  proc stampPermits*(userSid: string; filters: openArray[PermitFilter];
+                     resolvers: openArray[IpAddress] = []): PermitStamp =
+    ## Stamp `filters` (`permitFilters` of a snapshot) for the sandbox
+    ## user `userSid`, before the spawn, and hand back the handle
+    ## `clearPermits` closes. `resolvers` adds each address on port
+    ## 53: a child that connects directly must resolve through the
+    ## system resolver (`dnsServers`), a name channel the fence
+    ## cannot read. Raises PermitStampError with nothing left stamped:
+    ## over `MaxPermitFilters` before the engine is touched; on any BFE
+    ## refusal the session is ended, which drops what was added so
+    ## far. A standard user refused (error 5) means no setup grant for
+    ## this account: the caller then runs the command through the
+    ## forwarder (env mode) instead.
+    var work: seq[PermitFilter]
+    for f in filters: work.add f
+    for r in resolvers: work.add PermitFilter(ip: r, port: 53)
+    if work.len > MaxPermitFilters:
+      raise newException(PermitStampError, "sandwall wfp: " & $work.len &
+        " permit filters is more than the " & $MaxPermitFilters &
+        " a run may stamp")
+    if work.len == 0: return
+    var refusal = ""
+    try:
+      stampAll(result, userSid, work)
+    except OSError as e:
+      refusal = e.msg
+    if refusal.len > 0:
+      raise newException(PermitStampError, refusal)
+
+  proc stampAll(s: var PermitStamp; userSid: string;
+                 work: seq[PermitFilter]) =
+    ## The engine half of `stampPermits`: the descriptors, the dynamic
+    ## session, one filter per pair. A refused add ends the session,
+    ## which drops what it added so far; the caller reports it as
+    ## PermitStampError.
+    # The user condition, as the fence's block builds it.
+    var userSdRaw: pointer
+    var userSdSize: DWORD
+    let sddl = allocWide(sddlForUserSid(userSid))
+    if convertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1,
+        addr userSdRaw, addr userSdSize) == 0:
+      fail("ConvertStringSecurityDescriptorToSecurityDescriptorW(user)",
+        DWORD(getLastError()))
+    defer: localFree(userSdRaw)
+    var userBlob = FWP_BYTE_BLOB(size: uint32(userSdSize),
+      data: cast[ptr uint8](userSdRaw))
+    # The filters' own descriptor. The default one would let this
+    # process only classify and open them: DELETE goes to the caller's
+    # user by name, so the removal below is its own.
+    let me = currentUserSid()
+    if me.len == 0:
+      raise newException(OSError,
+        "sandwall wfp: the calling process has no user SID")
+    var filterSdRaw: pointer
+    let fsddl = allocWide("O:BAG:BAD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x" &
+      toHex(DELETE_ACCESS.BiggestInt, 8) & ";;;" & me & ")")
+    if convertStringSecurityDescriptorToSecurityDescriptorW(fsddl, 1,
+        addr filterSdRaw, nil) == 0:
+      fail("ConvertStringSecurityDescriptorToSecurityDescriptorW(filters)",
+        DWORD(getLastError()))
+    defer: localFree(filterSdRaw)
+    s.engine = openEngineDynamic("sandwall-permits")
+    let runId = newRunId()
+    try:
+      for i, f in work:
+        s.ids.add addPermit(s.engine, permitKey(runId, i),
+          "sandwall-permit " & $f.ip & ":" & $f.port,
+          addr userBlob, filterSdRaw, f.ip, f.port)
+    except CatchableError:
+      discard fwpmEngineClose0(s.engine)
+      s = PermitStamp()
+      raise
+
+  proc clearPermits*(s: var PermitStamp) =
+    ## End the run's permits: delete the filters by id (prompt; a
+    ## refused delete is no error, the session close takes them too),
+    ## then close the dynamic session. Idempotent.
+    if s.engine == 0: return
+    for id in s.ids:
+      discard fwpmFilterDeleteById0(s.engine, id)
+    discard fwpmEngineClose0(s.engine)
+    s = PermitStamp()
+
+  proc grantOnObject(engine: Handle; obj: WfpObject; key: ptr GUID;
+                     ace, label: string) =
+    ## Append one allow ACE (an SDDL string) to the DACL of one WFP
+    ## object, keeping everything that is there. Skips it when the
+    ## same ACE is already present, so a re-install adds nothing.
+    var sd: pointer
+    let grc = case obj
+      of woFilterContainer:
+        fwpmFilterGetSecurityInfoByKey0(engine, key, DACL_SECURITY_INFORMATION,
+          nil, nil, nil, nil, addr sd)
+      of woLayerV4, woLayerV6:
+        fwpmLayerGetSecurityInfoByKey0(engine, key, DACL_SECURITY_INFORMATION,
+          nil, nil, nil, nil, addr sd)
+      of woSublayer:
+        fwpmSubLayerGetSecurityInfoByKey0(engine, key, DACL_SECURITY_INFORMATION,
+          nil, nil, nil, nil, addr sd)
+    if grc != 0: fail("reading the DACL of " & label, grc)
+    defer: fwpmFreeMemory0(addr sd)
+    var text: WideCString
+    if convertSecurityDescriptorToStringSecurityDescriptorW(sd, 1,
+        DACL_SECURITY_INFORMATION, addr text, nil) == 0:
+      fail("ConvertSecurityDescriptorToStringSecurityDescriptorW",
+        DWORD(getLastError()))
+    let old = $text
+    localFree(text)
+    # No "D:" means a NULL DACL: everyone already has everything.
+    if "D:" notin old or ace in old: return
+    var merged: pointer
+    if convertStringSecurityDescriptorToSecurityDescriptorW(
+        newWideCString(old & ace), 1, addr merged, nil) == 0:
+      fail("ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        DWORD(getLastError()))
+    defer: localFree(merged)
+    var present, defaulted: WINBOOL
+    var dacl: pointer
+    if getSecurityDescriptorDacl(merged, addr present, addr dacl,
+        addr defaulted) == 0 or present == 0:
+      fail("GetSecurityDescriptorDacl", DWORD(getLastError()))
+    let src = case obj
+      of woFilterContainer:
+        fwpmFilterSetSecurityInfoByKey0(engine, key,
+          DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+      of woLayerV4, woLayerV6:
+        fwpmLayerSetSecurityInfoByKey0(engine, key, DACL_SECURITY_INFORMATION,
+          nil, nil, dacl, nil)
+      of woSublayer:
+        fwpmSubLayerSetSecurityInfoByKey0(engine, key,
+          DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+    if src != 0: fail("writing the DACL of " & label, src)
+
+  proc grantPermitStamping*(accountSid: string) =
+    ## Elevated (setup): let the account `accountSid` (an S-1-5-...
+    ## string; the one that spawns, never the sandbox user) stamp
+    ## per-run permits without elevation. That is FWPM_ACTRL_ADD on the
+    ## filters container and FWPM_ACTRL_ADD_LINK on the two connect
+    ## layers and on our sublayer, each appended to the DACL the object
+    ## has. With the sublayer gone (uninstall) the rest is inert: no
+    ## other sublayer or layer lets the account link. Raises OSError
+    ## when any of the four cannot be changed; the ones before it
+    ## stay granted.
+    let engine = openEngine("sandwall-setup")
+    defer: discard fwpmEngineClose0(engine)
+    let addAce = "(A;;0x" & toHex(FWPM_ACTRL_ADD.BiggestInt, 8) & ";;;" &
+      accountSid & ")"
+    let linkAce = "(A;;0x" & toHex(FWPM_ACTRL_ADD_LINK.BiggestInt, 8) & ";;;" &
+      accountSid & ")"
+    var v4 = FWPM_LAYER_ALE_AUTH_CONNECT_V4
+    var v6 = FWPM_LAYER_ALE_AUTH_CONNECT_V6
+    grantOnObject(engine, woFilterContainer, nil, addAce, "the filters container")
+    grantOnObject(engine, woLayerV4, addr v4, linkAce, "connect layer v4")
+    grantOnObject(engine, woLayerV6, addr v6, linkAce, "connect layer v6")
+    grantOnObject(engine, woSublayer, unsafeAddr sublayerKey, linkAce,
+      "the sandwall sublayer")
+
+  proc wfpStampProbeMain*(userSid: string): int =
+    ## The elevation gate as a self-command, run as the account that
+    ## spawns and NOT elevated: can this session add a permit filter
+    ## for the sandbox user and remove it again? It is `stampPermits`
+    ## itself with one permit for TEST-NET-1 (192.0.2.1:9, routed
+    ## nowhere), so whatever passes here is what a run does. 0 both
+    ## worked; 1 refused (error 5: no setup grant for this account, or
+    ## BFE refuses unelevated adds on this Windows); 2 any other
+    ## failure. The reason is printed either way.
+    var s: PermitStamp
+    try:
+      s = stampPermits(userSid,
+        [PermitFilter(ip: parseIpAddress("192.0.2.1"), port: 9)])
+      let rc = fwpmFilterDeleteById0(s.engine, s.ids[0])
+      if rc != 0: fail("FwpmFilterDeleteById0 (the stamped permit)", rc)
+      clearPermits(s)
+      stdout.writeLine("sandwall: wfp stamp probe: add and remove ok")
+      0
+    except OSError as e:
+      stderr.writeLine("sandwall: wfp stamp probe: " & e.msg)
+      if "ERROR_ACCESS_DENIED" in e.msg: 1 else: 2
+
+  # --- system resolvers --------------------------------------------
+
+  type
+    IpAddrString {.bycopy.} = object
+      ## IP_ADDR_STRING (iptypes.h), the fields read here.
+      next: ptr IpAddrString
+      address: array[16, char]
+      mask: array[16, char]
+      context: uint32
+
+    FixedInfo {.bycopy.} = object
+      ## The head of FIXED_INFO up to DnsServerList. Both 136-byte
+      ## fields make the pointer land at offset 272 whether or not the
+      ## C header packs the struct, so the layout holds either way.
+      hostName: array[136, char]
+      domainName: array[136, char]
+      currentDnsServer: ptr IpAddrString
+      dnsServerList: IpAddrString
+
+  proc getNetworkParams(pFixedInfo: pointer;
+      pOutBufLen: ptr uint32): DWORD {.stdcall, dynlib: "iphlpapi",
+      importc: "GetNetworkParams".}
+
+  proc dnsServers*(): seq[IpAddress] =
+    ## The system's DNS servers, every adapter (GetNetworkParams):
+    ## `stampPermits`' `resolvers`. Empty when Windows does not say.
+    var size: uint32
+    discard getNetworkParams(nil, addr size)
+    if size == 0: return
+    let buf = alloc0(size)
+    defer: dealloc(buf)
+    if getNetworkParams(buf, addr size) != 0: return
+    let info = cast[ptr FixedInfo](buf)
+    var node: ptr IpAddrString = addr info[].dnsServerList
+    while not node.isNil:
+      var text = ""
+      for c in node[].address:
+        if c == '\0': break
+        text.add c
+      if text.len > 0:
+        try: result.add parseIpAddress(text)
+        except ValueError: discard
+      node = node[].next
