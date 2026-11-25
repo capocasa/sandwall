@@ -71,6 +71,11 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
   ## unavailable the restriction applies without the narrowing and a
   ## warning is printed, matching the general backend-unavailable posture.
   when defined(linux):
+    # NO_NEW_PRIVS before any namespace switch: the flag is inherited
+    # across unshare(2), and some kernels reject the prctl once the
+    # caller sits in a fresh user namespace (arm64 CI runners). Landlock's
+    # apply() re-sets it, which is then a no-op.
+    landlock.setNoNewPrivsEarly()
     # When fencing, the userns must be created WITH CLONE_NEWNET, so the
     # netns comes first and maskDenied's ensureUserns is a no-op after.
     if fenceNet:
@@ -96,7 +101,14 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
       except OSError as e:
         stderr.writeLine("sandwall: " & e.msg &
           "; continuing without sub-path deny enforcement")
-    landlock.restrictImpl(writable, read, denied)
+    try:
+      landlock.restrictImpl(writable, read, denied)
+    except OSError as e:
+      # Same backend-unavailable posture as the unshare and mask
+      # degrades above: report and continue without this layer. The
+      # mount-namespace masks and the netns fence remain in force.
+      stderr.writeLine("sandwall: " & e.msg &
+        "; continuing WITHOUT landlock confinement")
     if fenceNet and proxySockPath.len > 0:
       # Landlock must still permit connecting to the unix socket: the
       # consumer must place proxySockPath under a writable path.

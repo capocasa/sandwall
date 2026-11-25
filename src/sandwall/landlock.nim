@@ -219,6 +219,15 @@ when defined(linux):
     finally:
       closeFd(pfd)
 
+  proc setNoNewPrivsEarly*() =
+    ## Set NO_NEW_PRIVS before any namespace switch. The flag is sticky
+    ## and inherited across unshare(2); apply()'s own call stays as a
+    ## no-op re-set for direct backend users. Best effort: apply() still
+    ## reports when the flag truly cannot be set.
+    const PR_SET_NO_NEW_PRIVS = 38
+    discard syscall(clong 157, PR_SET_NO_NEW_PRIVS.clong, 1.clong,
+                    0.clong, 0.clong, 0.clong)
+
   proc apply(rs: var Ruleset) =
     if rs.fd < 0:
       raise newException(ValueError, "sandwall: ruleset already consumed")

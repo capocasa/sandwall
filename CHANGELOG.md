@@ -3,6 +3,21 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.17] - 2026-11-25
+
+### Fixed
+
+- Linux: NO_NEW_PRIVS is set before any namespace switch and a failed
+  Landlock layer degrades with a notice instead of crashing the fenced
+  command. Some kernels reject prctl(PR_SET_NO_NEW_PRIVS) with EPERM once
+  the caller sits in a fresh user namespace (arm64 CI runners, observed
+  2026-11); the flag is sticky and inherited across unshare(2), so setting
+  it before the unshare keeps the fence fully enforced there, and any
+  remaining Landlock failure now prints
+  "sandwall: ...; continuing WITHOUT landlock confinement" and lets the
+  mount-namespace masks and the netns fence stand, matching the posture of
+  the other layer degrades.
+
 ## [0.5.16] - 2026-11-24
 
 ### Changed
