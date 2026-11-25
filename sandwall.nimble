@@ -1,7 +1,7 @@
 # nimble file for sandwall
 # Package
 
-version       = "0.5.16"
+version       = "0.5.17"
 author        = "Carlo Capocasa"
 description   = "A process-level filesystem sandbox backed by OS-native primitives (Landlock, Seatbelt, Windows ACLs)"
 license       = "MIT"
