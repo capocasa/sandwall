@@ -16,6 +16,13 @@ when defined(linux):
   import ./paths
   import ./baseline
 
+  # Nim's posix consts only define O_PATH for linux-amd64; everywhere else
+  # (arm64, Android) fetch it from the libc header instead.
+  when not declared(posix.O_PATH):
+    var swOPath {.importc: "O_PATH", header: "<fcntl.h>".}: cint
+  template O_PATH: cint =
+    when declared(posix.O_PATH): posix.O_PATH else: swOPath
+
   type AccessFds = distinct uint64
 
   # The Landlock syscall numbers are stable on every Linux/arch
@@ -158,7 +165,7 @@ when defined(linux):
     # target being readable. A FIFO would block, a write-only file would
     # EACCES, and /dev/tty ENXIOs without a controlling terminal - and a
     # swallowed add_rule error would silently drop the rule instead.
-    result = rawOpen(path, posix.O_PATH or posix.O_CLOEXEC)
+    result = rawOpen(path, O_PATH or posix.O_CLOEXEC)
     if result < 0: checkErrno("open('" & path & "') O_PATH")
 
   proc closeFd(fd: cint) =
