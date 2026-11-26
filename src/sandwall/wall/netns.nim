@@ -77,7 +77,7 @@ when defined(linux):
   proc ioctl(fd: cint; request: culong; arg: pointer): cint
       {.importc, header: "<sys/ioctl.h>".}
   proc prctl(option: cint; arg2: culong): cint
-      {.importc, header: "<sys/prctl.h>".}
+      {.importc, header: "<sys/prctl.h>", varargs.}
   proc if_nametoindex(ifname: cstring): cuint {.importc, header: "<net/if.h>".}
 
   type IfReq {.importc: "struct ifreq", header: "<net/if.h>".} = object
@@ -156,22 +156,28 @@ when defined(linux):
   var relayQueries = 0
     ## names the relay's per-query sockets; the process is single-threaded
 
-  proc dialUnixDgram(path: string): SocketHandle =
-    ## A fresh AF_UNIX datagram socket, bound to an abstract name and
-    ## connected to `path`. One per query (see dnsRelayProcess): a reply
-    ## the client stopped waiting for has nowhere to land once the socket
-    ## is gone. Bound, because a datagram sender without an address is
-    ## anonymous and the forwarder answers to the sender's address.
+  proc dialUnixDgram(path, bindPath: string): SocketHandle =
+    ## A fresh AF_UNIX datagram socket, connected to `path` and bound to
+    ## the filesystem name `bindPath`. One per query (see
+    ## dnsRelayProcess): a reply the client stopped waiting for has
+    ## nowhere to land once the socket is gone. Bound, because a datagram
+    ## sender without an address is anonymous and the forwarder answers
+    ## to the sender's address. A FILE, not an abstract name: the
+    ## abstract namespace is per network namespace (kernel 3.3+), the
+    ## forwarder answers from outside the fence's netns, and its reply
+    ## to an abstract address there refuses before it ever reaches a
+    ## socket.
     result = posix.socket(AF_UNIX, SOCK_DGRAM, 0)
     if result == osInvalidSocket: return
-    inc relayQueries
-    if not bindUnixAbstract(result, "sandwall-relay-" & $getpid() & "-" &
-                            $relayQueries):
-      discard posix.close(result)
-      return osInvalidSocket
     var sa: Sockaddr_un
     sa.sun_family = TSa_Family(AF_UNIX)
-    if path.len >= sa.sun_path.len:
+    if bindPath.len >= sa.sun_path.len or path.len >= sa.sun_path.len:
+      discard posix.close(result)
+      return osInvalidSocket
+    copyMem(addr sa.sun_path[0], cstring(bindPath), bindPath.len + 1)
+    removeFile(bindPath)
+    if posix.bindSocket(result, cast[ptr SockAddr](addr sa),
+                        SockLen(sizeof(sa))) != 0:
       discard posix.close(result)
       return osInvalidSocket
     copyMem(addr sa.sun_path[0], cstring(path), path.len + 1)
@@ -306,6 +312,7 @@ when defined(linux):
     ## so a late reply to a query the client gave up on has nowhere to
     ## land. The forwarder answers from memory (policy plus pool), so
     ## the wait is short unless the first resolution of a name is.
+    let replyDir = splitFile(dnsSockPath).dir
     while true:
       var buf: array[4096, char]
       var client: Sockaddr_in
@@ -316,7 +323,10 @@ when defined(linux):
         if osLastError().cint == EINTR: continue
         sleep(10)
         continue
-      let up = dialUnixDgram(dnsSockPath)
+      inc relayQueries
+      let bindPath = replyDir / "relay-" & $getpid() & "-" &
+        $relayQueries & ".dg"
+      let up = dialUnixDgram(dnsSockPath, bindPath)
       if up == osInvalidSocket: continue
       if posix.send(up, addr buf[0], n, 0) == n:
         var pfd = TPollfd(fd: up.cint, events: POLLIN, revents: 0)
@@ -327,6 +337,7 @@ when defined(linux):
             discard posix.sendto(udp, addr buf[0], m, 0,
                                  cast[ptr SockAddr](addr client), clen)
       discard posix.close(up)
+      removeFile(bindPath)
 
   proc forkRelay(udp: SocketHandle; dnsSockPath: string): Pid =
     let parentPid = posix.getpid()
@@ -374,6 +385,10 @@ when defined(linux):
       nl: NlMsghdr
       rt: RtMsg
       dst: RouteAttr     ## RTA_DST: the network address, network byte order
+      prefsrc: RouteAttr ## RTA_PREFSRC: 127.0.0.1, so connections out the
+                         ## fake pool have a source address (a source-less
+                         ## device route leaves the client at 0.0.0.0 and
+                         ## the forwarder's reply has nowhere to go)
       oif: RouteAttr      ## RTA_OIF: the output interface index
 
   const
@@ -381,16 +396,22 @@ when defined(linux):
     AF_NETLINK = 16
     NETLINK_ROUTE = 0
     NLMSG_ERROR = 2'u16
-    RTM_NEWROUTE = 16'u16
+    RTM_NEWROUTE = 24'u16
     NlmFRequest = 0x0001'u16
     NlmFAck = 0x0004'u16
     NlmFCreate = 0x0400'u16
     RTA_DST = 1'u16
+    RTA_PREFSRC = 7'u16
     RTA_OIF = 4'u16
     RTN_UNICAST = 1'u8
     RTPROT_BOOT = 3'u8
     RT_SCOPE_LINK = 253'u8
-    RT_TABLE_MAIN = 253'u8
+    RT_TABLE_MAIN = 254'u8
+    # prctl ambient caps: nft keeps CAP_NET_ADMIN across execv although
+    # the uid self-map makes the namespace euid non-zero
+    PR_CAP_AMBIENT = 47
+    PR_CAP_AMBIENT_RAISE = 2
+    CAP_NET_ADMIN = 12
 
   proc routeMessage(network: IpAddress; dstLen: uint8; oif: uint32): RouteMsg =
     ## `ip route add <network>/<len> dev lo scope link`, as one
@@ -405,6 +426,9 @@ when defined(linux):
     result.dst = RouteAttr(attr: RtAttr(rta_len: uint16(sizeof(RouteAttr)),
                                         rta_type: RTA_DST))
     copyMem(addr result.dst.value, unsafeAddr network.address_v4[0], 4)
+    result.prefsrc = RouteAttr(attr: RtAttr(rta_len: uint16(sizeof(RouteAttr)),
+                                            rta_type: RTA_PREFSRC),
+                               value: 0x0100_007f'u32)  # 127.0.0.1, bytes 7f 00 00 01
     result.oif = RouteAttr(attr: RtAttr(rta_len: uint16(sizeof(RouteAttr)),
                                         rta_type: RTA_OIF), value: oif)
 
@@ -427,7 +451,9 @@ when defined(linux):
       raise newException(OSError, "netlink: no acknowledgement for the route")
     let hdr = cast[ptr NlMsghdr](addr buf[0])
     if hdr.nlmsg_type != NLMSG_ERROR: return
-    let err = cast[ptr NlMsgerr](addr buf[0])[].error
+    # the error follows the reply's own nlmsghdr (NLMSG_DATA), the cast
+    # from buf[0] would read that header's nlmsg_len instead
+    let err = cast[ptr NlMsgerr](addr buf[sizeof(NlMsghdr)])[].error
     if err != 0: raiseOSError(OSErrorCode(-err), "route add")
 
   # ------------------------------------------------------------- nft
@@ -453,6 +479,38 @@ when defined(linux):
     "  }\n" &
     "}\n"
 
+  type
+    CapUserHeader {.importc: "struct __user_cap_header_struct",
+        header: "<linux/capability.h>".} = object
+      version: uint32
+      pid: cint
+    CapUserData {.importc: "struct __user_cap_data_struct",
+        header: "<linux/capability.h>".} = object
+      effective, permitted, inheritable: uint32
+
+  proc syscall(n: clong): clong {.importc: "syscall", header: "<unistd.h>",
+      varargs.}
+  var SYS_capget {.importc: "SYS_capget", header: "<sys/syscall.h>".}: clong
+  var SYS_capset {.importc: "SYS_capset", header: "<sys/syscall.h>".}: clong
+
+  proc raiseAmbient(cap: cint) =
+    ## Add `cap` to the inheritable set and raise it ambient, best effort.
+    ## The raise alone answers EPERM while the cap is not in inheritable
+    ## (ambient is a subset of inheritable), so capget/capset first. With
+    ## no failure here the cap survives the execv of a non-privileged
+    ## binary; a refusal surfaces as nft's own complaint, fail-closed.
+    const capsetVersion = 0x20080522'u32
+    var hdr = CapUserHeader(version: capsetVersion, pid: 0)
+    var data: array[2, CapUserData]
+    if syscall(SYS_capget, addr hdr, addr data) != 0: return
+    let word = cap div 32
+    data[word].inheritable = data[word].inheritable or
+      (1'u32 shl (cap mod 32))
+    hdr = CapUserHeader(version: capsetVersion, pid: 0)
+    if syscall(SYS_capset, addr hdr, addr data) != 0: return
+    discard prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE.culong, cap.culong,
+                  0, 0)
+
   proc runNft(nft, rulesPath: string): string =
     ## `nft -f rulesPath`. The first line of nft's complaint when the
     ## ruleset was refused, "" when it was taken. nft's stderr is read
@@ -469,6 +527,13 @@ when defined(linux):
         discard posix.dup2(null, 1)
         discard posix.close(null)
       var argv = allocCStringArray([nft, "-f", rulesPath])
+      # The uid self-map means full ns caps die at exec (euid != 0 in
+      # the namespace), and this ruleset needs CAP_NET_ADMIN over the
+      # netns. Ambient caps survive exec for an ordinary binary and
+      # raising them wants no-new-privs, which ensureUserns set before
+      # the unshare. Best effort: a refusal surfaces as nft's own
+      # complaint below, the raw fence stays fail-closed.
+      raiseAmbient(CAP_NET_ADMIN)
       discard posix.execv(nft.cstring, argv)
       exitnow(127)
     if pid < 0:
