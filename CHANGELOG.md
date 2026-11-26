@@ -3,6 +3,20 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.1] - 2026-11-26
+
+### Fixed
+
+- `dialUp` gives each address its own slice of the connect budget
+  (capped at 2s) instead of one deadline for all of them: macOS never
+  completes a connect to a loopback neighbour nothing listens on
+  (Linux refuses it at once), so a rotated permit set's dead address
+  starved the grace address behind it and every connect stalled.
+- The fence DNS test bound its query socket to an abstract unix name,
+  which macOS does not have; it binds a file next to `dns.sock` now,
+  like the netns relay. `bindUnixAbstract` left sockshim with it, the
+  product has no caller.
+
 ## [0.6.0] - 2026-11-26
 
 ### Fixed
