@@ -390,16 +390,25 @@ when defined(posix):
   proc ask(p: WallProxy; dnsPath: string; name: string;
            qtype = uint16(qtA)): string =
     ## One query to the fence DNS at `dnsPath`; "" when nothing came.
-    ## The socket is bound to an abstract name first, like the netns
-    ## relay's: the answer is sent to the sender's address.
+    ## The socket is bound to a filesystem name next to the dns socket
+    ## first, like the netns relay's: the answer is sent to the sender's
+    ## address. A file, not an abstract name: the abstract namespace is
+    ## per network namespace on Linux and absent on macOS.
     let s = posix.socket(AF_UNIX, SOCK_DGRAM, 0)
     if s == osInvalidSocket: raiseOSError(osLastError())
-    defer: discard posix.close(s)
     inc asked
-    doAssert bindUnixAbstract(s, "sandwall-test-" & $getCurrentProcessId() &
-                             "-" & $asked)
+    let bindPath = splitFile(dnsPath).dir / ("ask-" &
+      $getCurrentProcessId() & "-" & $asked & ".dg")
+    removeFile(bindPath)
     var sa: Sockaddr_un
     sa.sun_family = TSa_Family(AF_UNIX)
+    copyMem(addr sa.sun_path[0], cstring(bindPath), bindPath.len + 1)
+    if posix.bindSocket(s, cast[ptr SockAddr](addr sa),
+                        SockLen(sizeof(sa))) != 0:
+      raiseOSError(osLastError())
+    defer:
+      discard posix.close(s)
+      removeFile(bindPath)
     copyMem(addr sa.sun_path[0], cstring(dnsPath), dnsPath.len + 1)
     if posix.connect(s, cast[ptr SockAddr](addr sa), SockLen(sizeof(sa))) != 0:
       raiseOSError(osLastError())

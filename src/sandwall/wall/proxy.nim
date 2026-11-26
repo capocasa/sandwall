@@ -306,6 +306,12 @@ proc dialUp(ips: seq[IpAddress]; port: uint16;
   ## osInvalidSocket when none accepted.
   if ips.len == 0: return osInvalidSocket
   let deadline = epochTime() + upstreamTimeout / 1000
+  # Each address gets its own slice of the budget, not the whole of it:
+  # on macOS a connect to a loopback neighbour nothing listens on never
+  # completes (Linux refuses it at once), and one black-holed address
+  # under a shared deadline would starve the rotated-set grace address
+  # behind it.
+  let sliceMs = max(min(upstreamTimeout, 2000) div max(ips.len, 1), 500)
   for ip in ips:
     var sa: Sockaddr_storage
     var slen: SockLen
@@ -325,7 +331,8 @@ proc dialUp(ips: seq[IpAddress]; port: uint16;
           if posix.connect(fd, cast[ptr SockAddr](addr sa), slen) < 0:
             let err = osLastError().cint
             if err == EINPROGRESS:
-              let remain = int((deadline - epochTime()) * 1000)
+              let remain = min(int((deadline - epochTime()) * 1000),
+                               sliceMs)
               if remain > 0:
                 var pfd = TPollfd(fd: fd.cint, events: POLLOUT)
                 if poll(addr pfd, 1, remain.cint) > 0 and
@@ -347,7 +354,8 @@ proc dialUp(ips: seq[IpAddress]; port: uint16;
           if wsaConnect(fd, cast[ptr SockAddr](addr sa), slen.cint) < 0:
             let err = osLastError().cint
             if err == WSAEWOULDBLOCK:
-              let remain = int((deadline - epochTime()) * 1000)
+              let remain = min(int((deadline - epochTime()) * 1000),
+                               sliceMs)
               if remain > 0:
                 var pfd = TPollfdW(fd: fd, events: POLLOUT_W)
                 if pollW(addr pfd, 1, remain.cint) > 0 and

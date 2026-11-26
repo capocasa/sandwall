@@ -53,19 +53,6 @@ when defined(windows):
     wsaPoll(fds, nfds.culong, timeout)
   template interruptedW*(): bool = osLastError().cint == WSAEINTR
 
-when defined(posix):
-  proc bindUnixAbstract*(fd: SocketHandle; name: string): bool =
-    ## Bind an AF_UNIX datagram socket to the abstract name `name`
-    ## (no file, dies with the socket). A sender without an address is
-    ## anonymous to recvfrom: a reply has nowhere to go. True when bound.
-    var sa: Sockaddr_un
-    sa.sun_family = TSa_Family(AF_UNIX)
-    if name.len + 1 > sa.sun_path.len: return false
-    sa.sun_path[0] = '\0'
-    for i, c in name: sa.sun_path[i + 1] = c
-    posix.bindSocket(fd, cast[ptr SockAddr](addr sa),
-                     SockLen(2 + 1 + name.len)) == 0
-
 proc closeSock*(fd: SocketHandle) =
   when defined(posix):
     discard posix.close(fd)
