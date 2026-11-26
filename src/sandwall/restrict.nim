@@ -36,7 +36,8 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
                fenceNet: bool = false; proxyPort: uint16 = 0;
                proxySockPath: string = "";
                bridgePort: ptr uint16 = nil;
-               raw: bool = false; dnsSockPath: string = "") =
+               raw: bool = false; dnsSockPath: string = "";
+               loopback: bool = true) =
   ## Confine the calling thread (and all future children).
   ##
   ## `raw` (Linux, with fenceNet and proxySockPath) adds the env-var-free
@@ -63,6 +64,10 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
   ## is unused. When the netns is unavailable (unprivileged userns
   ## disabled, old kernel) a warning is printed and the restriction
   ## continues WITHOUT network fencing, matching the backend posture.
+  ## `loopback` (macOS raw path) decides whether the child may connect to
+  ## the host's loopback at all; the policy's localhost rules decide it
+  ## (wall/pf.loopbackPolicy), pf scopes the ports.
+  ##
   ## Windows ignores it here: the network fence on Windows is decided at
   ## spawn time in process.spawnSandboxed (internetClient capability when
   ## the policy has no host rules, airgap when it has), not in-process.
@@ -142,7 +147,8 @@ proc restrict*(writable: openArray[string]; read: openArray[string] = [];
     if raw:
       startRawBridges(rawFence)
   elif defined(macosx):
-    seatbelt.restrictImpl(writable, read, denied, egress = not fenceNet)
+    seatbelt.restrictImpl(writable, read, denied, egress = not fenceNet,
+                          loopback = loopback)
   elif defined(windows):
     # fenceNet stays a no-op here: the Windows wall is keyed on the
     # sandwall user's SID (wfp.nim) and therefore lives on the spawn
@@ -157,6 +163,9 @@ import std/os
 import ./rules
 when defined(posix):
   import ./wall/proxy
+when defined(macosx):
+  import ./wall/hosts
+  import ./wall/pf
 when defined(linux):
   import std/posix
 
@@ -195,13 +204,14 @@ proc restrict*(rules: openArray[Rule]; projectDir: string;
     restrict(r.writable, r.readonly, r.denied)
     return
   when defined(macosx):
-    # No raw path here. Seatbelt's network filters take `*` or
-    # `localhost` as the host and refuse a literal address (the whole
-    # profile is rejected), so no address can be permitted for a run.
     if raw:
-      raise newException(ValueError,
-        "sandwall: the raw path is not available on macOS (Seatbelt cannot " &
-        "permit single addresses); use the env path")
+      # The pf path. The address decision is the kernel's, by marker gid:
+      # the process already carries the gid (sandwallpf exec'd it) and
+      # the run's anchor is up, so this side only applies the file
+      # fence and the loopback decision, and sets no proxy env.
+      let lb = loopbackPolicy(toHostList(r.hosts))
+      restrict(r.writable, r.readonly, r.denied, loopback = lb.enabled)
+      return
   when defined(posix):
     # The proxy is forked BEFORE any restriction: after restrict it
     # would inherit the fence, after exec the forking image is gone.

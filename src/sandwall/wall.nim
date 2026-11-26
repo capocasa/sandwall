@@ -38,6 +38,10 @@ when defined(posix):
 when defined(linux):
   import ./wall/netns
   export netns
+when defined(macosx):
+  import ./wall/pf
+  import ./wall/pfdaemon
+  export pf, pfdaemon
 
 when defined(windows):
   import ./wall/stdio

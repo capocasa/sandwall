@@ -37,6 +37,9 @@ when isMainModule:
     import ./sandwall/wall/proxy
     import ./sandwall/wall/stdio
     import ./sandwall/wall/permit
+  when defined(macosx):
+    import ./sandwall/wall/pfdaemon
+    import ./sandwall/wall/permit
 
   const usage = """
 sandwall - a process sandbox backed by OS-native primitives
@@ -62,6 +65,13 @@ Usage:
   and plain ssh/scp/telnet work. If the raw fence cannot go up the
   command is re-run with proxy env vars (the env path) instead.
 
+  On macOS a policy with host rules is fenced by pf, keyed on a
+  marker gid the `sandwallpf` daemon plants: CMD gets no proxy env
+  vars, connects straight to the addresses the policy resolved, and
+  plain ssh/scp work. It needs the one-time elevated `sudo sandwall
+  setup` (a LaunchDaemon); with the daemon down the run fails closed
+  with the reason. `sandwall setup --status` tells.
+
   On Windows the run also tries the raw path first when every allow
   rule names an exact host (a wildcard goes to the proxy) and
   `sandwall setup --stamp-as ACCOUNT` granted the spawning account the
@@ -83,8 +93,8 @@ Examples:
 The restriction is monotonic: permanent for this process and all
 descendants. There is no "unrestrict".
 
-Note: the `setup` command exists only on Windows builds (the Windows
-fence needs a one-time elevated install); on this build networking and
+Note: the `setup` command exists on Windows and macOS builds, whose
+fences need a one-time elevated install; elsewhere networking and
 filesystem policy are enforced with no setup step.
   """
 
@@ -157,6 +167,99 @@ filesystem policy are enforced with no setup step.
         return -1
       code
 
+  when defined(macosx):
+    proc pfChildMain(args: seq[string]): int =
+      ## The box child sandwallpf execs: `--pf-child PROJECT POLICY --
+      ## CMD`. This process already carries the run's marker gid and pf
+      ## holds its fence, so the policy's addresses need no seatbelt
+      ## lines: apply the file fence and the loopback decision, exec.
+      if args.len < 4 or args[2] != "--":
+        stderr.writeLine("sandwall: --pf-child needs PROJECT POLICY -- CMD")
+        return 2
+      let projectDir = args[0]
+      try:
+        let rules = parsePolicy(readFile(args[1]), projectDir)
+        restrict(rules, projectDir, args[1], raw = true)
+        exec(args[3 .. ^1])
+      except CatchableError as e:
+        stderr.writeLine("sandwall: " & e.msg)
+        return 127
+
+    proc runPf(rules: seq[Rule]; projectDir, policyPath: string;
+               cmd: seq[string]): int =
+      ## A run with host rules on macOS: pf owns the network. The
+      ## daemon puts the run's fence up (begin), execs the box child
+      ## into a marker gid and this process waits on that child; `end`
+      ## takes the fence down. A `+*` policy stamps nothing. There is
+      ## no fallback to a proxy: daemon down or a refused stamp fails
+      ## the run closed, with the reason.
+      let r = resolve(rules)
+      let hosts = toHostList(r.hosts)
+      let lb = loopbackPolicy(hosts)
+      let open = allowsEverything(hosts)
+      var entries: seq[PermitEntry]
+      if not open:
+        let ps = newPermitSet()
+        let report = ps.seedFromPolicy(hosts, 1500)
+        entries = ps.snapshot()
+        ps.close()
+        let unresolved = report.failed.len + report.pending.len
+        if unresolved > 0:
+          stderr.writeLine("sandwall: " & $unresolved &
+            " allowed host(s) did not resolve in time; not permitted " &
+            "this run")
+      let st = pfFenceStatus()
+      if not st.running:
+        stderr.writeLine("sandwall: cannot fence egress: " & st.hint)
+        stderr.writeLine(PfMarker)
+        return PfUnavailableExit
+      var runId = ""
+      try:
+        if not open:
+          runId = pfBegin(PfSockPath, lb.ports, entries)
+        # Rules read from stdin are rendered into the run dir for the
+        # child to parse; a policy file is handed on as it is.
+        var polPath = policyPath
+        if polPath.len == 0:
+          let runDir = getTempDir() / ("sandwall-" & $getCurrentProcessId())
+          createDir(runDir)
+          polPath = runDir / "policy"
+          writeFile(polPath, renderPolicy(rules))
+          setFilePermissions(polPath, {fpUserRead, fpUserWrite})
+        var child = @[getAppFilename(), "--pf-child", projectDir, polPath,
+                      "--"]
+        child.add cmd
+        return pfExec(PfSockPath, runId, child, projectDir)
+      except PfError as e:
+        stderr.writeLine("sandwall: " & e.msg)
+        stderr.writeLine(PfMarker)
+        return PfUnavailableExit
+      finally:
+        if runId.len > 0: pfEnd(PfSockPath, runId)
+
+    proc pfSetupMain(args: seq[string]): int =
+      if "--status" in args:
+        let st = pfFenceStatus()
+        echo "sandwallpf daemon: installed=", st.installed,
+             " running=", st.running
+        if st.hint.len > 0: echo "  ", st.hint
+        return if st.running: 0 else: 1
+      if "--uninstall" in args:
+        echo pfUninstall()
+        return 0
+      let sudoUid = try: parseInt(getEnv("SUDO_UID"))
+                     except ValueError: -1
+      if sudoUid < 0:
+        stderr.writeLine("sandwall: setup must run from the account that " &
+          "spawns sandwall, with sudo (SUDO_UID missing)")
+        return 1
+      try:
+        echo pfSetup(sudoUid, getAppFilename().parentDir / "sandwallpf")
+        return 0
+      except CatchableError as e:
+        stderr.writeLine("sandwall: " & e.msg)
+        return 1
+
   proc runMain(args: seq[string]): int =
     ## sandwall RULES [--] CMD [ARGS...]
     if args.len < 2:
@@ -186,6 +289,11 @@ filesystem policy are enforced with no setup step.
     # would miss CMD's children.
     when defined(posix):
       discard setsid()
+      when defined(macosx):
+        # A policy with host rules is fenced by pf: the run goes through
+        # the sandwallpf broker and never sets a proxy env var.
+        if resolve(rules).hosts.len > 0:
+          return runPf(rules, projectDir, policyPath, cmd)
       when defined(linux):
         # Raw mode is tried only when nft is there to load the redirect;
         # the child decides whether it holds (restrict, RawUnavailableError).
@@ -281,6 +389,9 @@ filesystem policy are enforced with no setup step.
     if args.len == 0 or args[0] == "-h" or args[0] == "--help":
       stdout.writeLine(usage)
       return 0
+    when defined(macosx):
+      # Internal: the box child the pf broker execs (never typed).
+      if args[0] == "--pf-child": return pfChildMain(args[1 .. ^1])
     case args[0]
     of "connect":
       connectMain(args[1 .. ^1])
@@ -340,10 +451,12 @@ filesystem policy are enforced with no setup step.
         except OSError as e:
           stderr.writeLine("sandwall: " & e.msg)
           return 1
+      elif defined(macosx):
+        pfSetupMain(args)
       else:
-        stderr.writeLine("sandwall: setup is only available on Windows builds " &
-          "(the Windows fence needs a one-time elevated install). On this " &
-          "build no setup is needed."); 2
+        stderr.writeLine("sandwall: setup is only available on Windows and " &
+          "macOS builds (their fences need a one-time elevated install). " &
+          "On this build no setup is needed."); 2
     of "wfp-probe":
       when defined(windows):
         wfpProbeMain()

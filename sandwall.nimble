@@ -8,7 +8,7 @@ license       = "MIT"
 srcDir        = "src"
 installExt    = @["nim"]
 
-bin           = @["sandwall"]
+bin           = @["sandwall", "sandwallpf"]
 
 
 # Dependencies
@@ -31,6 +31,7 @@ task test, "Run sandwall tests":
     exec "nim c --path:../src -r test_wall.nim"
     exec "nim c --path:../src -r test_winwall.nim"
     exec "nim c --path:../src -r test_winpath.nim"
+    exec "nim c --path:../src --threads:on -r test_pf.nim"
 
 # Windows cross-compile check (run manually; needs mingw):
 #   nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src src/sandwall/wall/wfp.nim

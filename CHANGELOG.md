@@ -3,6 +3,34 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Added
+
+- macOS raw egress through pf (`osx-plan`, chunks osx-2 to osx-4).
+  Seatbelt cannot permit a single address, so the kernel filter does it
+  by process: `sudo sandwall setup` installs `sandwallpf` as a
+  LaunchDaemon and records the account; the daemon enables pf, adds two
+  anchor calls to the live main ruleset without flushing it, blocks
+  the whole marker range for orphans, and serves `begin`, `refresh`,
+  `end` and `exec` over a 0600 unix socket authenticated by
+  `LOCAL_PEERCRED`. `exec` is the privileged hop: the caller's stdio
+  arrives by `SCM_RIGHTS`, the daemon forks, `setgid`s a marker from
+  42400-42499 that is not a group of the system, `setuid`s back to the
+  caller and execs the box child, which applies Seatbelt and execs the
+  tool. One child anchor per run: lo0 scoped to the policy's
+  localhost ports (pf takes `port` only with a `proto`, so that is
+  four rules), `return-rst` for TCP, `return` for UDP, then a pass.
+  Runs are swept 15 minutes after their lease with no live child; a
+  live child keeps its run. On macOS a policy with host rules no
+  longer starts a proxy: with the daemon down it exits 125 and prints
+  `sandwall-pf-unavailable`. `restrict(rules, raw = true)` on macOS
+  applies the file fence and the loopback decision only; Seatbelt gets
+  a `loopback` flag. Rule text, gid bookkeeping and the sweep are
+  unit-tested on Linux, the whole rule sets pass `pfctl -n` and both
+  Seatbelt variants were run under `sandbox-exec` on macOS 14.8.7; the
+  daemon itself has not run as root on a Mac yet.
+
 ## [0.6.1] - 2026-11-26
 
 ### Fixed
