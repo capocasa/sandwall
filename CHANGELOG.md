@@ -3,7 +3,27 @@
 All notable changes to sandwall. Dates are commit dates, not release dates.
 Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.5.19] - 2026-11-25
+## [0.6.0] - 2026-11-26
+
+### Fixed
+
+- The Linux raw fence never ran green: `test_wall`'s raw scenario has
+  failed on every host it ran on, since its introduction. Four defects,
+  all in `wall/netns.nim`: `RTM_NEWROUTE` was 16, which is
+  `RTM_NEWLINK` (24 is the route), so the fence asked the kernel to
+  create an AF_INET "link"; the netlink ack parser read the reply's
+  outer `nlmsg_len` as the error code, masking every kernel refusal as
+  "Unknown error -64"; the fake-pool route carried no preferred source
+  (and the prefsrc attribute was typed 4, which is `RTA_OIF`), so
+  clients left with 0.0.0.0 as their address and the forwarder's reply
+  had nowhere to go; and the DNS relay bound its per-query reply
+  socket to an abstract unix name, which is per network namespace
+  since kernel 3.3, so the forwarder's reply refused before it ever
+  reached a socket. The relay now binds a file next to `dns.sock`.
+  Beyond those four, nft keeps `CAP_NET_ADMIN` across its execv via
+  ambient capabilities: the uid self-map makes the namespace euid
+  non-zero, and without this every capability dies at exec and the
+  ruleset load fails with EPERM.
 
 ### Added
 
