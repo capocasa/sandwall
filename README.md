@@ -30,9 +30,9 @@ skip the policy layer.
 
 | Platform | Filesystem | Network fence |
 |----------|-----------|-------------|
-| Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy; raw: fence DNS + nft redirect, no proxy env |
-| macOS | Seatbelt `sandbox_init_with_parameters` | pf fence keyed on a marker gid (after `sudo sandwall setup`): per-run address table, no proxy env; without the daemon: a run with host rules fails closed |
-| Windows | Dedicated local user + DACL grants | WFP fence (after `sandwall setup`): loopback-only + allowlist proxy; raw (after `setup --stamp-as`, exact rules): per-run permits; without setup: open + warning |
+| Linux | Landlock | netns (fresh namespace, loopback only) + allowlist proxy |
+| macOS | Seatbelt `sandbox_init_with_parameters` | Seatbelt loopback-only + allowlist proxy |
+| Windows | Dedicated local user + DACL grants | WFP fence (after `sandwall setup`): loopback-only + allowlist proxy; without setup: open + warning |
 
 The Linux and macOS backends confine the calling thread via kernel hooks
 (Landlock domains, Seatbelt profiles). The Windows backend has no single
@@ -125,79 +125,6 @@ export GIT_SSH_COMMAND="ssh -o ProxyCommand='sandwall connect %h %p'"
 
 (Setting that variable is the consumer's job, sandwall only provides the
 adapter.)
-
-### Raw egress (Linux, Windows, macOS)
-
-The env path above needs every tool to honor proxy variables, or an
-adapter. The raw path needs neither: the child connects as it would
-outside the fence and the kernel carries it, so plain `ssh`, `scp`,
-`telnet` and proxy-unaware libraries work. `sandwall` tries it first on
-Linux when `nft` is installed, on Windows when every `allow` rule
-names an exact host, and on macOS whenever the `sandwallpf` daemon is up:
-
-- **Linux.** A fence DNS answers A queries for allowed names with a stable
-  synthetic address from `198.18.0.0/15` and refuses the rest; `nft`
-  redirects every non-loopback TCP connection onto the forwarder, which
-  maps the synthetic address back to the name and checks the rule again
-  at connect time. Nothing inside the fence ever learns a real address
-  and a denied name does not resolve. Loopback is not redirected, so the
-  child's own services keep working and the host's do not. When the fence
-  cannot be put up (no user namespace, `nft` fails to load, a dangling
-  `resolv.conf` symlink) the child exits 75 with `sandwall: raw
-  unavailable, retrying env` on stderr before running anything, and
-  `sandwall` re-runs the command on the env path. Library users get the
-  same contract: `restrict(..., raw = true, dnsSockPath = ...)` raises
-  `RawUnavailableError` with nothing half applied.
-- **Windows.** The forwarder seeds a permit set from the policy's exact
-  allow rules (a snapshot the consumer hands over with
-  `runSandboxed(..., permits = ...)`), and the kernel learns those
-  addresses as per-run WFP permit filters, so the child connects
-  straight out. Two gates: `sandwall setup --stamp-as ACCOUNT` (elevated)
-  must have granted the spawning account the right to add and remove its
-  own filters, and the policy must be exact. A wildcard allow admits
-  names no snapshot can enumerate, a deny-only policy has nothing to
-  stamp; both take the env path, as does a refused stamp
-  (`PermitStampError`, nothing stamped). Permits are addresses: a denied
-  name sharing an address with an allowed one is reachable, and two runs
-  at once see the union of their permits (same sandbox user). The
-  spawning account resolves through the system resolver, so names leak
-  there where Linux leaks none. Past 512 address/port pairs a run takes
-  the env path. `sandwall wfp-stamp-probe`, run unelevated as the
-  spawning account after the grant, is the gate probe. **Run on a
-  Windows 11 host (26100)**: with the grant the unelevated spawner
-  stamps and removes a permit (the probe exits 0; without the grant it
-  exits 1, access denied), a raw run reached its permitted address and
-  no other, and names resolved inside the fence. That run fixed two
-  defects here: permit filters owned by Administrators, which an
-  unelevated spawner cannot assign (1307), and the resolver list read 8
-  bytes off `GetNetworkParams`' layout (a crash). Only the standalone
-  CLI ran; a consumer's own launch has not.
-- **macOS.** Seatbelt's `(remote ip "host:port")` accepts `*` or
-  `localhost` only, so the address decision lives in pf instead, keyed
-  on the process: the `sandwallpf` daemon execs the child with a
-  primary gid from a range it owns (`42400-42499`), and one child anchor
-  per run passes that gid to the policy's addresses and resets the
-  rest, TCP and UDP. The child's uid, `~` and file ownership are
-  unchanged; nothing outside the child carries the gid. `sudo sandwall
-  setup` (from the account that spawns sandwall) installs the daemon as
-  a LaunchDaemon and records that account; `sandwall setup --status`
-  tells whether it is up. Loopback follows the policy: no `localhost`
-  rule means none, a `localhost:PORT` rule opens that port, a bare
-  `localhost` rule opens every listener on the host, local proxies
-  included. There is no fallback to a proxy: with the daemon down, or a
-  refused run, a policy with host rules exits 125 and prints
-  `sandwall-pf-unavailable` on stderr, and nothing runs. The rule text
-  and the Seatbelt profiles were checked on macOS 14.8.7; the daemon
-  has not yet run as root on a Mac.
-
-Addresses come from a permit set refreshed on a fixed interval (the
-system resolver reports no TTL), with the previous set kept for a grace
-period so a failover between two commands is covered; nothing is repaired
-mid-command. A bare address is admitted on the raw path only when an
-allowed name resolved to it: `matchIp` decides, the policy default does
-not vouch for a literal, so an open policy denies `ssh 1.2.3.4` in raw
-mode where the env path admitted it. Name the host, or allow the
-address.
 
 ## The policy file
 
@@ -352,9 +279,7 @@ PATH=/opt/osxcross/bin:$PATH nim c --os:macosx --cpu:amd64 \
 The `darwin24.5` triple prefix tracks the SDK version; adjust to whatever
 `ls /opt/osxcross/bin` shows. Output is an x86_64 Mach-O you can `scp` to a
 Mac and run directly (no codesigning needed over ssh). For arm64 use
-`--cpu:arm64` with the `aarch64-apple-darwin24.5-clang` wrapper. The
-pf daemon is a second binary: `src/sandwallpf.nim`, same flags, put
-next to `sandwall` on the Mac.
+`--cpu:arm64` with the `aarch64-apple-darwin24.5-clang` wrapper.
 
 ### Windows (mingw)
 

@@ -19,7 +19,6 @@
 
 import std/os
 import ./restrict
-import ./wall/permit
 
 type
   ExitCode* = distinct int
@@ -27,10 +26,8 @@ type
 proc `$`*(e: ExitCode): string = $(int(e))
 
 when defined(windows):
-  import std/[winlean, widestrs, strutils, times]
+  import std/[winlean, widestrs, strutils]
   import ./rtoken  # spawnSandboxed
-  import ./wall/wfp
-  import ./wall/winuser
 
   proc findExeInPath*(name: string): string =
     ## Resolve a bare command name against PATH/PATHEXT like cmd does:
@@ -113,8 +110,7 @@ else:
 
 template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
                         read: openArray[string] = [];
-                        denied: openArray[string] = [];
-                        permits: openArray[PermitEntry] = []): ExitCode =
+                        denied: openArray[string] = []): ExitCode =
   ## One-shot helper. Restricts to `writable` (full access) plus `read`
   ## (read+execute only) and runs `cmd`, returning its exit code.
   ##
@@ -125,24 +121,8 @@ template runSandboxed*(writable: openArray[string]; cmd: openArray[string];
   ## the writable roots, then `spawnSandboxedAndWait` runs the command
   ## as that user. Windows cannot confine the current process, so the
   ## whole sandbox takes effect at spawn time in the child.
-  ##
-  ## `permits` (Windows; a permit snapshot: `permit.readSnapshot` or
-  ## `permit.snapshot`) asks for the raw path: before anything else the
-  ## kernel learns the policy's addresses as this run's WFP permits
-  ## (`wfp.stampPermits`), so `cmd` needs no proxy env and connects
-  ## straight out. The permits end with the run. When they cannot be
-  ## stamped this raises `PermitStampError` before anything is
-  ## stamped, restricted or spawned: the caller then sets the proxy
-  ## env and calls again without `permits` (env mode). Other failures
-  ## are spawn failures, as before. POSIX ignores `permits`: the Linux
-  ## fence checks every connection itself, macOS has no raw path.
   block:
     when defined(windows):
-      var stamp: wfp.PermitStamp
-      defer: wfp.clearPermits(stamp)
-      if permits.len > 0:
-        stamp = wfp.stampPermits(winuser.sidString(),
-          wfp.permitFilters(permits, epochTime()), wfp.dnsServers())
       restrict(writable, read, denied)
       spawnSandboxedAndWait(cmd)
     else:

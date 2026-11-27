@@ -289,10 +289,10 @@ when defined(windows):
       return nil
     cast[winffi.PSID](sid)
 
-  proc sidString*(user = sandwallUserName): string =
-    ## SID string of the sandwall user (or of the account `user`), ""
-    ## when the account does not exist.
-    let sid = userSid(user)
+  proc sidString*(): string =
+    ## SID string of the sandwall user, "" when the user does not
+    ## exist.
+    let sid = userSid()
     if sid == nil: return ""
     defer: dealloc(sid)
     var str: WideCString

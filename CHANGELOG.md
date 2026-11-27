@@ -5,127 +5,15 @@ Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
-### Added
+### Removed
 
-- macOS raw egress through pf (`osx-plan`, chunks osx-2 to osx-4).
-  Seatbelt cannot permit a single address, so the kernel filter does it
-  by process: `sudo sandwall setup` installs `sandwallpf` as a
-  LaunchDaemon and records the account; the daemon enables pf, adds two
-  anchor calls to the live main ruleset without flushing it, blocks
-  the whole marker range for orphans, and serves `begin`, `refresh`,
-  `end` and `exec` over a 0600 unix socket authenticated by
-  `LOCAL_PEERCRED`. `exec` is the privileged hop: the caller's stdio
-  arrives by `SCM_RIGHTS`, the daemon forks, `setgid`s a marker from
-  42400-42499 that is not a group of the system, `setuid`s back to the
-  caller and execs the box child, which applies Seatbelt and execs the
-  tool. One child anchor per run: lo0 scoped to the policy's
-  localhost ports (pf takes `port` only with a `proto`, so that is
-  four rules), `return-rst` for TCP, `return` for UDP, then a pass.
-  Runs are swept 15 minutes after their lease with no live child; a
-  live child keeps its run. On macOS a policy with host rules no
-  longer starts a proxy: with the daemon down it exits 125 and prints
-  `sandwall-pf-unavailable`. `restrict(rules, raw = true)` on macOS
-  applies the file fence and the loopback decision only; Seatbelt gets
-  a `loopback` flag. Rule text, gid bookkeeping and the sweep are
-  unit-tested on Linux, the whole rule sets pass `pfctl -n` and both
-  Seatbelt variants were run under `sandbox-exec` on macOS 14.8.7; the
-  daemon itself has not run as root on a Mac yet.
+- The forwarder (raw egress) path that 0.6.0 to 0.6.2 shipped: fence
+  DNS with fake-IPs, the nft redirect, WFP permit filters, the pf
+  anchors and the `sandwallpf` daemon. A policy with host rules is
+  back to the socks proxy of 0.5.19. The code sits on the `forwarder`
+  branch, the plans and the 0.6 changelog under `archive/forwarder/`.
 
-## [0.6.1] - 2026-11-26
-
-### Fixed
-
-- `dialUp` gives each address its own slice of the connect budget
-  (capped at 2s) instead of one deadline for all of them: macOS never
-  completes a connect to a loopback neighbour nothing listens on
-  (Linux refuses it at once), so a rotated permit set's dead address
-  starved the grace address behind it and every connect stalled.
-- The fence DNS test bound its query socket to an abstract unix name,
-  which macOS does not have; it binds a file next to `dns.sock` now,
-  like the netns relay. `bindUnixAbstract` left sockshim with it, the
-  product has no caller.
-
-## [0.6.0] - 2026-11-26
-
-### Fixed
-
-- The Linux raw fence never ran green: `test_wall`'s raw scenario has
-  failed on every host it ran on, since its introduction. Four defects,
-  all in `wall/netns.nim`: `RTM_NEWROUTE` was 16, which is
-  `RTM_NEWLINK` (24 is the route), so the fence asked the kernel to
-  create an AF_INET "link"; the netlink ack parser read the reply's
-  outer `nlmsg_len` as the error code, masking every kernel refusal as
-  "Unknown error -64"; the fake-pool route carried no preferred source
-  (and the prefsrc attribute was typed 4, which is `RTA_OIF`), so
-  clients left with 0.0.0.0 as their address and the forwarder's reply
-  had nowhere to go; and the DNS relay bound its per-query reply
-  socket to an abstract unix name, which is per network namespace
-  since kernel 3.3, so the forwarder's reply refused before it ever
-  reached a socket. The relay now binds a file next to `dns.sock`.
-  Beyond those four, nft keeps `CAP_NET_ADMIN` across its execv via
-  ambient capabilities: the uid self-map makes the namespace euid
-  non-zero, and without this every capability dies at exec and the
-  ruleset load fails with EPERM.
-
-### Added
-
-- Linux: the raw egress path. `restrict(..., raw = true, dnsSockPath =
-  ...)` puts up a fence DNS that answers A queries for policy-allowed
-  names with a stable synthetic address from 198.18.0.0/15 and refuses
-  the rest, routes the pool, loads an nft redirect of every non-loopback
-  TCP connection onto a raw forwarder listener (SO_ORIGINAL_DST, `SWRAW
-  <ip> <port>`), and binds a `/etc/resolv.conf` pointing at a DNS relay
-  over inside the namespace. The forwarder maps the synthetic address
-  back to its name and checks the rule again at connect time; nothing in
-  the fence ever learns a real address. `startWallProxy` gained
-  `dnsSockPath` for the fence DNS listener; `RawUnavailableError`,
-  `RawMarker` and `RawFallbackExit` (75) are the fallback contract; the
-  standalone CLI tries raw first when `nft` is around and re-runs env
-  mode on the marker. (`wall/netns.nim`, `wall/dns.nim`,
-  `wall/proxy.nim`)
-- `wall/permit.nim`: a permit set, hostname rules as resolved address
-  sets with a fixed refresh (not DNS TTL), a previous-generation grace
-  period and single-flight lookups: `seedFromPolicy`, `refreshForSpawn`,
-  `snapshot`, `writeSnapshot`, `readSnapshot`, `matchIp`, `liveAddresses`,
-  `canStamp`. The proxy decides names through it (`getOrResolve`) and
-  bare IPs through `matchIp` plus the policy's own decision about the
-  literal, so an open policy keeps admitting them on the env path.
-- Windows: per-run permit filters. `wfp.stampPermits` adds one WFP PERMIT
-  filter per (address, port) of a snapshot in a dynamic engine session,
-  keyed on the sandwall user's SID, so a raw child connects straight out
-  with no proxy env; `runSandboxed(..., permits = snapshot)` stamps
-  before restricting or spawning and raises `PermitStampError` with
-  nothing stamped when it cannot (more than 512 pairs, or any engine
-  refusal). `setup --stamp-as ACCOUNT` (elevated) grants the spawning
-  account the right to add and remove its own filters, and
-  `wfp-stamp-probe` (unelevated, as that account) checks the grant.
-  Run on a Windows 11 host (26100): the grant is honored for a standard
-  user (`wfp-stamp-probe` exits 0 there, 1 without the grant), a raw run
-  reached its permitted address and no other, and names resolve inside
-  the fence. Two defects surfaced and are fixed: the permit filters'
-  descriptor named Administrators as owner, which an unelevated spawner
-  cannot assign (the add failed with 1307), so `permitFilterSddl` makes
-  the caller the owner; and `dnsServers` read `GetNetworkParams`'
-  FIXED_INFO 8 bytes off the header's layout (132-byte name fields, the
-  list at 272) and crashed, now `dnsServersIn` with a test. The CLI no
-  longer says the fence is not installed when an unelevated process
-  merely cannot read the engine.
-- `hosts.hasWildcardAllow`, `hosts.winningPorts`, `hosts.allowsAnyPort`;
-  the fence DNS decision, where a port-restricted allow keeps the name
-  resolvable.
-
-### Changed
-
-- The raw path is fail-closed for bare addresses: `matchIp` only, the
-  policy default does not vouch for a literal, so an open policy denies
-  `ssh 1.2.3.4` in raw mode where the env path admitted it. Name the host
-  or allow the address.
-- macOS: `restrict(rules, raw = true)` raises instead of silently running
-  env mode. Seatbelt's `(remote ip "host:port")` accepts `*` or
-  `localhost` only, so there is no per-address permit to stamp; macOS
-  stays on the proxy env path.
-- The CLI's "fence not installed" warning checks the dedicated-user
-  fence (`fenceStatus`), not the legacy AppContainer one.
+## [0.5.19] - 2026-11-25
 
 ### Fixed
 

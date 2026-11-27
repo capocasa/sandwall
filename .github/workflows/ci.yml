@@ -46,12 +46,7 @@ jobs:
           rm -rf ~/.cache/nim/sandwall_r
           nim c --path:src -d:release --passC:"-arch x86_64" --passL:"-arch x86_64" --cpu:amd64 -o:sandwall-x86_64 src/sandwall.nim
           lipo -create sandwall-arm64 sandwall-x86_64 -output sandwall
-          # the pf daemon ships next to sandwall (setup records its path)
-          mv sandwallpf sandwallpf-arm64
-          rm -rf ~/.cache/nim/sandwallpf_r
-          nim c --path:src -d:release --passC:"-arch x86_64" --passL:"-arch x86_64" --cpu:amd64 -o:sandwallpf-x86_64 src/sandwallpf.nim
-          lipo -create sandwallpf-arm64 sandwallpf-x86_64 -output sandwallpf
-          file sandwall sandwallpf
+          file sandwall
 
       - name: Run tests (Unix)
         if: runner.os != 'Windows'
@@ -82,7 +77,6 @@ jobs:
         run: |
           mkdir -p ${{ matrix.artifact }}
           cp sandwall ${{ matrix.artifact }}/
-          if [ -f sandwallpf ]; then cp sandwallpf ${{ matrix.artifact }}/; fi
           cp README.md LICENSE ${{ matrix.artifact }}/
           tar czf ${{ matrix.artifact }}.${{ matrix.ext }} ${{ matrix.artifact }}
 

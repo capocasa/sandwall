@@ -76,8 +76,7 @@ proc quote(s: string): string =
   result.add('"')
 
 proc buildProfile*(writable, read: openArray[string];
-                  denied: openArray[string] = []; egress = true;
-                  loopback = true): string =
+                  denied: openArray[string] = []; egress = true): string =
   ## Assemble the TinyScheme profile. Order is: (deny default), baseline read
   ## allows, caller write allows, caller read allows, then per-policy deny
   ## narrowing. Seatbelt evaluates last-match-wins, so the grammar's own
@@ -263,38 +262,28 @@ proc buildProfile*(writable, read: openArray[string];
     # Open network: a policy without host rules means "no network
     # restriction", but (deny default) covers sockets too, so the open
     # case needs explicit allows or every connect() dies on macOS (on
-    # Linux the same policy simply never enters a netns). The raw path
-    # lands here too: pf owns the address decision by marker gid, so
-    # the profile must not be read as the network fence. Loopback is
-    # the one thing left to Seatbelt: a policy with no localhost rule
-    # gives the child none (a local proxy would be an exit around the
-    # pf table), and a later deny wins over the allow above it.
+    # Linux the same policy simply never enters a netns).
     result.add("(allow network-outbound)\n")
     result.add("(allow network-inbound)\n")
-    if not loopback:
-      result.add("(deny network-outbound (remote ip \"localhost:*\"))\n")
 
 proc backendSupported*(): bool = true
 
 proc backendName*(): string = "seatbelt"
 
 proc restrictImpl*(writable, read: openArray[string];
-                    denied: openArray[string] = []; egress = true;
-                    loopback = true) =
+                    denied: openArray[string] = []; egress = true) =
   ## Confine the calling thread via a Seatbelt profile. Writable paths get
   ## full access, read paths get read + execute (via the file-read* allow on
   ## system dirs that makes exec work), everything else is denied. With
   ## `egress = false` the only permitted network is loopback - the wall
   ## proxy listens on the host's 127.0.0.1, which the sandbox reaches
-  ## directly (no bridge needed on macOS). With `loopback = false` and
-  ## egress the child has no loopback at all (the raw path, where pf
-  ## scopes what is left). The profile is rebuilt from scratch each call
-  ## - no state, matching Landlock.
+  ## directly (no bridge needed on macOS). The profile is rebuilt from
+  ## scratch each call - no state, matching Landlock.
   let init = loadSandboxInit()
   if init.isNil:
     raise newException(OSError,
       "sandwall: seatbelt unavailable (sandbox_init_with_parameters not found)")
-  let profile = buildProfile(writable, read, denied, egress, loopback)
+  let profile = buildProfile(writable, read, denied, egress)
   var errbuf: cstring = nil
   let r = init(profile.cstring, 0'u64, nil, addr errbuf)
   if r != 0:

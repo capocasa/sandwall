@@ -1,14 +1,14 @@
 # nimble file for sandwall
 # Package
 
-version       = "0.6.2"
+version       = "0.6.3"
 author        = "Carlo Capocasa"
 description   = "A process-level filesystem sandbox backed by OS-native primitives (Landlock, Seatbelt, Windows ACLs)"
 license       = "MIT"
 srcDir        = "src"
 installExt    = @["nim"]
 
-bin           = @["sandwall", "sandwallpf"]
+bin           = @["sandwall"]
 
 
 # Dependencies
@@ -24,14 +24,11 @@ task test, "Run sandwall tests":
     exec "nim c --path:../src -r test_sandbox.nim"
     exec "nim c --path:../src -r test_rules.nim"
     exec "nim c --path:../src -r test_hosts.nim"
-    exec "nim c --path:../src -r test_permit.nim"
-    exec "nim c --path:../src -r test_dns.nim"
     exec "nim c --path:../src -r test_proxy.nim"
     exec "nim c --path:../src -r test_connect.nim"
     exec "nim c --path:../src -r test_wall.nim"
     exec "nim c --path:../src -r test_winwall.nim"
     exec "nim c --path:../src -r test_winpath.nim"
-    exec "nim c --path:../src --threads:on -r test_pf.nim"
 
 # Windows cross-compile check (run manually; needs mingw):
 #   nim c --os:windows -d:mingw --cpu:amd64 --compileOnly --path:src src/sandwall/wall/wfp.nim

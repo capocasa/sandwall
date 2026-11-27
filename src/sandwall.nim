@@ -36,10 +36,6 @@ when isMainModule:
   when defined(windows):
     import ./sandwall/wall/proxy
     import ./sandwall/wall/stdio
-    import ./sandwall/wall/permit
-  when defined(macosx):
-    import ./sandwall/wall/pfdaemon
-    import ./sandwall/wall/permit
 
   const usage = """
 sandwall - a process sandbox backed by OS-native primitives
@@ -60,25 +56,6 @@ Usage:
   connection). System dirs stay read-only so CMD's binaries and libs
   stay runnable.
 
-  On Linux with nft available the run first tries the raw path: CMD
-  gets no proxy env vars, its DNS resolves allowed names to fake-IPs
-  and plain ssh/scp/telnet work. If the raw fence cannot go up the
-  command is re-run with proxy env vars (the env path) instead.
-
-  On macOS a policy with host rules is fenced by pf, keyed on a
-  marker gid the `sandwallpf` daemon plants: CMD gets no proxy env
-  vars, connects straight to the addresses the policy resolved, and
-  plain ssh/scp work. It needs the one-time elevated `sudo sandwall
-  setup` (a LaunchDaemon); with the daemon down the run fails closed
-  with the reason. `sandwall setup --status` tells.
-
-  On Windows the run also tries the raw path first when every allow
-  rule names an exact host (a wildcard goes to the proxy) and
-  `sandwall setup --stamp-as ACCOUNT` granted the spawning account the
-  per-run kernel permits; a refused stamp falls back to the env path
-  with the reason printed. `sandwall wfp-stamp-probe`, run unelevated
-  as that account, tells whether it can stamp.
-
   sandwall connect HOST PORT
       SOCKS5 stdio adapter for ssh ProxyCommand-style tools: pumps
       stdio through the wall proxy at 127.0.0.1:$WALL_PROXY_PORT
@@ -93,8 +70,8 @@ Examples:
 The restriction is monotonic: permanent for this process and all
 descendants. There is no "unrestrict".
 
-Note: the `setup` command exists on Windows and macOS builds, whose
-fences need a one-time elevated install; elsewhere networking and
+Note: the `setup` command exists only on Windows builds (the Windows
+fence needs a one-time elevated install); on this build networking and
 filesystem policy are enforced with no setup step.
   """
 
@@ -114,151 +91,6 @@ filesystem policy are enforced with no setup step.
       socksConnect(proxyPort, args[0], port)
     else:
       stderr.writeLine("sandwall: connect is POSIX-only"); 2
-
-  when defined(linux):
-    import ./sandwall/wall/netns
-
-    proc runRaw(rules: seq[Rule]; projectDir, policyPath: string;
-                cmd: seq[string]): int =
-      ## The first attempt of a run when nft is around: fork, and let
-      ## the child fence itself in raw mode and exec. Returns the
-      ## child's exit code, or -1 when the child refused raw mode (exit
-      ## 75 AND the marker over the pipe only the pre-exec fence code
-      ## could write), in which case the caller runs env mode in-process.
-      ## The marker on stderr alone is not enough: a command may exit
-      ## 75 on its own, and running it twice is not an option.
-      var marker: array[2, cint]
-      if posix.pipe(marker) != 0: raiseOSError(osLastError())
-      let pid = posix.fork()
-      if pid == 0:
-        discard posix.close(marker[0])
-        discard fcntl(marker[1], F_SETFD, FD_CLOEXEC)
-        discard setsid()
-        try:
-          restrict(rules, projectDir, policyPath, raw = true,
-                   fallbackFd = marker[1])
-          exec(cmd)
-        except CatchableError as e:
-          stderr.writeLine("sandwall: " & e.msg)
-        exitnow(127)
-      if pid < 0:
-        discard posix.close(marker[0])
-        discard posix.close(marker[1])
-        raiseOSError(osLastError())
-      discard posix.close(marker[1])
-      var status: cint
-      discard posix.waitpid(pid, status, 0)
-      # The proxy the child forked may still hold the write end for a
-      # moment; the marker, if any, is already in the pipe, so look
-      # without waiting.
-      var pfd = TPollfd(fd: marker[0], events: POLLIN, revents: 0)
-      var got: array[RawMarker.len, char]
-      let n = if poll(addr pfd, 1, 0) > 0:
-                posix.read(marker[0], addr got[0], got.len)
-              else: 0
-      discard posix.close(marker[0])
-      var gotMarker = newString(max(n, 0))
-      for i in 0 ..< gotMarker.len: gotMarker[i] = got[i]
-      var code = 1
-      if WIFEXITED(status): code = int(WEXITSTATUS(status))
-      elif WIFSIGNALED(status): code = 128 + int(WTERMSIG(status))
-      if code == RawFallbackExit and gotMarker == RawMarker:
-        stderr.writeLine("sandwall: retrying with proxy env")
-        return -1
-      code
-
-  when defined(macosx):
-    proc pfChildMain(args: seq[string]): int =
-      ## The box child sandwallpf execs: `--pf-child PROJECT POLICY --
-      ## CMD`. This process already carries the run's marker gid and pf
-      ## holds its fence, so the policy's addresses need no seatbelt
-      ## lines: apply the file fence and the loopback decision, exec.
-      if args.len < 4 or args[2] != "--":
-        stderr.writeLine("sandwall: --pf-child needs PROJECT POLICY -- CMD")
-        return 2
-      let projectDir = args[0]
-      try:
-        let rules = parsePolicy(readFile(args[1]), projectDir)
-        restrict(rules, projectDir, args[1], raw = true)
-        exec(args[3 .. ^1])
-      except CatchableError as e:
-        stderr.writeLine("sandwall: " & e.msg)
-        return 127
-
-    proc runPf(rules: seq[Rule]; projectDir, policyPath: string;
-               cmd: seq[string]): int =
-      ## A run with host rules on macOS: pf owns the network. The
-      ## daemon puts the run's fence up (begin), execs the box child
-      ## into a marker gid and this process waits on that child; `end`
-      ## takes the fence down. A `+*` policy stamps nothing. There is
-      ## no fallback to a proxy: daemon down or a refused stamp fails
-      ## the run closed, with the reason.
-      let r = resolve(rules)
-      let hosts = toHostList(r.hosts)
-      let lb = loopbackPolicy(hosts)
-      let open = allowsEverything(hosts)
-      var entries: seq[PermitEntry]
-      if not open:
-        let ps = newPermitSet()
-        let report = ps.seedFromPolicy(hosts, 1500)
-        entries = ps.snapshot()
-        ps.close()
-        let unresolved = report.failed.len + report.pending.len
-        if unresolved > 0:
-          stderr.writeLine("sandwall: " & $unresolved &
-            " allowed host(s) did not resolve in time; not permitted " &
-            "this run")
-      let st = pfFenceStatus()
-      if not st.running:
-        stderr.writeLine("sandwall: cannot fence egress: " & st.hint)
-        stderr.writeLine(PfMarker)
-        return PfUnavailableExit
-      var runId = ""
-      try:
-        if not open:
-          runId = pfBegin(PfSockPath, lb.ports, entries)
-        # Rules read from stdin are rendered into the run dir for the
-        # child to parse; a policy file is handed on as it is.
-        var polPath = policyPath
-        if polPath.len == 0:
-          let runDir = getTempDir() / ("sandwall-" & $getCurrentProcessId())
-          createDir(runDir)
-          polPath = runDir / "policy"
-          writeFile(polPath, renderPolicy(rules))
-          setFilePermissions(polPath, {fpUserRead, fpUserWrite})
-        var child = @[getAppFilename(), "--pf-child", projectDir, polPath,
-                      "--"]
-        child.add cmd
-        return pfExec(PfSockPath, runId, child, projectDir)
-      except PfError as e:
-        stderr.writeLine("sandwall: " & e.msg)
-        stderr.writeLine(PfMarker)
-        return PfUnavailableExit
-      finally:
-        if runId.len > 0: pfEnd(PfSockPath, runId)
-
-    proc pfSetupMain(args: seq[string]): int =
-      if "--status" in args:
-        let st = pfFenceStatus()
-        echo "sandwallpf daemon: installed=", st.installed,
-             " running=", st.running
-        if st.hint.len > 0: echo "  ", st.hint
-        return if st.running: 0 else: 1
-      if "--uninstall" in args:
-        echo pfUninstall()
-        return 0
-      let sudoUid = try: parseInt(getEnv("SUDO_UID"))
-                     except ValueError: -1
-      if sudoUid < 0:
-        stderr.writeLine("sandwall: setup must run from the account that " &
-          "spawns sandwall, with sudo (SUDO_UID missing)")
-        return 1
-      try:
-        echo pfSetup(sudoUid, getAppFilename().parentDir / "sandwallpf")
-        return 0
-      except CatchableError as e:
-        stderr.writeLine("sandwall: " & e.msg)
-        return 1
 
   proc runMain(args: seq[string]): int =
     ## sandwall RULES [--] CMD [ARGS...]
@@ -289,17 +121,6 @@ filesystem policy are enforced with no setup step.
     # would miss CMD's children.
     when defined(posix):
       discard setsid()
-      when defined(macosx):
-        # A policy with host rules is fenced by pf: the run goes through
-        # the sandwallpf broker and never sets a proxy env var.
-        if resolve(rules).hosts.len > 0:
-          return runPf(rules, projectDir, policyPath, cmd)
-      when defined(linux):
-        # Raw mode is tried only when nft is there to load the redirect;
-        # the child decides whether it holds (restrict, RawUnavailableError).
-        if findNft().len > 0:
-          let rc = runRaw(rules, projectDir, policyPath, cmd)
-          if rc >= 0: return rc
       try:
         restrict(rules, projectDir, policyPath)
         exec(cmd)
@@ -308,61 +129,18 @@ filesystem policy are enforced with no setup step.
         return 127
     else:
       # Windows cannot confine the current process; runSandboxed
-      # restricts (sandbox user ACL stamps) and spawns the child as
-      # that user.
+      # restricts (AppContainer SID + ACL stamps) and spawns the child
+      # in the container, rolling the ACLs back after.
       let r = resolve(rules)
-      # Network: no host rules -> open (POSIX parity). Host rules ->
-      # the WFP fence (installed via `sandwall setup`) confines the
-      # child's egress to loopback; the wall proxy enforces the
-      # hostname allowlist. If the fence is NOT installed, warn: the
-      # child has open network in either mode (accepted degrade).
+      # Network: no host rules -> internetClient (open, POSIX parity).
+      # Host rules -> the WFP fence (installed via `sandwall setup`)
+      # confines egress to loopback so the child can only reach the
+      # wall proxy, which enforces the hostname allowlist. If the fence
+      # is NOT installed, warn and leave the network open (accepted
+      # degrade posture). The wall proxy runs either way (interface
+      # parity; harmless when the fence is absent).
       let netAllowed = r.hosts.len == 0
-      let hosts = toHostList(r.hosts)
       var wallProxy: WallProxy
-      var permits: seq[PermitEntry]
-      if not netAllowed:
-        let st = try: fenceStatus()
-                 except CatchableError: (false, 0, "")
-        if not st.installed:
-          if st.hint.len > 0:
-            # Denied, not absent: the spawning account is unelevated and
-            # cannot read the engine. Unknown is not "not installed",
-            # so this is a note, not the warning, on every such run.
-            stderr.writeLine("sandwall: note: WFP fence status unknown (" &
-              st.hint & "); without the fence the child has open network " &
-              "access")
-          else:
-            stderr.writeLine("sandwall: WARNING: host rules are present but " &
-              "the WFP fence is not installed. The child will have OPEN " &
-              "network access. Run 'sandwall setup' (elevated) to install " &
-              "the fence and enforce the host allowlist.")
-        # Raw path first. When every allow rule is an exact name or an
-        # IP literal, the policy's addresses are seeded here, within
-        # 1.5 s, and the kernel permits them for this run
-        # (wfp.stampPermits): CMD gets no proxy env and connects
-        # straight out. A wildcard allow admits names no snapshot can
-        # enumerate and a deny-only policy has nothing to stamp; both
-        # go to the proxy (env mode), which decides by name.
-        if hosts.canStamp:
-          let ps = newPermitSet()
-          let report = ps.seedFromPolicy(hosts, 1500)
-          permits = ps.snapshot()
-          ps.close()
-          let unresolved = report.failed.len + report.pending.len
-          if unresolved > 0:
-            stderr.writeLine("sandwall: " & $unresolved &
-              " allowed host(s) did not resolve in time; not permitted " &
-              "this run")
-          if permits.len == 0:
-            stderr.writeLine("sandwall: no allowed host resolved; using " &
-              "the proxy env path")
-      if permits.len > 0:
-        try:
-          return int(runSandboxed(r.writable, cmd, read = r.readonly,
-                                  denied = r.denied, permits = permits))
-        except PermitStampError as e:
-          stderr.writeLine("sandwall: " & e.msg &
-            "; using the proxy env path")
       if not netAllowed:
         let polPath = if policyPath.len > 0: policyPath
                       else:
@@ -372,9 +150,19 @@ filesystem policy are enforced with no setup step.
                         p
         wallProxy = startWallProxy(polPath, projectDir)
         setProxyEnv(wallProxy.port)
-      # Env mode: loopback reaches the wall proxy, which enforces the
-      # allowlist; everything else the fence blocks. Without the fence
-      # the child has open network (accepted degrade).
+        # Check if the WFP fence is installed. If not, warn: the child
+        # will have open network access despite host rules.
+        let fenceInstalled = try: acFenceStatus().installed
+                              except CatchableError: false
+        if not fenceInstalled:
+          stderr.writeLine("sandwall: WARNING: host rules are present but " &
+            "the WFP fence is not installed. The child will have OPEN " &
+            "network access. Run 'sandwall setup' (elevated) to install " &
+            "the fence and enforce the host allowlist.")
+      # With host rules: the WFP fence (if installed via setup)
+      # blocks non-loopback egress at the kernel; loopback reaches the
+      # wall proxy which enforces the allowlist. If the fence is
+      # absent, the child has open network (accepted degrade).
       try:
         return int(runSandboxed(r.writable, cmd, read = r.readonly,
                                 denied = r.denied))
@@ -389,9 +177,6 @@ filesystem policy are enforced with no setup step.
     if args.len == 0 or args[0] == "-h" or args[0] == "--help":
       stdout.writeLine(usage)
       return 0
-    when defined(macosx):
-      # Internal: the box child the pf broker execs (never typed).
-      if args[0] == "--pf-child": return pfChildMain(args[1 .. ^1])
     case args[0]
     of "connect":
       connectMain(args[1 .. ^1])
@@ -411,24 +196,6 @@ filesystem policy are enforced with no setup step.
           unexemptAcLoopback()
           echo "sandwall: wall filters removed"
           return 0
-        # --stamp-as ACCOUNT: let the unelevated account that spawns
-        # stamp per-run permits (the raw path). Without it every run
-        # goes through the proxy env path. The account must not be the
-        # sandbox user itself: it could then widen its own fence.
-        var stampAs = ""
-        for i, a in args:
-          if a == "--stamp-as" and i + 1 < args.len: stampAs = args[i + 1]
-        var stampSid = ""
-        if stampAs.len > 0:
-          stampSid = sidString(stampAs)
-          if stampSid.len == 0:
-            stderr.writeLine("sandwall: --stamp-as: no such account: '" &
-              stampAs & "'")
-            return 1
-          if stampSid == sidString():
-            stderr.writeLine("sandwall: --stamp-as must not be the " &
-              "sandbox user")
-            return 1
         try:
           let sid = setupSandwallUser()
           installFence(sid, FirstProxyPort, LastProxyPort)
@@ -438,35 +205,18 @@ filesystem policy are enforced with no setup step.
             echo "sandwall: AC fence installed"
           except OSError as e:
             stderr.writeLine("sandwall: AC fence install failed: " & e.msg)
-          if stampSid.len > 0:
-            try:
-              grantPermitStamping(stampSid)
-              echo "sandwall: ", stampAs,
-                " may stamp per-run permits (check with wfp-stamp-probe)"
-            except OSError as e:
-              stderr.writeLine("sandwall: permit stamping not granted: " &
-                e.msg & "; runs use the proxy env path")
           echo "sandwall: setup complete; sandwall user SID ", sid
           return 0
         except OSError as e:
           stderr.writeLine("sandwall: " & e.msg)
           return 1
-      elif defined(macosx):
-        pfSetupMain(args)
       else:
-        stderr.writeLine("sandwall: setup is only available on Windows and " &
-          "macOS builds (their fences need a one-time elevated install). " &
-          "On this build no setup is needed."); 2
+        stderr.writeLine("sandwall: setup is only available on Windows builds " &
+          "(the Windows fence needs a one-time elevated install). On this " &
+          "build no setup is needed."); 2
     of "wfp-probe":
       when defined(windows):
         wfpProbeMain()
-      else:
-        0  # internal: nothing to probe on POSIX
-    of "wfp-stamp-probe":
-      # The raw path's gate, run unelevated as the spawning account:
-      # can this session stamp and remove one permit filter?
-      when defined(windows):
-        wfpStampProbeMain(sidString())
       else:
         0  # internal: nothing to probe on POSIX
     of "stdio-relay":
