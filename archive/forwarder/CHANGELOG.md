@@ -1,0 +1,612 @@
+# Changelog
+
+All notable changes to sandwall. Dates are commit dates, not release dates.
+Format loosly based on [Keep a Changelog](https://keepachangelog.com/).
+
+## Unreleased
+
+### Added
+
+- macOS raw egress through pf (`osx-plan`, chunks osx-2 to osx-4).
+  Seatbelt cannot permit a single address, so the kernel filter does it
+  by process: `sudo sandwall setup` installs `sandwallpf` as a
+  LaunchDaemon and records the account; the daemon enables pf, adds two
+  anchor calls to the live main ruleset without flushing it, blocks
+  the whole marker range for orphans, and serves `begin`, `refresh`,
+  `end` and `exec` over a 0600 unix socket authenticated by
+  `LOCAL_PEERCRED`. `exec` is the privileged hop: the caller's stdio
+  arrives by `SCM_RIGHTS`, the daemon forks, `setgid`s a marker from
+  42400-42499 that is not a group of the system, `setuid`s back to the
+  caller and execs the box child, which applies Seatbelt and execs the
+  tool. One child anchor per run: lo0 scoped to the policy's
+  localhost ports (pf takes `port` only with a `proto`, so that is
+  four rules), `return-rst` for TCP, `return` for UDP, then a pass.
+  Runs are swept 15 minutes after their lease with no live child; a
+  live child keeps its run. On macOS a policy with host rules no
+  longer starts a proxy: with the daemon down it exits 125 and prints
+  `sandwall-pf-unavailable`. `restrict(rules, raw = true)` on macOS
+  applies the file fence and the loopback decision only; Seatbelt gets
+  a `loopback` flag. Rule text, gid bookkeeping and the sweep are
+  unit-tested on Linux, the whole rule sets pass `pfctl -n` and both
+  Seatbelt variants were run under `sandbox-exec` on macOS 14.8.7; the
+  daemon itself has not run as root on a Mac yet.
+
+## [0.6.1] - 2026-11-26
+
+### Fixed
+
+- `dialUp` gives each address its own slice of the connect budget
+  (capped at 2s) instead of one deadline for all of them: macOS never
+  completes a connect to a loopback neighbour nothing listens on
+  (Linux refuses it at once), so a rotated permit set's dead address
+  starved the grace address behind it and every connect stalled.
+- The fence DNS test bound its query socket to an abstract unix name,
+  which macOS does not have; it binds a file next to `dns.sock` now,
+  like the netns relay. `bindUnixAbstract` left sockshim with it, the
+  product has no caller.
+
+## [0.6.0] - 2026-11-26
+
+### Fixed
+
+- The Linux raw fence never ran green: `test_wall`'s raw scenario has
+  failed on every host it ran on, since its introduction. Four defects,
+  all in `wall/netns.nim`: `RTM_NEWROUTE` was 16, which is
+  `RTM_NEWLINK` (24 is the route), so the fence asked the kernel to
+  create an AF_INET "link"; the netlink ack parser read the reply's
+  outer `nlmsg_len` as the error code, masking every kernel refusal as
+  "Unknown error -64"; the fake-pool route carried no preferred source
+  (and the prefsrc attribute was typed 4, which is `RTA_OIF`), so
+  clients left with 0.0.0.0 as their address and the forwarder's reply
+  had nowhere to go; and the DNS relay bound its per-query reply
+  socket to an abstract unix name, which is per network namespace
+  since kernel 3.3, so the forwarder's reply refused before it ever
+  reached a socket. The relay now binds a file next to `dns.sock`.
+  Beyond those four, nft keeps `CAP_NET_ADMIN` across its execv via
+  ambient capabilities: the uid self-map makes the namespace euid
+  non-zero, and without this every capability dies at exec and the
+  ruleset load fails with EPERM.
+
+### Added
+
+- Linux: the raw egress path. `restrict(..., raw = true, dnsSockPath =
+  ...)` puts up a fence DNS that answers A queries for policy-allowed
+  names with a stable synthetic address from 198.18.0.0/15 and refuses
+  the rest, routes the pool, loads an nft redirect of every non-loopback
+  TCP connection onto a raw forwarder listener (SO_ORIGINAL_DST, `SWRAW
+  <ip> <port>`), and binds a `/etc/resolv.conf` pointing at a DNS relay
+  over inside the namespace. The forwarder maps the synthetic address
+  back to its name and checks the rule again at connect time; nothing in
+  the fence ever learns a real address. `startWallProxy` gained
+  `dnsSockPath` for the fence DNS listener; `RawUnavailableError`,
+  `RawMarker` and `RawFallbackExit` (75) are the fallback contract; the
+  standalone CLI tries raw first when `nft` is around and re-runs env
+  mode on the marker. (`wall/netns.nim`, `wall/dns.nim`,
+  `wall/proxy.nim`)
+- `wall/permit.nim`: a permit set, hostname rules as resolved address
+  sets with a fixed refresh (not DNS TTL), a previous-generation grace
+  period and single-flight lookups: `seedFromPolicy`, `refreshForSpawn`,
+  `snapshot`, `writeSnapshot`, `readSnapshot`, `matchIp`, `liveAddresses`,
+  `canStamp`. The proxy decides names through it (`getOrResolve`) and
+  bare IPs through `matchIp` plus the policy's own decision about the
+  literal, so an open policy keeps admitting them on the env path.
+- Windows: per-run permit filters. `wfp.stampPermits` adds one WFP PERMIT
+  filter per (address, port) of a snapshot in a dynamic engine session,
+  keyed on the sandwall user's SID, so a raw child connects straight out
+  with no proxy env; `runSandboxed(..., permits = snapshot)` stamps
+  before restricting or spawning and raises `PermitStampError` with
+  nothing stamped when it cannot (more than 512 pairs, or any engine
+  refusal). `setup --stamp-as ACCOUNT` (elevated) grants the spawning
+  account the right to add and remove its own filters, and
+  `wfp-stamp-probe` (unelevated, as that account) checks the grant.
+  Run on a Windows 11 host (26100): the grant is honored for a standard
+  user (`wfp-stamp-probe` exits 0 there, 1 without the grant), a raw run
+  reached its permitted address and no other, and names resolve inside
+  the fence. Two defects surfaced and are fixed: the permit filters'
+  descriptor named Administrators as owner, which an unelevated spawner
+  cannot assign (the add failed with 1307), so `permitFilterSddl` makes
+  the caller the owner; and `dnsServers` read `GetNetworkParams`'
+  FIXED_INFO 8 bytes off the header's layout (132-byte name fields, the
+  list at 272) and crashed, now `dnsServersIn` with a test. The CLI no
+  longer says the fence is not installed when an unelevated process
+  merely cannot read the engine.
+- `hosts.hasWildcardAllow`, `hosts.winningPorts`, `hosts.allowsAnyPort`;
+  the fence DNS decision, where a port-restricted allow keeps the name
+  resolvable.
+
+### Changed
+
+- The raw path is fail-closed for bare addresses: `matchIp` only, the
+  policy default does not vouch for a literal, so an open policy denies
+  `ssh 1.2.3.4` in raw mode where the env path admitted it. Name the host
+  or allow the address.
+- macOS: `restrict(rules, raw = true)` raises instead of silently running
+  env mode. Seatbelt's `(remote ip "host:port")` accepts `*` or
+  `localhost` only, so there is no per-address permit to stamp; macOS
+  stays on the proxy env path.
+- The CLI's "fence not installed" warning checks the dedicated-user
+  fence (`fenceStatus`), not the legacy AppContainer one.
+
+### Fixed
+
+- Linux: the Landlock layer sets NO_NEW_PRIVS through libc's `prctl`
+  instead of raw syscall 157. That number is prctl only on x86_64; on
+  arm64 it is `setsid(2)` (asm-generic numbers; prctl is 167 there), so
+  the flag was never set on arm64. A qemu-aarch64 probe shows the call
+  returning a fresh session id: the fenced command was silently
+  detached from its controlling terminal, and the next call failed with
+  EPERM, which is the "prctl(NO_NEW_PRIVS) failed (errno=1)" the arm64
+  CI runner has shown since the sandbox trio went chronic, and which
+  0.5.17's degrade now turns into "continuing WITHOUT landlock
+  confinement". The EPERM that 0.5.17 and 0.5.18 attributed to kernels
+  rejecting the prctl inside a fresh user namespace was this: mainline
+  kernels do not reject it.
+- Linux: Landlock rule paths are opened with O_PATH. Opening them
+  O_RDONLY made add_rule fail for any path the sandboxed process could
+  not read (write-only files, FIFOs, /dev/tty without a controlling
+  terminal), and the swallowed error silently dropped the rule.
+
+## [0.5.18] - 2026-11-25
+
+### Fixed
+
+- Linux: NO_NEW_PRIVS is now set inside ensureUserns, before the very
+  first unshare(2). 0.5.17 set it at the top of restrict(), but the
+  device-mask and rule-file paths enter the user namespace before that
+  point, so the flag was still set too late on kernels that reject
+  prctl(PR_SET_NO_NEW_PRIVS) inside a fresh user namespace (arm64 CI
+  runners). Every unshare funnels through ensureUserns, so this covers
+  the netns fence, the deny masks and the mount namespace alike.
+
+## [0.5.17] - 2026-11-25
+
+### Fixed
+
+- Linux: NO_NEW_PRIVS is set before any namespace switch and a failed
+  Landlock layer degrades with a notice instead of crashing the fenced
+  command. Some kernels reject prctl(PR_SET_NO_NEW_PRIVS) with EPERM once
+  the caller sits in a fresh user namespace (arm64 CI runners, observed
+  2026-11); the flag is sticky and inherited across unshare(2), so setting
+  it before the unshare keeps the fence fully enforced there, and any
+  remaining Landlock failure now prints
+  "sandwall: ...; continuing WITHOUT landlock confinement" and lets the
+  mount-namespace masks and the netns fence stand, matching the posture of
+  the other layer degrades.
+
+## [0.5.16] - 2026-11-24
+
+### Changed
+
+- POSIX baselines grant `/dev/ptmx` writable. Pty allocation opens
+  ptmx O_RDWR - `script`, `ssh`, `python pty` all start there - and
+  the node was in no baseline set, so every fenced open died EACCES
+  even where the caller's device handling spared it (3code's device
+  mask excludes ptmx; the Landlock domain denied it anyway). The
+  kernel-minted slaves under `/dev/pts` stay ungranted: they are
+  other sessions' terminals, and exposing them is a caller grant's
+  decision, not the baseline's.
+
+## [0.5.15] - 2026-11-20
+
+### Fixed
+
+- Linux: the user namespace is now mapped, so fenced commands run
+  as the launching user instead of nobody. ensureUserns composed its
+  id-map writes from ids read only AFTER unshare(2) - by then they
+  read as the unmapped overflow 65534, and the kernel rejects a
+  "0 65534 1" line (an unprivileged writer may map only its own
+  id), so every deny-masked or network-fenced command ran stranded
+  in an unmapped namespace: `id` said nobody, files read
+  nobody:nobody, git flagged dubious ownership, ssh saw a passwd
+  home of `/`. The ids are now read before the unshare and SELF-
+  mapped (uid/gid onto themselves, not onto 0): the confined
+  process keeps the user's id - caps over the namespace come from
+  the unshare itself, not from the mapped value, and mapping to 0
+  bought nothing except a lying `id` and root-shaped tool behavior.
+  A nested run under an outer Landlock domain still degrades (the
+  map files cannot be opened for write there); callers report it.
+
+## [0.5.12] - 2026-10-20
+
+### Fixed
+
+- macOS: unix sockets now ride the path grants. Seatbelt gates
+  socket creation (`system-socket`), bind (`network-bind`), and
+  connect (`network-outbound` on unix paths) as network operations
+  no file rule reaches, so a writable path was file-full but
+  socket-dead: `dotnet` builds died binding their diagnostic and
+  MSBuild worker sockets under `allow /tmp` (3code #55; claude-code
+  #41254 hit the same wall, codex #12702 and Anthropic's
+  sandbox-runtime ship the same three-op shape). Writable paths get
+  bind + connect, read paths connect only (`readonly
+  /var/run/docker.sock` is the shape for a service socket), and
+  denied paths lose their sockets along with their files. The grants
+  hold in both egress modes - a fenced build still needs its local
+  IPC, and unix sockets are no more network-namespaced under the
+  Linux netns fence, which leaves them to the path rules there.
+  Landlock needed no counterpart: MAKE_SOCK already rides the
+  writable grant and connect() is not Landlock-gated.
+
+## [0.5.11] - 2026-10-15
+
+### Added
+
+- `ask` verb: rules can request interactive approval for a path
+  (`ask /path [writable] [deny-with-approval]`), denials stay
+  implicit until an ask rule fires, and superseded asks stop
+  masking later denies. Read-only ask masks landlock/seatbelt
+  write-through defaults the same way explicit readonly lines do.
+
+## [0.5.10] - 2026-10-14
+
+### Added
+
+- macOS: the seatbelt profile now carries the operations the JVM
+  needs at startup and no path rule can reach, so `java`/`javac`
+  work under the sandbox: `sysctl-write` for exactly
+  `kern.grade_cputype` (the kernel registers that sysctl CTL_RW, so
+  Seatbelt classifies even the JVM's read of it as a write) and a
+  `mach-lookup` for `com.apple.system.opendirectoryd.libinfo`
+  (getpwnam/getpwuid user lookups; the JVM resolves user.home
+  through it). Same wall as openai/codex#3978.
+
+- macOS: `signal` and `process-info*` are allowed for
+  `same-sandbox` targets only, so build tools and test harnesses can
+  kill and query the children they spawn while the user's session
+  stays unreachable (the shape Chrome's and Codex's profiles ship).
+
+## [0.5.7] - 2026-09-11
+
+### Fixed
+
+- Windows: user-setup failures from `NetUserAdd`/`NetUserSetInfo`
+  now say what to do (access denied needs an account with admin
+  rights, run setup elevated) instead of a raw netapi code, and the
+  activate path prints the actual return code - it previously
+  printed the parmErr index, which surfaced as "netapi error 0".
+
+- Windows: the WFP fence was volatile - filters, sublayer and
+  provider were added as static objects, so the whole fence vanished
+  when the BFE stopped at shutdown and only the next `setup` re-armed
+  it. Filters and sublayer now carry `FWPM_*_FLAG_PERSISTENT` and
+  survive reboots. The FWPM provider is gone entirely: the BFE marks a
+  provider's filters disabled at boot when the provider has no
+  Windows service name (FWPM_FILTER_FLAG_DISABLED), which would have
+  left a fence that enumerates as installed but no longer enforces
+  (same providerless shape as the srt reference implementation).
+
+## [0.5.6] - 2026-09-11
+
+### Fixed
+
+- Windows: `setup` created the `sandwall` account **disabled**. The
+  `UF_NORMAL_ACCOUNT` constant was `0x0002`, which is `UF_ACCOUNTDISABLE`
+  (`UF_NORMAL_ACCOUNT` is `0x0200`), so `NetUserAdd` set the disable bit
+  literally and every sandboxed `CreateProcessWithLogonW` failed 1327
+  (ERROR_ACCOUNT_RESTRICTION) - the account could never log on. The
+  constant is corrected and setup now re-activates the account via
+  `NetUserSetInfo` level 1008, which also heals accounts stranded
+  disabled by an earlier build.
+
+- Windows: the sandwall-user credential was stored per-user
+  (`%LOCALAPPDATA%\sandwall\credentials.dat`, DPAPI CurrentUser
+  scope). When setup elevated into a different account than the one
+  that later runs the sandbox (a standard user typing admin
+  credentials into the UAC prompt, or a SYSTEM install), the blob
+  landed in the setup account's profile and was undecryptable by the
+  real user - so `backendSupported` returned false and every run
+  reported the sandbox as unset up even though `setup` printed
+  success. The credential now lives in a machine-wide store
+  (`%ProgramData%\sandwall\credentials.dat`) under DPAPI
+  LOCAL_MACHINE scope, readable by any local user; the sandwall
+  account itself gets a DENY ACE on the file so a sandboxed child
+  cannot learn its own password. A leftover per-user blob from an
+  earlier setup is removed. (GitHub issue #33.)
+
+## [0.5.5] - 2026-08-18
+
+### Fixed
+
+- Windows: the endCapture buffer lived on the ORC thread heap - grown
+  by the pump thread, freed by the caller after the pump thread (and
+  its thread-local allocator, discarded at join) was gone. The
+  cross-thread dealloc landed in rawDealloc on freed TLS state and
+  SIGSEGV'd (seen as the 3code Windows `curl 1.1.1.1` deny crash in
+  endCapture). The capture buffer now lives on the Win32 process
+  heap, which any thread may grow and the caller reads safely.
+
+## [0.5.4] - 2026-08-18
+
+### Added
+
+- Windows: `sandwall/wall` exports `beginCapture`/`endCapture` so a
+  parent can run restrict + CreateProcessWithLogonW in-process and
+  collect the child's named-pipe stdout into a buffer, without a
+  second 3code.exe relay.
+
+### Fixed
+
+- Windows: ACL/ACE header offsets in `hasSidAce` were wrong after the
+  C shim drop, so the redundant-stamp skip never matched and setup
+  re-walked the MSYS2 tree every run.
+- Windows: the wall proxy's accept-thread state was an untraced
+  allocShared pointer; ORC collected it after a fenced curl and the
+  interactive parent SIGSEGV'd. It stays rooted from WallProxy now.
+- Windows: children spawned as the sandbox user (bash, whoami,
+  powershell) died 0xC0000142 because setup stamped WinSta0 with
+  GENERIC_ALL instead of this session's station with
+  WINSTA_ALL/DESKTOP_ALL. Those masks are granted at spawn.
+- Windows: `sandwall setup` caches the decrypted sandbox password and
+  tries logonFlags=0 before LOGON_WITH_PROFILE, saving hundreds of ms
+  per spawn.
+
+## [0.5.3] - 2026-08-17
+
+### Fixed
+
+- Windows: `FwpmProviderAdd0` failed with `FWP_E_INVALID_PARAMETER`
+  (`-2144206795`) on every `setup` after the C shim was dropped.
+  `FWPM_PROVIDER0` was missing `serviceName` (WFP read a garbage
+  pointer past the struct) and `FWPM_ACTION0.filterType` was a
+  pointer instead of an inline GUID (would have shifted every field
+  after `action` on `FwpmFilterAdd0`). Compile-time size asserts pin
+  the x64 layouts against the SDK headers.
+- Windows: `sandwall setup` over SSH (session 0) hung in
+  `OpenDesktopW("default")`. Prefer WinSta0 when it opens, otherwise
+  stamp the process's own station/desktop via GetThreadDesktop.
+- Windows: re-running setup no longer re-walks the ~30k-file MSYS2
+  tree; `grantExecute` skips `stampAce` when an ALLOW ACE for the
+  sandbox user is already on the path. `hasSidAce` no longer requires
+  an exact inheritance-flag match (SetNamedSecurityInfo rewrites those).
+- Windows: re-running setup no longer rotates the sandwall password
+  via `NetUserSetInfo`; keep the stored DPAPI blob when it is present.
+
+## [0.5.2] - 2026-08-16
+
+### Fixed
+
+- Windows: a readonly rule for a path that does not exist (a policy
+  guard on a repo `.sandbox` that was never created) no longer kills
+  the run with `GetNamedSecurityInfo failed (error 2)`;
+  restrictImpl now skips missing readonly paths, the same posture as
+  the denied-path loop.
+
+## [0.5.1] - 2026-08-16
+
+### Fixed
+
+- Windows: the sandboxed child no longer flashes a console window per
+  command. CreateProcessWithLogonW defaults to CREATE_NEW_CONSOLE and a
+  cross-logon child cannot inherit the caller's console, so every
+  sandboxed run opened its own window (delegated to Windows Terminal on
+  default Win11, i.e. a visible terminal per bash command). The spawn
+  now passes CREATE_NO_WINDOW plus STARTF_USESHOWWINDOW/SW_HIDE; the
+  relay's CreateProcessW child inherits that invisible console.
+
+### Changed
+
+- No embedded C left: all three shims are gone.
+  - `desktop_shim.c` -> `winuser.grantDesktopAccess` (same
+    Get/SetSecurityInfo + SetEntriesInAclW calls via acl.nim, the
+    do-not-free-the-old-DACL comment kept).
+  - `spawn_shim.c` -> a direct 11-argument `CreateProcessWithLogonW`
+    import (the shim existed because the first attempt used
+    CreateProcessAsUserW's argument shape and misaligned the stack).
+  - `wfp_shim.c` -> FWPM provider/sublayer/filter structs built in
+    Nim with `allocWide` strings; direct `Fwpm*Add0` calls. The
+    filter weight arg was dead even in the shim (it always set
+    FWP_EMPTY) and is now dropped - BFE auto-assigns and the permit
+    pair outranks the block on condition count.
+  All three replacements are verified live on Windows 11 26100
+  (setup fence read, e2e policy run, deny-narrowing with rollback,
+  exit-code propagation, PATH resolution).
+- Windows argv quoting exists once (`wall/quotecmd.nim`). This also
+  fixes `spawnAsSandwall` (the fence behavioral probe), whose
+  wrap-only quoter mangled arguments containing quotes.
+- The Windows run lifecycle is owned by the library:
+  `rtoken.runAsSandboxUser` spawns, waits, and unwinds (pipe close +
+  DENY-ACE rollback) in a try/finally, and a failed spawn cleans up
+  after itself. `closeRunRelay`/`rollbackDenies` are gone from the
+  public API; callers cannot forget them anymore.
+- The retired AppContainer filesystem backend (superseded by the
+  dedicated-user backend in 0.4.0) is deleted from acl.nim, which
+  shrinks to the shared AC primitives: types, FFI, stampAce,
+  hasSidAce, removeSidAces.
+- Dedupe: `wall/sockshim.nim` holds the winsock portability layer,
+  the two-socket splice loop, sendAll and closeSock (proxy.nim and
+  netns.nim drop their copies); `isPathUnder` lives in paths.nim;
+  wfp's openEngine/deny-hint and delete-filters-by-key loops are one
+  proc each; the proxy fence-port range is imported from wfp.nim
+  instead of mirrored (the staticRead mirror-check test is gone).
+- The debug cross-compile defines (swNoRelay, swNoJob, swNoPump,
+  swNullCwd) and the never-used `internetAccess`/`inetOk` parameters
+  are removed.
+
+## [0.5.0] - 2026-08-16
+
+### Fixed
+
+- Windows: CreateProcessWithLogonW children no longer die at loader
+  init (0xC0000142) or stall on a CSRSS ALPC reply. Two causes, both
+  verified on Windows 11 26100:
+  - the explicit lpDesktop="winsta0\default" string made
+    console-subsystem children fail their cross-session desktop
+    connect even with the setup-time winsta0 + default-desktop ACL
+    grants in place. lpDesktop is now NULL: the child initializes in
+    the caller's desktop. (The old "the desktop string is REQUIRED"
+    finding was an artifact of the grants never being applied - see
+    the next bullet.)
+  - the setup-time desktop grant helper (csrc/desktop_shim.c)
+    heap-corrupted (0xC0000374) before applying the default-desktop
+    ACE: the old DACL returned by GetSecurityInfo was LocalFree'd
+    (fatal in session-0 callers on this build) and the domain buffer
+    for the second LookupAccountNameW call was one terminator short.
+    The old DACL is now leaked (~200 bytes, once per setup) and the
+    buffer is sized with +1.
+- Windows: the child environment is passed explicitly
+  (GetEnvironmentStringsW + CREATE_UNICODE_ENVIRONMENT). With a NULL
+  env CreateProcessWithLogonW gives the child a fresh block: the
+  stdio-relay pipe name, the wall-proxy vars, and TEMP/TMP never
+  arrived, and the relay silently produced nothing.
+- Windows: the stdio relay hop works. The pipe client handle is now
+  inheritable (the real command inherits it as stdio), the pump
+  thread's Thread object is heap-allocated (a stack-allocated Thread
+  died with its scope before pumping), the relay command is
+  `<self> stdio-relay --` with a matching CLI dispatch in the
+  sandwall binary, and argv-to-command-line quoting follows the
+  CreateProcessW escaping rules (embedded quotes in `bash -c` script
+  strings were mangled by the wrap-only version).
+
+## [0.4.0] - 2026-08-15
+
+### Changed
+
+- Windows backend replaced: the filesystem sandbox now runs commands
+  as a dedicated local user (`sandwall`, created by the one-time
+  elevated `setup`) via CreateProcessWithLogonW with
+  lpDesktop="winsta0\default", inside a KILL_ON_JOB_CLOSE Job.
+  Writable roots get an ALLOW ACE for that user (plus traverse-only
+  ACEs on profile ancestors); deny-narrowing stamps a DENY ACE that is
+  rolled back after the run. This replaces both the AppContainer
+  backend (killed msys2/cygwin at DLL init) and the same-user
+  write-restricted-token backend: the restricted-token model needs the
+  token user SID in the restricting list for msys2's owner-ACL'd
+  signal pipe, which makes every user-writable path writable and the
+  sandbox a no-op (verified on Windows 11; the same wall as
+  openai/codex#17459). The dedicated user also lets the existing WFP
+  fence confine sandboxed network egress at the kernel (verified:
+  off-loopback connect blocked) and keeps schannel https working for
+  tools that use it.
+- CreateProcessWithLogonW is called through a C shim
+  (csrc/spawn_shim.c): the real prototype takes 11 arguments (no
+  process/thread attribute params, no inherit flag); a hand-written
+  Nim import with the CreateProcessAsUserW shape misaligns the stack
+  and SIGSEGVs.
+
+### Fixed
+
+- ACCESS_MODE enum order in acl.nim: DENY_ACCESS=3 and REVOKE_ACCESS=4
+  were swapped, so a policy `deny` stamp silently REVOKEd (a no-op
+  strip) and deny-narrowing under a writable root never took.
+
+## [0.2.7] - 2026-08-13
+
+### Added
+
+- `Rule.hidden`: rules flagged hidden are enforced by `checkPath` and
+  `resolve` like any other rule but skipped by `renderPolicy`. For
+  implicit guard rules a host application adds on top of the parsed
+  policy (3code uses it to keep its own policy files read-only without
+  showing them in the rule dump).
+
+## [0.2.4] - 2026-08-08
+
+### Fixed
+
+- Windows WFP fence: the fence did not install. The failure was
+  FWP_E_LAYER_NOT_FOUND (0x80320004), misdiagnosed in a prior attempt
+  as FWP_E_INVALID_WEIGHT (an error code that does not exist). Root
+  cause: 5 of 6 WFP layer/provider GUIDs were hallucinated
+  (plausible-looking but wrong byte values). Verified against the
+  Microsoft SDK header and three independent C sources (OpenVPN,
+  WireGuard, strongSwan). With the correct layer GUID,
+  FwpmFilterAdd0 returns S_OK. Additional bugs fixed during live
+  verification on Windows 11: FWP_MATCH_RANGE was 1, should be 5
+  (FWP_MATCH_GREATER); FWP_ACTION_BLOCK/PERMIT used 0x2000
+  (NON_TERMINATING) not 0x1000 (TERMINATING); FWP_V6_ADDR_MASK was
+  unhandled in addFilter (null pointer deref); enumOurFilters read
+  only 256 of 600+ filters in a single enum call; wfp_shim.c lacked a
+  _WIN32_WINNT guard (types invisible to gcc); the AC fence used
+  ALE_USER_ID with a security descriptor, which matches the token
+  user rather than the AppContainer SID, switched to ALE_PACKAGE_ID
+  with FWP_SID; runMain passed inetOk = netAllowed (airgap) instead of
+  inetOk = true (fence posture) for host rules.
+
+### Changed
+
+- Windows: host-rules network posture is **WFP fence + degrade**.
+  With host rules and `sandwall setup` (one-time elevated) installed,
+  WFP filters confine the AppContainer child to loopback, and the wall
+  proxy enforces the hostname allowlist (same architecture as POSIX).
+  Without `sandwall setup`, host rules produce a stderr warning and the
+  child has open network access (accepted degrade).
+- Policy DSL access codes replaced by words: `+` -> `write`, `-` ->
+  `deny`, `*` -> `read`. Arbitrary whitespace allowed between the word
+  and the target. Old-format policy files must be rewritten; the parser
+  silently drops old-style lines.
+
+### Added
+
+- Windows: `installAcFence`, `uninstallAcFence`, and `acFenceStatus`
+  expose the AppContainer fence (loopback confinement keyed on the
+  package SID). `setup` installs both the user fence and the AC fence;
+  `--status` reports both; `--uninstall` removes both.
+- Windows: the restricted-token + CPAU backend (which could not spawn a
+  confined child on Windows 11) is replaced by an **AppContainer**
+  backend. The child runs under a lowbox token that denies filesystem and
+  network by default; writable paths get an ALLOW ACE + Low integrity
+  label for the AppContainer SID, read-only paths a read+execute grant,
+  and the stamps roll back after the child exits. Filesystem isolation is
+  verified on Windows 11. Network semantics now match POSIX: with no host
+  rules the child gets the `internetClient` capability (network left
+  alone); with host rules the child gets no capability and is fully
+  offline (the AppContainer blocks even loopback, so the wall proxy
+  cannot be reached - the allowlist degrades to an airgap, with a stderr
+  warning). The wall proxy compiles on Windows (WSAPoll/winsock port).
+  Inside a sandboxed `cmd`, run user executables by bare name or
+  relative path (not a drive-letter absolute path, which cmd under an
+  AppContainer refuses). Windows CLI tests now run natively (portable
+  `type`/`cmd` probes, pwsh-safe CI step).
+
+## [0.2.0] - 2026-07-28
+
+### Added
+
+- `rules` module: the policy file DSL (`+` allow, `-` deny, `*`
+  read-only; path and host targets), parser, cascade loading, checkPath,
+  resolve, render, append. Host rules (hostname/IP, optional port) are
+  parsed for the future network sandbox but not enforced.
+- `firewall-research.md`: cross-platform network sandboxing survey
+  (Landlock ABI v4, Seatbelt, WFP, proxy architectures) for the
+  upcoming network milestone.
+
+### Fixed
+
+- Baseline read set now covers `/etc`: ld.so config, resolv.conf,
+  nsswitch, and locale files made glibc programs unreliable under a
+  sandbox that denied /etc reads.
+
+## [0.1.0] - 2026-07-25
+
+First release. A filesystem sandbox backed by OS-native primitives, with one
+Nim API across three platforms.
+
+### Added
+
+- **Linux backend**: Landlock ruleset. `restrict(writable, read)` confines
+  the calling thread and all its children to a fixed set of writable and
+  read-only paths. Unprivileged, kernel-enforced, monotonic (no un-restrict).
+  Access rights are masked to the running kernel's Landlock ABI version so
+  the binary loads on any 5.19+ kernel. (`cddce2c`, `69804bc`)
+- **macOS backend**: Seatbelt, via `sandbox_init_with_parameters` from
+  libSystem. Same monotonic, inherit-on-fork semantics as Landlock. Symbols
+  are resolved through `dlsym` so the binary loads on every macOS release
+  regardless of header availability. (`9c1980f`, `9fae8ca`, `557895c`)
+- **Windows backend**: restricted token + per-path ACLs. A fresh SID is
+  stamped as a DENY ACE on volume roots and an ALLOW ACE on the writable
+  paths; the child is spawned via `CreateProcessAsUser` with that token and
+  the ACLs roll back when it exits. (`ec526e1`)
+- **The two primitives**: `restrict(writable, read)` and `forkNimbox` / `exec`
+  / `wait`. Same names, same semantics on every platform. `restrict.nim`
+  dispatches to the active backend at compile time. (`cddce2c`)
+- **CLI**: `sandwall restrict RWPATH... [--ro ROPATH...] -- CMD ARGS...`.
+  Confines itself then `exec`s the command. System dirs are auto read-only so
+  the command's binaries and libs stay runnable. `setsid` before exec gives the
+  command its own process group for clean signal delivery. (`2af0796`,
+  `2f5c8d0`)
+- OS-specific baseline read paths and file-type-aware Landlock rules so
+  system directories, device nodes, and shared libs behave correctly across
+  the backends. (`fb83fee`)
+- CI: build + test matrix (Ubuntu, macOS universal binary, Windows), with a
+  tag-gated release job that publishes platform artifacts. (`9c1980f`,
+  `ec526e1`)
